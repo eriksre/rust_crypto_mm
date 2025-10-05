@@ -1,0 +1,159 @@
+   Compiling syn v2.0.106
+   Compiling signal-hook-registry v1.4.6
+   Compiling futures-task v0.3.31
+   Compiling digest v0.10.7
+   Compiling utf8parse v0.2.2
+   Compiling security-framework-sys v2.15.0
+   Compiling colorchoice v1.0.4
+   Compiling anstyle-query v1.1.4
+   Compiling bitflags v2.9.4
+   Compiling anstyle v1.0.11
+   Compiling is_terminal_polyfill v1.70.1
+   Compiling rustls-pemfile v2.2.0
+   Compiling anstyle-parse v0.2.7
+   Compiling clap_lex v0.7.5
+   Compiling strsim v0.11.1
+   Compiling heck v0.5.0
+   Compiling anyhow v1.0.100
+   Compiling security-framework v2.11.1
+   Compiling sha1 v0.10.6
+   Compiling anstream v0.6.20
+   Compiling unsafe-libyaml v0.2.11
+   Compiling sha2 v0.10.9
+   Compiling hmac v0.12.1
+   Compiling dotenvy v0.15.7
+   Compiling clap_builder v4.5.48
+   Compiling rustls-native-certs v0.7.3
+   Compiling synstructure v0.13.2
+   Compiling zerovec-derive v0.11.1
+   Compiling zerofrom-derive v0.1.6
+   Compiling yoke-derive v0.8.0
+   Compiling displaydoc v0.2.5
+   Compiling tokio-macros v2.5.0
+   Compiling serde_derive v1.0.219
+   Compiling futures-macro v0.3.31
+   Compiling thiserror-impl v1.0.69
+   Compiling clap_derive v4.5.47
+   Compiling async-trait v0.1.89
+   Compiling tokio v1.47.1
+   Compiling futures-util v0.3.31
+   Compiling zerofrom v0.1.6
+   Compiling thiserror v1.0.69
+   Compiling clap v4.5.48
+   Compiling yoke v0.8.0
+   Compiling serde v1.0.219
+   Compiling zerovec v0.11.4
+   Compiling zerotrie v0.2.2
+   Compiling tokio-util v0.7.16
+   Compiling tokio-rustls v0.24.1
+   Compiling tokio-rustls v0.25.0
+   Compiling h2 v0.3.27
+   Compiling serde_json v1.0.143
+   Compiling serde_urlencoded v0.7.1
+   Compiling serde_yaml v0.9.34+deprecated
+   Compiling tinystr v0.8.1
+   Compiling potential_utf v0.1.3
+   Compiling icu_collections v2.0.0
+   Compiling icu_locale_core v2.0.0
+   Compiling icu_provider v2.0.0
+   Compiling icu_properties v2.0.1
+   Compiling icu_normalizer v2.0.0
+   Compiling hyper v0.14.32
+   Compiling idna_adapter v1.2.1
+   Compiling idna v1.1.0
+   Compiling url v2.5.7
+   Compiling tungstenite v0.21.0
+   Compiling hyper-rustls v0.24.2
+   Compiling tokio-tungstenite v0.21.0
+   Compiling reqwest v0.11.27
+   Compiling rust_test v0.1.0 (/Users/eriksreinfelds/Documents/GitHub/rust_test)
+    Finished `release` profile [optimized] target(s) in 13.25s
+     Running `target/release/gate_runner --config config/gate_mvp.yaml`
+Gate runner started for DOGE_USDT (dry_run: false)
+quoting DOGE_USDT on gate_ob (ts=Some(1759629044229353000))
+ref 0.2514 (gate_ob) -> Bid 20.0000 @ 0.2513 (live) exch_id=Some(ExchangeOrderId("56013523570825226"))
+  intent t-gate-b-1 tif=poc size=20.0000 ts=Some(1759629044229353000)
+ref 0.2514 (gate_ob) -> Ask 20.0000 @ 0.2514 (live) exch_id=Some(ExchangeOrderId("56013523570825227"))
+  intent t-gate-s-2 tif=poc size=20.0000 ts=Some(1759629044229353000)
+report t-gate-b-1 status New filled 0.000000 avg None ts=None
+report t-gate-s-2 status New filled 0.000000 avg None ts=None
+repricing DOGE_USDT on binance_bbo_adj (ts=Some(1759629046301000000)); cancelling 2 orders
+report t-gate-b-1 status Canceled filled 0.000000 avg None ts=None
+report t-gate-s-2 status Canceled filled 0.000000 avg None ts=None
+quoting DOGE_USDT on bybit_bbo_adj (ts=Some(1759629046663000000))
+ref 0.2513 (bybit_bbo_adj) -> Bid 20.0000 @ 0.2513 (live) exch_id=Some(ExchangeOrderId("56013523570825437"))
+  intent t-gate-b-3 tif=poc size=20.0000 ts=Some(1759629046663000000)
+ref 0.2513 (bybit_bbo_adj) -> Ask 20.0000 @ 0.2514 (live) exch_id=Some(ExchangeOrderId("56013523570825438"))
+  intent t-gate-s-4 tif=poc size=20.0000 ts=Some(1759629046663000000)
+report t-gate-b-3 status New filled 0.000000 avg None ts=None
+report t-gate-s-4 status New filled 0.000000 avg None ts=None
+repricing DOGE_USDT on bybit_bbo_adj (ts=Some(1759629053593000000)); cancelling 2 orders
+report t-gate-b-3 status Canceled filled 0.000000 avg None ts=None
+report t-gate-s-4 status Canceled filled 0.000000 avg None ts=None
+quoting DOGE_USDT on bybit_bbo_adj (ts=Some(1759629053933000000))
+ref 0.2514 (bybit_bbo_adj) -> Bid 20.0000 @ 0.2514 (live) exch_id=Some(ExchangeOrderId("56013523570825717"))
+  intent t-gate-b-5 tif=poc size=20.0000 ts=Some(1759629053933000000)
+ref 0.2514 (bybit_bbo_adj) -> Ask 20.0000 @ 0.2514 (live) exch_id=Some(ExchangeOrderId("56013523570825718"))
+  intent t-gate-s-6 tif=poc size=20.0000 ts=Some(1759629053933000000)
+report t-gate-b-5 status New filled 0.000000 avg None ts=None
+report t-gate-s-6 status New filled 0.000000 avg None ts=None
+repricing DOGE_USDT on binance_bbo_adj (ts=Some(1759629063397000000)); cancelling 2 orders
+report t-gate-b-5 status Canceled filled 0.000000 avg None ts=None
+report t-gate-s-6 status Canceled filled 0.000000 avg None ts=None
+quoting DOGE_USDT on binance_bbo_adj (ts=Some(1759629063738000000))
+ref 0.2514 (binance_bbo_adj) -> Bid 20.0000 @ 0.2514 (live) exch_id=Some(ExchangeOrderId("56013523570826372"))
+  intent t-gate-b-7 tif=poc size=20.0000 ts=Some(1759629063738000000)
+ref 0.2514 (binance_bbo_adj) -> Ask 20.0000 @ 0.2514 (live) exch_id=Some(ExchangeOrderId("56013523570826373"))
+  intent t-gate-s-8 tif=poc size=20.0000 ts=Some(1759629063738000000)
+report t-gate-b-7 status New filled 0.000000 avg None ts=None
+report t-gate-s-8 status New filled 0.000000 avg None ts=None
+repricing DOGE_USDT on binance_bbo_adj (ts=Some(1759629065180000000)); cancelling 2 orders
+report t-gate-b-7 status Canceled filled 0.000000 avg None ts=None
+report t-gate-s-8 status Canceled filled 0.000000 avg None ts=None
+quoting DOGE_USDT on gate_bbo (ts=Some(1759629065514000000))
+ref 0.2514 (gate_bbo) -> Bid 20.0000 @ 0.2514 (live) exch_id=Some(ExchangeOrderId("56013523570826727"))
+  intent t-gate-b-9 tif=poc size=20.0000 ts=Some(1759629065514000000)
+ref 0.2514 (gate_bbo) -> Ask 20.0000 @ 0.2515 (live) exch_id=Some(ExchangeOrderId("56013523570826728"))
+  intent t-gate-s-10 tif=poc size=20.0000 ts=Some(1759629065514000000)
+report t-gate-b-9 status New filled 0.000000 avg None ts=None
+report t-gate-s-10 status New filled 0.000000 avg None ts=None
+repricing DOGE_USDT on binance_bbo_adj (ts=Some(1759629066837000000)); cancelling 2 orders
+report t-gate-b-9 status Canceled filled 0.000000 avg None ts=None
+report t-gate-s-10 status Canceled filled 0.000000 avg None ts=None
+quoting DOGE_USDT on binance_bbo_adj (ts=Some(1759629067164000000))
+ref 0.2515 (binance_bbo_adj) -> Bid 20.0000 @ 0.2515 (live) exch_id=Some(ExchangeOrderId("56013523570826997"))
+  intent t-gate-b-11 tif=poc size=20.0000 ts=Some(1759629067164000000)
+ref 0.2515 (binance_bbo_adj) -> Ask 20.0000 @ 0.2515 (live) exch_id=Some(ExchangeOrderId("56013523570826998"))
+  intent t-gate-s-12 tif=poc size=20.0000 ts=Some(1759629067164000000)
+report t-gate-b-11 status New filled 0.000000 avg None ts=None
+report t-gate-s-12 status New filled 0.000000 avg None ts=None
+repricing DOGE_USDT on bitget_bbo_adj (ts=Some(1759629067589000000)); cancelling 2 orders
+report t-gate-b-11 status Canceled filled 0.000000 avg None ts=None
+report t-gate-s-12 status Canceled filled 0.000000 avg None ts=None
+quoting DOGE_USDT on bybit_bbo_adj (ts=Some(1759629067943000000))
+ref 0.2515 (bybit_bbo_adj) -> Bid 20.0000 @ 0.2514 (live) exch_id=Some(ExchangeOrderId("56013523570827112"))
+  intent t-gate-b-13 tif=poc size=20.0000 ts=Some(1759629067943000000)
+ref 0.2515 (bybit_bbo_adj) -> Ask 20.0000 @ 0.2515 (live) exch_id=Some(ExchangeOrderId("56013523570827113"))
+  intent t-gate-s-14 tif=poc size=20.0000 ts=Some(1759629067943000000)
+report t-gate-b-13 status New filled 0.000000 avg None ts=None
+report t-gate-s-14 status New filled 0.000000 avg None ts=None
+repricing DOGE_USDT on bybit_bbo_adj (ts=Some(1759629069393000000)); cancelling 2 orders
+report t-gate-b-13 status Canceled filled 0.000000 avg None ts=None
+report t-gate-s-14 status Canceled filled 0.000000 avg None ts=None
+quoting DOGE_USDT on binance_bbo_adj (ts=Some(1759629069763000000))
+ref 0.2516 (binance_bbo_adj) -> Bid 20.0000 @ 0.2515 (live) exch_id=Some(ExchangeOrderId("56013523570828059"))
+  intent t-gate-b-15 tif=poc size=20.0000 ts=Some(1759629069763000000)
+ref 0.2516 (binance_bbo_adj) -> Ask 20.0000 @ 0.2516 (live) exch_id=Some(ExchangeOrderId("56013523570828060"))
+  intent t-gate-s-16 tif=poc size=20.0000 ts=Some(1759629069763000000)
+report t-gate-b-15 status New filled 0.000000 avg None ts=None
+report t-gate-s-16 status New filled 0.000000 avg None ts=None
+repricing DOGE_USDT on binance_bbo_adj (ts=Some(1759629074597000000)); cancelling 2 orders
+report t-gate-b-15 status Canceled filled 0.000000 avg None ts=None
+report t-gate-s-16 status Canceled filled 0.000000 avg None ts=None
+quoting DOGE_USDT on gate_ob (ts=Some(1759629074925003000))
+ref 0.2516 (gate_ob) -> Bid 20.0000 @ 0.2515 (live) exch_id=Some(ExchangeOrderId("56013523570828550"))
+  intent t-gate-b-17 tif=poc size=20.0000 ts=Some(1759629074925003000)
+ref 0.2516 (gate_ob) -> Ask 20.0000 @ 0.2516 (live) exch_id=Some(ExchangeOrderId("56013523570828551"))
+  intent t-gate-s-18 tif=poc size=20.0000 ts=Some(1759629074925003000)
+report t-gate-b-17 status New filled 0.000000 avg None ts=None
+report t-gate-s-18 status New filled 0.000000 avg None ts=None

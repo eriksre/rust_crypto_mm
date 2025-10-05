@@ -7,13 +7,14 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::Parser;
 use rust_test::base_classes::engine::spawn_state_engine;
+use rust_test::base_classes::state::ExchangeAdjustment;
 use rust_test::base_classes::state::state as global_state;
 use rust_test::execution::{
     DryRunGateway, ExecutionGateway, ExecutionReport, GateWsConfig, GateWsGateway, OrderAck,
     OrderManager, OrderStatus, QuoteIntent,
 };
-use rust_test::strategy::{QuoteConfig, SimpleQuoteStrategy};
-use tokio::time::sleep;
+use rust_test::strategy::{QuoteConfig, ReferenceMeta, SimpleQuoteStrategy};
+use tokio::time::{MissedTickBehavior, interval};
 
 #[derive(Debug, Parser)]
 #[command(name = "gate-runner", about = "Gate.io MVP dry-run executor")]
@@ -81,7 +82,10 @@ async fn main() -> Result<()> {
     let mut strategy = SimpleQuoteStrategy::new(config.strategy.clone());
     let mut last_key: Option<RevisionKey> = None;
 
-    let poll_interval = Duration::from_millis(20);
+    let mut market_timer = interval(Duration::from_millis(20));
+    market_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut quote_timer = interval(Duration::from_millis(50));
+    quote_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     tokio::select! {
         _ = ctrl_c_notifier() => {
@@ -89,29 +93,39 @@ async fn main() -> Result<()> {
         }
         _ = async {
             loop {
-                if let Some(reference) = latest_reference(&mut last_key) {
-                    let now = Instant::now();
-                    if let Err(err) = handle_reference(
-                        &reference,
-                        now,
-                        &mut strategy,
-                        &config,
-                        order_manager.clone()
-                    ).await {
-                        eprintln!(
-                            "error handling reference {} {:.4}: {:#}",
-                            reference.source,
-                            reference.price,
-                            err
-                        );
+                tokio::select! {
+                    _ = market_timer.tick() => {
+                        while let Some(reference) = latest_reference(&mut last_key) {
+                            let now = Instant::now();
+                            if let Err(err) = handle_market_update(
+                                reference,
+                                now,
+                                &mut strategy,
+                                &config,
+                                order_manager.clone()
+                            ).await {
+                                eprintln!("error handling market update: {:#}", err);
+                            }
+                        }
+
+                        if let Err(err) =
+                            drain_reports(&mut strategy, &config, order_manager.clone()).await
+                        {
+                            eprintln!("error processing reports: {:#}", err);
+                        }
+                    }
+                    _ = quote_timer.tick() => {
+                        let now = Instant::now();
+                        if let Err(err) = handle_quote_tick(
+                            now,
+                            &mut strategy,
+                            &config,
+                            order_manager.clone()
+                        ).await {
+                            eprintln!("error handling quote tick: {:#}", err);
+                        }
                     }
                 }
-
-                if let Err(err) = drain_reports(&mut strategy, &config, order_manager.clone()).await {
-                    eprintln!("error processing reports: {:#}", err);
-                }
-
-                sleep(poll_interval).await;
             }
         } => {}
     }
@@ -135,7 +149,7 @@ fn latest_reference(last_key: &mut Option<RevisionKey>) -> Option<ReferencePrice
         seq: u64,
         ts_ns: Option<u64>,
         source_idx: u8,
-        source: &'static str,
+        source: String,
     }
 
     fn is_newer(candidate: &Candidate, current: &Candidate) -> bool {
@@ -150,9 +164,31 @@ fn latest_reference(last_key: &mut Option<RevisionKey>) -> Option<ReferencePrice
         candidate.source_idx > current.source_idx
     }
 
+    let adjust_price = |price: Option<f64>, adj: &ExchangeAdjustment| -> Option<f64> {
+        match price {
+            Some(px) if px.is_finite() && px > 0.0 => {
+                if adj.samples > 0 {
+                    Some(px - adj.offset.unwrap_or(0.0))
+                } else {
+                    Some(px)
+                }
+            }
+            Some(_) => None,
+            None => None,
+        }
+    };
+
+    let label = |base: &str, adj: &ExchangeAdjustment| -> String {
+        if adj.samples > 0 {
+            format!("{}_adj", base)
+        } else {
+            base.to_string()
+        }
+    };
+
     let mut best: Option<Candidate> = None;
     let mut consider =
-        |price: Option<f64>, seq: u64, ts: Option<u64>, source_idx: u8, source: &'static str| {
+        |price: Option<f64>, seq: u64, ts: Option<u64>, source_idx: u8, source: String| {
             if seq == 0 {
                 return;
             }
@@ -179,63 +215,63 @@ fn latest_reference(last_key: &mut Option<RevisionKey>) -> Option<ReferencePrice
         st.gate.bbo.seq,
         st.gate.bbo.ts_ns,
         0,
-        "gate_bbo",
+        "gate_bbo".to_string(),
     );
     consider(
         st.gate.orderbook.price,
         st.gate.orderbook.seq,
         st.gate.orderbook.ts_ns,
         1,
-        "gate_ob",
+        "gate_ob".to_string(),
     );
     consider(
         st.gate.trade.price,
         st.gate.trade.seq,
         st.gate.trade.ts_ns,
         2,
-        "gate_trade",
+        "gate_trade".to_string(),
     );
     consider(
-        st.bybit.bbo.price,
+        adjust_price(st.bybit.bbo.price, &st.demean.bybit),
         st.bybit.bbo.seq,
         st.bybit.bbo.ts_ns,
         3,
-        "bybit_bbo",
+        label("bybit_bbo", &st.demean.bybit),
     );
     consider(
-        st.bybit.trade.price,
+        adjust_price(st.bybit.trade.price, &st.demean.bybit),
         st.bybit.trade.seq,
         st.bybit.trade.ts_ns,
         4,
-        "bybit_trade",
+        label("bybit_trade", &st.demean.bybit),
     );
     consider(
-        st.binance.bbo.price,
+        adjust_price(st.binance.bbo.price, &st.demean.binance),
         st.binance.bbo.seq,
         st.binance.bbo.ts_ns,
         5,
-        "binance_bbo",
+        label("binance_bbo", &st.demean.binance),
     );
     consider(
-        st.binance.trade.price,
+        adjust_price(st.binance.trade.price, &st.demean.binance),
         st.binance.trade.seq,
         st.binance.trade.ts_ns,
         6,
-        "binance_trade",
+        label("binance_trade", &st.demean.binance),
     );
     consider(
-        st.bitget.bbo.price,
+        adjust_price(st.bitget.bbo.price, &st.demean.bitget),
         st.bitget.bbo.seq,
         st.bitget.bbo.ts_ns,
         7,
-        "bitget_bbo",
+        label("bitget_bbo", &st.demean.bitget),
     );
     consider(
-        st.bitget.trade.price,
+        adjust_price(st.bitget.trade.price, &st.demean.bitget),
         st.bitget.trade.seq,
         st.bitget.trade.ts_ns,
         8,
-        "bitget_trade",
+        label("bitget_trade", &st.demean.bitget),
     );
 
     let candidate = best?;
@@ -256,40 +292,68 @@ fn latest_reference(last_key: &mut Option<RevisionKey>) -> Option<ReferencePrice
     })
 }
 
-async fn handle_reference(
-    reference: &ReferencePrice,
+async fn handle_market_update(
+    reference: ReferencePrice,
     now: Instant,
     strategy: &mut SimpleQuoteStrategy,
     config: &RunnerConfig,
     order_manager: Arc<OrderManager>,
 ) -> Result<()> {
-    if let Some(plan) = strategy.on_reference_price(reference.price, now) {
+    let meta = ReferenceMeta {
+        source: reference.source.clone(),
+        ts_ns: reference.ts_ns,
+    };
+    let cancels = strategy.on_market_update(reference.price, Some(meta), now);
+
+    if !cancels.is_empty() {
+        println!(
+            "repricing {} on {} (ts={:?}); cancelling {} orders",
+            config.strategy.symbol,
+            reference.source,
+            reference.ts_ns,
+            cancels.len()
+        );
+        for id in cancels {
+            if let Err(err) = order_manager.cancel(&id).await {
+                eprintln!("cancel {} failed: {:#}", id, err);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_quote_tick(
+    now: Instant,
+    strategy: &mut SimpleQuoteStrategy,
+    config: &RunnerConfig,
+    order_manager: Arc<OrderManager>,
+) -> Result<()> {
+    if let Some(plan) = strategy.plan_quotes(now) {
         enforce_risk(&plan.intents, &config.risk)?;
 
-        if !plan.cancels.is_empty() {
-            println!(
-                "repricing {} on {} (ts={:?}); cancelling {} orders",
-                config.strategy.symbol,
-                reference.source,
-                reference.ts_ns,
-                plan.cancels.len()
-            );
-            for id in &plan.cancels {
-                if let Err(err) = order_manager.cancel(id).await {
-                    eprintln!("cancel {} failed: {:#}", id, err);
-                }
-            }
-        } else {
+        if let Some(meta) = plan.reference_meta.as_ref() {
             println!(
                 "quoting {} on {} (ts={:?})",
-                config.strategy.symbol, reference.source, reference.ts_ns
+                config.strategy.symbol, meta.source, meta.ts_ns
+            );
+        } else {
+            println!(
+                "quoting {} with latest price {:.4}",
+                config.strategy.symbol, plan.reference_price
             );
         }
 
         let intents = plan.intents.clone();
         let acks = order_manager.submit(intents.clone()).await?;
         strategy.commit_plan(&plan);
-        log_submission(&intents, &acks, reference, config);
+        log_submission(
+            &intents,
+            &acks,
+            plan.reference_meta.as_ref(),
+            plan.reference_price,
+            config,
+        );
     }
     Ok(())
 }
@@ -339,9 +403,13 @@ fn enforce_risk(intents: &[QuoteIntent], risk: &RiskConfig) -> Result<()> {
 fn log_submission(
     intents: &[QuoteIntent],
     acks: &[OrderAck],
-    reference: &ReferencePrice,
+    reference_meta: Option<&ReferenceMeta>,
+    reference_price: f64,
     config: &RunnerConfig,
 ) {
+    let (source, ts_ns) = reference_meta
+        .map(|meta| (meta.source.as_str(), meta.ts_ns))
+        .unwrap_or(("unknown", None));
     let mode = if config.mode.dry_run {
         "dry-run"
     } else {
@@ -350,8 +418,8 @@ fn log_submission(
     for (intent, ack) in intents.iter().zip(acks.iter()) {
         println!(
             "ref {:.4} ({}) -> {:?} {:.4} @ {:.4} ({}) exch_id={:?}",
-            reference.price,
-            reference.source,
+            reference_price,
+            source,
             intent.side,
             intent.size,
             intent.price,
@@ -361,7 +429,7 @@ fn log_submission(
         if config.mode.log_fills {
             println!(
                 "  intent {} tif={} size={:.4} ts={:?}",
-                intent.client_order_id, intent.tif, intent.size, reference.ts_ns
+                intent.client_order_id, intent.tif, intent.size, ts_ns
             );
         }
     }
@@ -398,7 +466,7 @@ struct RevisionKey {
 struct ReferencePrice {
     price: f64,
     ts_ns: Option<u64>,
-    source: &'static str,
+    source: String,
 }
 
 async fn ctrl_c_notifier() {

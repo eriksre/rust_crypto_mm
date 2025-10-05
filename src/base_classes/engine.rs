@@ -3,7 +3,8 @@
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::base_classes::state::{TradeDirection, state};
+use crate::base_classes::demean::{DemeanTracker, ExchangeKind};
+use crate::base_classes::state::{ExchangeAdjustment, TradeDirection, state};
 use crate::base_classes::tickers::TickerStore;
 use crate::base_classes::ws::spawn_ws_worker;
 use crate::collectors::{binance, bitget, bybit, gate};
@@ -101,6 +102,23 @@ pub fn spawn_state_engine(symbol: String) -> JoinHandle<()> {
         let mut gate_tickers = TickerStore::default();
         let mut binance_tickers = TickerStore::default();
 
+        let mut demean = DemeanTracker::new(Duration::from_secs(8));
+
+        let apply_demean = |updates: &[(ExchangeKind, ExchangeAdjustment)]| {
+            if updates.is_empty() {
+                return;
+            }
+            let mut st = state().lock().unwrap();
+            for (exchange, adj) in updates {
+                let target = match exchange {
+                    ExchangeKind::Bybit => &mut st.demean.bybit,
+                    ExchangeKind::Binance => &mut st.demean.binance,
+                    ExchangeKind::Bitget => &mut st.demean.bitget,
+                };
+                *target = *adj;
+            }
+        };
+
         loop {
             let mut progressed = false;
 
@@ -113,6 +131,7 @@ pub fn spawn_state_engine(symbol: String) -> JoinHandle<()> {
                         match feed {
                             "orderbook" => {
                                 if let Some(mid) = bybit_book.mid_price_f64() {
+                                    demean.record_other(ExchangeKind::Bybit, Some(ts), Some(mid));
                                     let (bid_vec, ask_vec) = bybit_book.top_levels_f64(3);
                                     let bid_levels = levels_to_array(&bid_vec);
                                     let ask_levels = levels_to_array(&ask_vec);
@@ -154,6 +173,11 @@ pub fn spawn_state_engine(symbol: String) -> JoinHandle<()> {
                                                 ts,
                                             )
                                         };
+                                        demean.record_other(
+                                            ExchangeKind::Bybit,
+                                            Some(ts_eff),
+                                            Some(mid),
+                                        );
                                         let mut st = state().lock().unwrap();
                                         let snap = &mut st.bybit.bbo;
                                         snap.price = Some(mid);
@@ -164,6 +188,7 @@ pub fn spawn_state_engine(symbol: String) -> JoinHandle<()> {
                                         snap.direction = None;
                                     }
                                 } else if let Some(mid) = bybit_book.mid_price_f64() {
+                                    demean.record_other(ExchangeKind::Bybit, Some(ts), Some(mid));
                                     let (bid_vec, ask_vec) = bybit_book.top_levels_f64(1);
                                     let bid_levels = levels_to_array(&bid_vec);
                                     let ask_levels = levels_to_array(&ask_vec);
@@ -188,6 +213,7 @@ pub fn spawn_state_engine(symbol: String) -> JoinHandle<()> {
                             } else {
                                 ts
                             };
+                            demean.record_other(ExchangeKind::Bybit, Some(trade_ts), Some(px));
                             let direction = if trade.is_buyer_maker {
                                 TradeDirection::Sell
                             } else {
@@ -273,6 +299,7 @@ pub fn spawn_state_engine(symbol: String) -> JoinHandle<()> {
                     #[cfg(feature = "binance_book")]
                     if let Some((_feed, _)) = binance::events_for_book(s, &mut binance_book) {
                         if let Some(mid) = binance_book.mid_price_f64() {
+                            demean.record_other(ExchangeKind::Binance, Some(ts), Some(mid));
                             let (bid_vec, ask_vec) = binance_book.top_levels_f64(3);
                             let bid_levels = levels_to_array(&bid_vec);
                             let ask_levels = levels_to_array(&ask_vec);
@@ -317,6 +344,7 @@ pub fn spawn_state_engine(symbol: String) -> JoinHandle<()> {
                             } else {
                                 ([None; 3], [None; 3], ts)
                             };
+                            demean.record_other(ExchangeKind::Binance, Some(ts_eff), Some(mid));
                             let mut st = state().lock().unwrap();
                             let snap = &mut st.binance.bbo;
                             snap.price = Some(mid);
@@ -331,6 +359,7 @@ pub fn spawn_state_engine(symbol: String) -> JoinHandle<()> {
                         if let Some(trade) = binance_trades.last() {
                             let px = (trade.px as f64) / binance::PRICE_SCALE;
                             let trade_ts = if trade.ts != 0 { trade.ts } else { ts };
+                            demean.record_other(ExchangeKind::Binance, Some(trade_ts), Some(px));
                             let direction = if trade.is_buyer_maker {
                                 TradeDirection::Sell
                             } else {
@@ -421,14 +450,18 @@ pub fn spawn_state_engine(symbol: String) -> JoinHandle<()> {
                                 let (bid_vec, ask_vec) = gate_book.top_levels_f64(3);
                                 let bid_levels = levels_to_array(&bid_vec);
                                 let ask_levels = levels_to_array(&ask_vec);
-                                let mut st = state().lock().unwrap();
-                                let snap = &mut st.gate.orderbook;
-                                snap.price = Some(mid);
-                                snap.seq = snap.seq.wrapping_add(1);
-                                snap.ts_ns = Some(ts);
-                                snap.bid_levels = bid_levels;
-                                snap.ask_levels = ask_levels;
-                                snap.direction = None;
+                                {
+                                    let mut st = state().lock().unwrap();
+                                    let snap = &mut st.gate.orderbook;
+                                    snap.price = Some(mid);
+                                    snap.seq = snap.seq.wrapping_add(1);
+                                    snap.ts_ns = Some(ts);
+                                    snap.bid_levels = bid_levels;
+                                    snap.ask_levels = ask_levels;
+                                    snap.direction = None;
+                                }
+                                let updates = demean.on_gate_event(Some(ts), Some(mid));
+                                apply_demean(&updates);
                             }
                         }
                     }
@@ -452,14 +485,18 @@ pub fn spawn_state_engine(symbol: String) -> JoinHandle<()> {
                                 let (bid_vec, ask_vec) = gate_book.top_levels_f64(1);
                                 (levels_to_array(&bid_vec), levels_to_array(&ask_vec), ts)
                             };
-                            let mut st = state().lock().unwrap();
-                            let snap = &mut st.gate.bbo;
-                            snap.price = Some(mid);
-                            snap.seq = snap.seq.wrapping_add(1);
-                            snap.ts_ns = Some(ts_eff);
-                            snap.bid_levels = bid_levels;
-                            snap.ask_levels = ask_levels;
-                            snap.direction = None;
+                            {
+                                let mut st = state().lock().unwrap();
+                                let snap = &mut st.gate.bbo;
+                                snap.price = Some(mid);
+                                snap.seq = snap.seq.wrapping_add(1);
+                                snap.ts_ns = Some(ts_eff);
+                                snap.bid_levels = bid_levels;
+                                snap.ask_levels = ask_levels;
+                                snap.direction = None;
+                            }
+                            let updates = demean.on_gate_event(Some(ts_eff), Some(mid));
+                            apply_demean(&updates);
                         }
                     }
                     if gate::update_trades(s, &mut gate_trades) {
@@ -471,13 +508,17 @@ pub fn spawn_state_engine(symbol: String) -> JoinHandle<()> {
                             } else {
                                 TradeDirection::Buy
                             };
-                            let mut st = state().lock().unwrap();
-                            st.gate.trade.price = Some(px);
-                            st.gate.trade.seq = st.gate.trade.seq.wrapping_add(1);
-                            st.gate.trade.ts_ns = Some(trade_ts);
-                            st.gate.trade.direction = Some(direction);
-                            st.gate.trade.bid_levels = [None; 3];
-                            st.gate.trade.ask_levels = [None; 3];
+                            {
+                                let mut st = state().lock().unwrap();
+                                st.gate.trade.price = Some(px);
+                                st.gate.trade.seq = st.gate.trade.seq.wrapping_add(1);
+                                st.gate.trade.ts_ns = Some(trade_ts);
+                                st.gate.trade.direction = Some(direction);
+                                st.gate.trade.bid_levels = [None; 3];
+                                st.gate.trade.ask_levels = [None; 3];
+                            }
+                            let updates = demean.on_gate_event(Some(trade_ts), Some(px));
+                            apply_demean(&updates);
                         }
                     }
                     if let Some((symbol, mut ticker)) = gate::update_tickers(s, &mut gate_tickers) {
@@ -594,6 +635,7 @@ pub fn spawn_state_engine(symbol: String) -> JoinHandle<()> {
                     for (feed, _) in bitget::events_for(s, &mut bitget_book) {
                         if feed == "orderbook" {
                             if let Some(mid) = bitget_book.mid_price_f64() {
+                                demean.record_other(ExchangeKind::Bitget, Some(ts), Some(mid));
                                 let (bid_vec, ask_vec) = bitget_book.top_levels_f64(3);
                                 let bid_levels = levels_to_array(&bid_vec);
                                 let ask_levels = levels_to_array(&ask_vec);
@@ -628,6 +670,7 @@ pub fn spawn_state_engine(symbol: String) -> JoinHandle<()> {
                                 let (bid_vec, ask_vec) = bitget_book.top_levels_f64(1);
                                 (levels_to_array(&bid_vec), levels_to_array(&ask_vec), ts)
                             };
+                            demean.record_other(ExchangeKind::Bitget, Some(ts_eff), Some(mid));
                             let mut st = state().lock().unwrap();
                             let snap = &mut st.bitget.bbo;
                             snap.price = Some(mid);
@@ -642,6 +685,7 @@ pub fn spawn_state_engine(symbol: String) -> JoinHandle<()> {
                         if let Some(trade) = bitget_trades.last() {
                             let px = (trade.px as f64) / bitget::PRICE_SCALE;
                             let trade_ts = if trade.ts != 0 { trade.ts } else { ts };
+                            demean.record_other(ExchangeKind::Bitget, Some(trade_ts), Some(px));
                             let direction = if trade.is_buyer_maker {
                                 TradeDirection::Sell
                             } else {

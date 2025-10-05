@@ -31,6 +31,20 @@ pub struct FeedSnap {
 }
 
 #[derive(Clone, Copy, Default, Debug)]
+pub struct ExchangeAdjustment {
+    pub offset: Option<f64>,
+    pub samples: u32,
+    pub last_update_ns: Option<Ts>,
+}
+
+#[derive(Clone, Default, Debug)]
+pub struct DemeanState {
+    pub bybit: ExchangeAdjustment,
+    pub binance: ExchangeAdjustment,
+    pub bitget: ExchangeAdjustment,
+}
+
+#[derive(Clone, Copy, Default, Debug)]
 pub struct TickerSnap {
     pub last_price: Option<f64>,
     pub last_qty: Option<f64>,
@@ -61,6 +75,7 @@ pub struct GlobalState {
     pub binance: ExchangeSnap,
     pub gate: ExchangeSnap,
     pub bitget: ExchangeSnap,
+    pub demean: DemeanState,
 }
 
 static STATE: OnceLock<Mutex<GlobalState>> = OnceLock::new();

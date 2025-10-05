@@ -39,6 +39,13 @@ pub struct QuotePlan {
     pub cancels: Vec<ClientOrderId>,
     pub intents: Vec<QuoteIntent>,
     pub planned_at: Instant,
+    pub reference_meta: Option<ReferenceMeta>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReferenceMeta {
+    pub source: String,
+    pub ts_ns: Option<u64>,
 }
 
 pub struct SimpleQuoteStrategy {
@@ -47,6 +54,10 @@ pub struct SimpleQuoteStrategy {
     last_reference: Option<f64>,
     last_refresh_at: Option<Instant>,
     active_orders: Vec<ClientOrderId>,
+    pending_cancels: Vec<ClientOrderId>,
+    latest_price: Option<f64>,
+    latest_meta: Option<ReferenceMeta>,
+    needs_requote: bool,
 }
 
 impl SimpleQuoteStrategy {
@@ -57,26 +68,63 @@ impl SimpleQuoteStrategy {
             last_reference: None,
             last_refresh_at: None,
             active_orders: Vec::new(),
+            pending_cancels: Vec::new(),
+            latest_price: None,
+            latest_meta: None,
+            needs_requote: true,
         }
     }
 
-    pub fn on_reference_price(&mut self, price: f64, now: Instant) -> Option<QuotePlan> {
+    pub fn on_market_update(
+        &mut self,
+        price: f64,
+        meta: Option<ReferenceMeta>,
+        _now: Instant,
+    ) -> Vec<ClientOrderId> {
         if !price.is_finite() || price <= 0.0 {
+            return Vec::new();
+        }
+
+        self.latest_price = Some(price);
+        self.latest_meta = meta;
+
+        if self.active_orders.is_empty() {
+            self.needs_requote = true;
+        }
+
+        let mut cancels = Vec::new();
+        if let Some(last_price) = self.last_reference.filter(|p| *p > 0.0) {
+            let change_bps = ((price - last_price).abs() / last_price) * 10_000.0;
+            if change_bps >= self.config.reprice_bps.max(f64::EPSILON) {
+                self.needs_requote = true;
+                cancels = self.prepare_cancels();
+            }
+        } else {
+            self.needs_requote = true;
+        }
+
+        cancels
+    }
+
+    pub fn plan_quotes(&mut self, now: Instant) -> Option<QuotePlan> {
+        let price = self.latest_price?;
+
+        if !self.needs_requote {
             return None;
         }
 
-        if !self.should_requote(price, now) {
+        if !self.active_orders.is_empty() && !self.debounce_elapsed(now) {
             return None;
         }
 
-        let cancels = self.active_orders.clone();
         let intents = self.build_intents(price);
 
         Some(QuotePlan {
             reference_price: price,
-            cancels,
+            cancels: Vec::new(),
             intents,
             planned_at: now,
+            reference_meta: self.latest_meta.clone(),
         })
     }
 
@@ -88,38 +136,23 @@ impl SimpleQuoteStrategy {
             .iter()
             .map(|intent| intent.client_order_id.clone())
             .collect();
+        self.needs_requote = false;
     }
 
     pub fn handle_report(&mut self, report: &ExecutionReport) {
+        self.pending_cancels
+            .retain(|id| id != &report.client_order_id);
         if matches!(
             report.status,
             OrderStatus::Filled | OrderStatus::Canceled | OrderStatus::Rejected
         ) {
             self.active_orders
                 .retain(|id| id != &report.client_order_id);
+            self.needs_requote = true;
         }
-    }
-
-    fn should_requote(&self, price: f64, now: Instant) -> bool {
-        let debounce_elapsed = self
-            .last_refresh_at
-            .map(|ts| now.saturating_duration_since(ts) >= self.debounce_duration())
-            .unwrap_or(true);
-
-        if self.active_orders.is_empty() {
-            return debounce_elapsed;
+        if matches!(report.status, OrderStatus::PartiallyFilled) {
+            self.needs_requote = true;
         }
-
-        if !debounce_elapsed {
-            return false;
-        }
-
-        if let Some(last_price) = self.last_reference.filter(|p| *p > 0.0) {
-            let change_bps = ((price - last_price).abs() / last_price) * 10_000.0;
-            return change_bps >= self.config.reprice_bps.max(f64::EPSILON);
-        }
-
-        true
     }
 
     fn build_intents(&mut self, mid: f64) -> Vec<QuoteIntent> {
@@ -176,5 +209,30 @@ impl SimpleQuoteStrategy {
 
     fn debounce_duration(&self) -> Duration {
         Duration::from_millis(self.config.debounce_ms.max(1))
+    }
+
+    fn debounce_elapsed(&self, now: Instant) -> bool {
+        self.last_refresh_at
+            .map(|ts| now.saturating_duration_since(ts) >= self.debounce_duration())
+            .unwrap_or(true)
+    }
+
+    fn prepare_cancels(&mut self) -> Vec<ClientOrderId> {
+        if self.active_orders.is_empty() {
+            return Vec::new();
+        }
+
+        let mut newly_requested = Vec::new();
+        for id in &self.active_orders {
+            if !self.pending_cancels.iter().any(|pending| pending == id) {
+                newly_requested.push(id.clone());
+            }
+        }
+
+        if !newly_requested.is_empty() {
+            self.pending_cancels.extend(newly_requested.iter().cloned());
+        }
+
+        newly_requested
     }
 }
