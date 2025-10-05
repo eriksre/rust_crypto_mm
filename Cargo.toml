@@ -1,0 +1,126 @@
+[package]
+name = "rust_test"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[features]
+# Enable parsing and full-book managers by default; choose WS backend at run.
+default = ["parse_binance", "binance_book", "bitget_book", "ws_tungstenite"]
+
+# High-performance client options (enable one when you’re ready):
+ws_tungstenite = ["dep:tungstenite", "dep:url"]
+ws_fast = ["dep:fastwebsockets", "dep:hyper", "dep:hyper-util", "dep:tokio", "dep:bytes", "dep:http"]
+affinity = ["dep:libc"]
+parse_binance = ["dep:serde", "dep:serde_json"]
+parsing = ["dep:serde", "dep:serde_json"]
+binance_book = ["dep:reqwest", "dep:tokio", "dep:serde", "dep:serde_json", "parse_binance"]
+bitget_book = ["dep:serde", "dep:serde_json"]
+gate_exec = [
+    "dep:tokio",
+    "dep:reqwest",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:serde_yaml",
+    "dep:hmac",
+    "dep:sha2",
+    "dep:async-trait",
+    "dep:clap",
+    "dep:futures-util",
+    "dep:tokio-tungstenite",
+    "dep:dotenvy",
+]
+
+[dependencies.tungstenite]
+version = "0.21"
+optional = true
+default-features = false
+features = ["handshake", "rustls-tls-webpki-roots"]
+
+[dependencies.url]
+version = "2"
+optional = true
+
+[dependencies.fastwebsockets]
+version = "0.6"
+optional = true
+
+[dependencies.hyper]
+version = "1"
+optional = true
+
+[dependencies.hyper-util]
+version = "0.1"
+optional = true
+features = ["client", "http1", "http2", "tokio"]
+
+[dependencies.http]
+version = "1"
+optional = true
+
+[dependencies.tokio]
+version = "1"
+optional = true
+features = ["rt-multi-thread", "macros", "net", "time", "signal"]
+
+[dependencies.bytes]
+version = "1"
+optional = true
+
+[dependencies.libc]
+version = "0.2"
+optional = true
+
+[dependencies.serde]
+version = "1"
+optional = true
+features = ["derive"]
+
+[dependencies.serde_json]
+version = "1"
+optional = true
+
+[dependencies.reqwest]
+version = "0.11"
+optional = true
+default-features = false
+features = ["json", "rustls-tls"]
+
+[dependencies.async-trait]
+version = "0.1"
+optional = true
+
+[dependencies.hmac]
+version = "0.12"
+optional = true
+
+[dependencies.sha2]
+version = "0.10"
+optional = true
+
+[dependencies.serde_yaml]
+version = "0.9"
+optional = true
+
+[dependencies.anyhow]
+version = "1"
+
+[dependencies.clap]
+version = "4"
+features = ["derive"]
+optional = true
+
+[dependencies.tokio-tungstenite]
+version = "0.21"
+optional = true
+features = ["rustls-tls-native-roots"]
+
+[dependencies.futures-util]
+version = "0.3"
+optional = true
+features = ["sink", "std"]
+
+[dependencies.dotenvy]
+version = "0.15"
+optional = true

@@ -1,0 +1,180 @@
+#![allow(dead_code)]
+
+use std::time::{Duration, Instant};
+
+use serde::Deserialize;
+
+use crate::base_classes::types::Side;
+use crate::execution::{
+    ClientOrderId, ExecutionReport, OrderStatus, QuoteIntent, TimeInForce, Venue,
+};
+
+const DEFAULT_REPRICE_BPS: f64 = 2.0;
+const DEFAULT_DEBOUNCE_MS: u64 = 50;
+
+fn default_reprice_bps() -> f64 {
+    DEFAULT_REPRICE_BPS
+}
+
+fn default_debounce_ms() -> u64 {
+    DEFAULT_DEBOUNCE_MS
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct QuoteConfig {
+    pub venue: Venue,
+    pub symbol: String,
+    pub size: f64,
+    pub spread_bps: f64,
+    pub min_tick: f64,
+    #[serde(default = "default_reprice_bps")]
+    pub reprice_bps: f64,
+    #[serde(default = "default_debounce_ms")]
+    pub debounce_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct QuotePlan {
+    pub reference_price: f64,
+    pub cancels: Vec<ClientOrderId>,
+    pub intents: Vec<QuoteIntent>,
+    pub planned_at: Instant,
+}
+
+pub struct SimpleQuoteStrategy {
+    config: QuoteConfig,
+    next_id: u64,
+    last_reference: Option<f64>,
+    last_refresh_at: Option<Instant>,
+    active_orders: Vec<ClientOrderId>,
+}
+
+impl SimpleQuoteStrategy {
+    pub fn new(config: QuoteConfig) -> Self {
+        Self {
+            config,
+            next_id: 0,
+            last_reference: None,
+            last_refresh_at: None,
+            active_orders: Vec::new(),
+        }
+    }
+
+    pub fn on_reference_price(&mut self, price: f64, now: Instant) -> Option<QuotePlan> {
+        if !price.is_finite() || price <= 0.0 {
+            return None;
+        }
+
+        if !self.should_requote(price, now) {
+            return None;
+        }
+
+        let cancels = self.active_orders.clone();
+        let intents = self.build_intents(price);
+
+        Some(QuotePlan {
+            reference_price: price,
+            cancels,
+            intents,
+            planned_at: now,
+        })
+    }
+
+    pub fn commit_plan(&mut self, plan: &QuotePlan) {
+        self.last_reference = Some(plan.reference_price);
+        self.last_refresh_at = Some(plan.planned_at);
+        self.active_orders = plan
+            .intents
+            .iter()
+            .map(|intent| intent.client_order_id.clone())
+            .collect();
+    }
+
+    pub fn handle_report(&mut self, report: &ExecutionReport) {
+        if matches!(
+            report.status,
+            OrderStatus::Filled | OrderStatus::Canceled | OrderStatus::Rejected
+        ) {
+            self.active_orders
+                .retain(|id| id != &report.client_order_id);
+        }
+    }
+
+    fn should_requote(&self, price: f64, now: Instant) -> bool {
+        let debounce_elapsed = self
+            .last_refresh_at
+            .map(|ts| now.saturating_duration_since(ts) >= self.debounce_duration())
+            .unwrap_or(true);
+
+        if self.active_orders.is_empty() {
+            return debounce_elapsed;
+        }
+
+        if !debounce_elapsed {
+            return false;
+        }
+
+        if let Some(last_price) = self.last_reference.filter(|p| *p > 0.0) {
+            let change_bps = ((price - last_price).abs() / last_price) * 10_000.0;
+            return change_bps >= self.config.reprice_bps.max(f64::EPSILON);
+        }
+
+        true
+    }
+
+    fn build_intents(&mut self, mid: f64) -> Vec<QuoteIntent> {
+        let mut spread = mid * self.config.spread_bps / 10_000.0;
+        if spread < self.config.min_tick {
+            spread = self.config.min_tick;
+        }
+        let half = spread / 2.0;
+        let (bid_px, ask_px) = self.quote_levels(mid, half);
+
+        let bid = QuoteIntent::new(
+            self.config.venue,
+            self.config.symbol.clone(),
+            Side::Bid,
+            bid_px,
+            self.config.size,
+            TimeInForce::PostOnly,
+            self.next_client_id("B"),
+        );
+        let ask = QuoteIntent::new(
+            self.config.venue,
+            self.config.symbol.clone(),
+            Side::Ask,
+            ask_px,
+            self.config.size,
+            TimeInForce::PostOnly,
+            self.next_client_id("S"),
+        );
+        vec![bid, ask]
+    }
+
+    fn quote_levels(&self, mid: f64, half_spread: f64) -> (f64, f64) {
+        let tick = self.config.min_tick.max(1e-8);
+        let mut bid = ((mid - half_spread) / tick).floor() * tick;
+        let mut ask = ((mid + half_spread) / tick).ceil() * tick;
+
+        if bid <= 0.0 {
+            bid = tick;
+        }
+        if ask <= bid {
+            ask = bid + tick;
+        }
+        (bid, ask)
+    }
+
+    fn next_client_id(&mut self, side_tag: &str) -> ClientOrderId {
+        self.next_id = self.next_id.wrapping_add(1);
+        ClientOrderId::new(format!(
+            "t-gate-{}-{}",
+            side_tag.to_lowercase(),
+            self.next_id
+        ))
+    }
+
+    fn debounce_duration(&self) -> Duration {
+        Duration::from_millis(self.config.debounce_ms.max(1))
+    }
+}

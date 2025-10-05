@@ -1,0 +1,12 @@
+/target
+.env
+.env.*
+.venv
+venv/
+ENV/
+env/
+*.env
+*.env.*
+/*.env
+/.env.*
+/.venv
