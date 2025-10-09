@@ -11,6 +11,32 @@ fn direction_str(dir: Option<TradeDirection>) -> &'static str {
     dir.map_or("", |d| d.as_str())
 }
 
+#[inline(always)]
+fn write_csv_row(
+    writer: &mut BufWriter<File>,
+    ts: u64,
+    exchange: &str,
+    feed: &str,
+    price: f64,
+    direction: Option<TradeDirection>,
+    quantity: Option<f64>,
+    role: Option<&str>,
+    info: Option<&str>,
+) {
+    let dir = direction_str(direction);
+    let qty = quantity
+        .map(|q| format!("{q:.8}"))
+        .unwrap_or_else(String::new);
+    let role_str = role.unwrap_or("");
+    let info_str = info.unwrap_or("");
+    writeln!(
+        writer,
+        "{},{},{},{},{},{},{},{}",
+        ts, exchange, feed, price, dir, qty, role_str, info_str
+    )
+    .ok();
+}
+
 fn main() {
     // Args: SYMBOL [output.csv]
     let symbol = std::env::args()
@@ -21,17 +47,18 @@ fn main() {
         .unwrap_or_else(|| "all_exchanges.csv".to_string());
 
     // Spawn background engine: producers + processors maintain state. This process only writes snapshots.
-    let _engine = spawn_state_engine(symbol.clone());
+    let _engine = spawn_state_engine(symbol.clone(), None);
 
     eprintln!("Collecting mids + trades to {out_path}. Ctrl-C to stop.");
     let file = File::create(&out_path).expect("create csv");
     let mut w = BufWriter::new(file);
-    writeln!(w, "ts_ns,exchange,feed,price,direction").unwrap();
+    writeln!(w, "ts_ns,exchange,feed,price,direction,quantity,role,info").unwrap();
 
     // Last seen seq markers per feed to write only new updates
     let mut last_bybit = (0u64, 0u64, 0u64);
     let mut last_binance = (0u64, 0u64, 0u64);
     let mut last_gate = (0u64, 0u64, 0u64);
+    let mut last_gate_user_trade = 0u64;
     let mut last_bitget = (0u64, 0u64, 0u64);
 
     loop {
@@ -40,48 +67,51 @@ fn main() {
         if st.bybit.orderbook.seq != last_bybit.0 {
             if let Some(p) = st.bybit.orderbook.price {
                 let ts = st.bybit.orderbook.ts_ns.unwrap_or(0);
-                writeln!(
-                    w,
-                    "{},{},{},{},{}",
+                write_csv_row(
+                    &mut w,
                     ts,
                     "bybit",
                     "orderbook",
                     p,
-                    direction_str(st.bybit.orderbook.direction),
-                )
-                .ok();
+                    st.bybit.orderbook.direction,
+                    None,
+                    None,
+                    None,
+                );
                 last_bybit.0 = st.bybit.orderbook.seq;
             }
         }
         if st.bybit.bbo.seq != last_bybit.1 {
             if let Some(p) = st.bybit.bbo.price {
                 let ts = st.bybit.bbo.ts_ns.unwrap_or(0);
-                writeln!(
-                    w,
-                    "{},{},{},{},{}",
+                write_csv_row(
+                    &mut w,
                     ts,
                     "bybit",
                     "bbo",
                     p,
-                    direction_str(st.bybit.bbo.direction),
-                )
-                .ok();
+                    st.bybit.bbo.direction,
+                    None,
+                    None,
+                    None,
+                );
                 last_bybit.1 = st.bybit.bbo.seq;
             }
         }
         if st.bybit.trade.seq != last_bybit.2 {
             if let Some(p) = st.bybit.trade.price {
                 let ts = st.bybit.trade.ts_ns.unwrap_or(0);
-                writeln!(
-                    w,
-                    "{},{},{},{},{}",
+                write_csv_row(
+                    &mut w,
                     ts,
                     "bybit",
                     "trade",
                     p,
-                    direction_str(st.bybit.trade.direction),
-                )
-                .ok();
+                    st.bybit.trade.direction,
+                    None,
+                    None,
+                    None,
+                );
                 last_bybit.2 = st.bybit.trade.seq;
             }
         }
@@ -89,48 +119,51 @@ fn main() {
         if st.binance.orderbook.seq != last_binance.0 {
             if let Some(p) = st.binance.orderbook.price {
                 let ts = st.binance.orderbook.ts_ns.unwrap_or(0);
-                writeln!(
-                    w,
-                    "{},{},{},{},{}",
+                write_csv_row(
+                    &mut w,
                     ts,
                     "binance",
                     "orderbook",
                     p,
-                    direction_str(st.binance.orderbook.direction),
-                )
-                .ok();
+                    st.binance.orderbook.direction,
+                    None,
+                    None,
+                    None,
+                );
                 last_binance.0 = st.binance.orderbook.seq;
             }
         }
         if st.binance.bbo.seq != last_binance.1 {
             if let Some(p) = st.binance.bbo.price {
                 let ts = st.binance.bbo.ts_ns.unwrap_or(0);
-                writeln!(
-                    w,
-                    "{},{},{},{},{}",
+                write_csv_row(
+                    &mut w,
                     ts,
                     "binance",
                     "bbo",
                     p,
-                    direction_str(st.binance.bbo.direction),
-                )
-                .ok();
+                    st.binance.bbo.direction,
+                    None,
+                    None,
+                    None,
+                );
                 last_binance.1 = st.binance.bbo.seq;
             }
         }
         if st.binance.trade.seq != last_binance.2 {
             if let Some(p) = st.binance.trade.price {
                 let ts = st.binance.trade.ts_ns.unwrap_or(0);
-                writeln!(
-                    w,
-                    "{},{},{},{},{}",
+                write_csv_row(
+                    &mut w,
                     ts,
                     "binance",
                     "trade",
                     p,
-                    direction_str(st.binance.trade.direction),
-                )
-                .ok();
+                    st.binance.trade.direction,
+                    None,
+                    None,
+                    None,
+                );
                 last_binance.2 = st.binance.trade.seq;
             }
         }
@@ -138,97 +171,122 @@ fn main() {
         if st.gate.orderbook.seq != last_gate.0 {
             if let Some(p) = st.gate.orderbook.price {
                 let ts = st.gate.orderbook.ts_ns.unwrap_or(0);
-                writeln!(
-                    w,
-                    "{},{},{},{},{}",
+                write_csv_row(
+                    &mut w,
                     ts,
                     "gate",
                     "orderbook",
                     p,
-                    direction_str(st.gate.orderbook.direction),
-                )
-                .ok();
+                    st.gate.orderbook.direction,
+                    None,
+                    None,
+                    None,
+                );
                 last_gate.0 = st.gate.orderbook.seq;
             }
         }
         if st.gate.bbo.seq != last_gate.1 {
             if let Some(p) = st.gate.bbo.price {
                 let ts = st.gate.bbo.ts_ns.unwrap_or(0);
-                writeln!(
-                    w,
-                    "{},{},{},{},{}",
+                write_csv_row(
+                    &mut w,
                     ts,
                     "gate",
                     "bbo",
                     p,
-                    direction_str(st.gate.bbo.direction),
-                )
-                .ok();
+                    st.gate.bbo.direction,
+                    None,
+                    None,
+                    None,
+                );
                 last_gate.1 = st.gate.bbo.seq;
             }
         }
         if st.gate.trade.seq != last_gate.2 {
             if let Some(p) = st.gate.trade.price {
                 let ts = st.gate.trade.ts_ns.unwrap_or(0);
-                writeln!(
-                    w,
-                    "{},{},{},{},{}",
+                write_csv_row(
+                    &mut w,
                     ts,
                     "gate",
                     "trade",
                     p,
-                    direction_str(st.gate.trade.direction),
-                )
-                .ok();
+                    st.gate.trade.direction,
+                    None,
+                    None,
+                    None,
+                );
                 last_gate.2 = st.gate.trade.seq;
             }
+        }
+        if st.gate.user_trade.seq != last_gate_user_trade {
+            if let Some(p) = st.gate.user_trade.price {
+                let ts = st.gate.user_trade.ts_ns.unwrap_or(0);
+                let role = st.gate.user_trade.role.as_deref();
+                let info = st.gate.user_trade.text.as_deref();
+                write_csv_row(
+                    &mut w,
+                    ts,
+                    "gate",
+                    "user_trade",
+                    p,
+                    st.gate.user_trade.direction,
+                    st.gate.user_trade.quantity,
+                    role,
+                    info,
+                );
+            }
+            last_gate_user_trade = st.gate.user_trade.seq;
         }
         // bitget
         if st.bitget.orderbook.seq != last_bitget.0 {
             if let Some(p) = st.bitget.orderbook.price {
                 let ts = st.bitget.orderbook.ts_ns.unwrap_or(0);
-                writeln!(
-                    w,
-                    "{},{},{},{},{}",
+                write_csv_row(
+                    &mut w,
                     ts,
                     "bitget",
                     "orderbook",
                     p,
-                    direction_str(st.bitget.orderbook.direction),
-                )
-                .ok();
+                    st.bitget.orderbook.direction,
+                    None,
+                    None,
+                    None,
+                );
                 last_bitget.0 = st.bitget.orderbook.seq;
             }
         }
         if st.bitget.bbo.seq != last_bitget.1 {
             if let Some(p) = st.bitget.bbo.price {
                 let ts = st.bitget.bbo.ts_ns.unwrap_or(0);
-                writeln!(
-                    w,
-                    "{},{},{},{},{}",
+                write_csv_row(
+                    &mut w,
                     ts,
                     "bitget",
                     "bbo",
                     p,
-                    direction_str(st.bitget.bbo.direction),
-                )
-                .ok();
+                    st.bitget.bbo.direction,
+                    None,
+                    None,
+                    None,
+                );
                 last_bitget.1 = st.bitget.bbo.seq;
             }
         }
         if st.bitget.trade.seq != last_bitget.2 {
             if let Some(p) = st.bitget.trade.price {
                 let ts = st.bitget.trade.ts_ns.unwrap_or(0);
-                writeln!(
-                    w,
-                    "{},{},{},{},{}",
+                write_csv_row(
+                    &mut w,
                     ts,
                     "bitget",
                     "trade",
                     p,
-                    direction_str(st.bitget.trade.direction),
-                )
-                .ok();
+                    st.bitget.trade.direction,
+                    None,
+                    None,
+                    None,
+                );
                 last_bitget.2 = st.bitget.trade.seq;
             }
         }

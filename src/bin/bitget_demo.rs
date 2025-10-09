@@ -11,7 +11,7 @@ fn main() {
     const N: usize = 1 << 12;
 
     let (consumer, _jh) =
-        spawn_ws_worker::<BitgetHandler, N>(BitgetHandler::new(symbol.clone()), core_pin);
+        spawn_ws_worker::<BitgetHandler, N>(BitgetHandler::new(symbol.clone()), core_pin, None);
 
     eprintln!("Bitget futures streaming for {symbol}. Enable ws backend features to connect.");
     eprintln!(

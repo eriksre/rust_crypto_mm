@@ -3,6 +3,7 @@
 
 use crate::base_classes::types::Ts;
 use crate::base_classes::ws::ExchangeHandler;
+use std::time::Instant;
 
 #[derive(Debug, Clone)]
 pub enum BinanceEvent {
@@ -101,6 +102,7 @@ pub struct MarkPriceUpdate {
 #[derive(Debug, Clone)]
 pub struct BinanceParsedFrame {
     pub ts: Ts,
+    pub recv_instant: Instant,
     pub event: BinanceEvent,
 }
 
@@ -171,13 +173,21 @@ impl ExchangeHandler for BinanceParsedHandler {
     fn initial_subscriptions(&self) -> &[String] {
         &self.subs
     }
-    fn parse_text(&self, text: &str, ts: Ts) -> Option<Self::Out> {
+    fn parse_text(&self, text: &str, ts: Ts, recv_instant: Instant) -> Option<Self::Out> {
         let event = Self::parse_event(text.as_bytes())?;
-        Some(BinanceParsedFrame { ts, event })
+        Some(BinanceParsedFrame {
+            ts,
+            recv_instant,
+            event,
+        })
     }
-    fn parse_binary(&self, data: &[u8], ts: Ts) -> Option<Self::Out> {
+    fn parse_binary(&self, data: &[u8], ts: Ts, recv_instant: Instant) -> Option<Self::Out> {
         let event = Self::parse_event(data)?;
-        Some(BinanceParsedFrame { ts, event })
+        Some(BinanceParsedFrame {
+            ts,
+            recv_instant,
+            event,
+        })
     }
 
     // Binance futures WS does not accept JSON PING on this endpoint; rely on WS-level pings only.

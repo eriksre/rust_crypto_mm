@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::env;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -14,6 +15,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::sleep;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
+use crate::base_classes::state::{TradeDirection, state};
 use crate::base_classes::types::Side;
 use crate::exchanges::endpoints::GateioWs;
 use crate::exchanges::gate_rest;
@@ -132,11 +134,14 @@ impl ExecutionGateway for GateWsGateway {
         resp_rx.await.context("submit response channel closed")?
     }
 
-    async fn cancel(&self, id: &ClientOrderId) -> Result<()> {
+    async fn cancel_batch(&self, ids: &[ClientOrderId]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(GatewayCommand::Cancel {
-                id: id.clone(),
+                ids: ids.iter().cloned().collect(),
                 resp: resp_tx,
             })
             .await
@@ -170,7 +175,7 @@ enum GatewayCommand {
         resp: oneshot::Sender<Result<Vec<OrderAck>>>,
     },
     Cancel {
-        id: ClientOrderId,
+        ids: Vec<ClientOrderId>,
         resp: oneshot::Sender<Result<()>>,
     },
     Poll {
@@ -185,7 +190,7 @@ enum PendingRequest {
         resp_tx: oneshot::Sender<Result<Vec<OrderAck>>>,
     },
     Cancel {
-        id: ClientOrderId,
+        ids: Vec<ClientOrderId>,
         resp_tx: oneshot::Sender<Result<()>>,
     },
 }
@@ -196,7 +201,7 @@ struct GateWsWorker {
     reports: Arc<Mutex<Vec<ExecutionReport>>>,
     client_to_exchange: Arc<Mutex<HashMap<ClientOrderId, ExchangeOrderId>>>,
     req_counter: u64,
-    deferred_cancels: HashMap<ClientOrderId, oneshot::Sender<Result<()>>>,
+    user_id: Option<String>,
 }
 
 impl GateWsWorker {
@@ -212,8 +217,102 @@ impl GateWsWorker {
             reports,
             client_to_exchange,
             req_counter: 0,
-            deferred_cancels: HashMap::new(),
+            user_id: None,
         }
+    }
+
+    async fn handle_user_trades_message(&self, value: &Value) -> Result<()> {
+        let event = value.get("event").and_then(|v| v.as_str()).unwrap_or("");
+        if event != "update" {
+            return Ok(());
+        }
+
+        if let Some(results) = value.get("result").and_then(|v| v.as_array()) {
+            for trade in results {
+                self.record_user_trade(trade).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn record_user_trade(&self, trade: &Value) -> Result<()> {
+        let contract = trade.get("contract").and_then(|v| v.as_str()).unwrap_or("");
+        if !contract.is_empty() && !contract.eq_ignore_ascii_case(&self.cfg.symbol) {
+            return Ok(());
+        }
+
+        let price = trade.get("price").and_then(value_to_f64);
+        let size_contracts = trade.get("size").and_then(value_to_f64).unwrap_or(0.0);
+        let quantity = if size_contracts.abs() > f64::EPSILON {
+            Some(size_contracts.abs() * self.cfg.contract_size)
+        } else {
+            None
+        };
+        let direction = if size_contracts > 0.0 {
+            Some(TradeDirection::Buy)
+        } else if size_contracts < 0.0 {
+            Some(TradeDirection::Sell)
+        } else {
+            None
+        };
+        let fee = trade.get("fee").and_then(value_to_f64);
+        let role = trade
+            .get("role")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let text = trade
+            .get("text")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let order_id = trade.get("order_id").and_then(value_to_string);
+        let ts_ns = trade
+            .get("create_time_ms")
+            .and_then(value_to_u64)
+            .map(|ms| ms.saturating_mul(1_000_000))
+            .or_else(|| {
+                trade
+                    .get("create_time")
+                    .and_then(value_to_u64)
+                    .map(|secs| secs.saturating_mul(1_000_000_000))
+            });
+
+        {
+            let mut st = state().lock().unwrap();
+            let snap = &mut st.gate.user_trade;
+            snap.price = price;
+            snap.contracts = Some(size_contracts);
+            snap.quantity = quantity;
+            snap.fee = fee;
+            snap.role = role.clone();
+            snap.text = text.clone();
+            snap.order_id = order_id.clone();
+            snap.ts_ns = ts_ns;
+            snap.direction = direction;
+            snap.seq = snap.seq.wrapping_add(1);
+        }
+
+        if let Some(ref text_id) = text {
+            let client_id = ClientOrderId::new(text_id.clone());
+            let known = {
+                let guard = self.client_to_exchange.lock().await;
+                guard.contains_key(&client_id)
+            };
+
+            if known {
+                let fill_qty = quantity.unwrap_or(0.0);
+                let mut guard = self.reports.lock().await;
+                guard.push(ExecutionReport {
+                    client_order_id: client_id,
+                    exchange_order_id: order_id.map(ExchangeOrderId),
+                    status: OrderStatus::PartiallyFilled,
+                    filled_qty: fill_qty,
+                    avg_fill_price: price,
+                    ts: ts_ns,
+                });
+            }
+        }
+
+        Ok(())
     }
 
     async fn run(mut self) -> Result<()> {
@@ -283,6 +382,9 @@ impl GateWsWorker {
         ws.send(Message::Ping(Vec::new())).await.ok();
 
         self.perform_login(&mut ws).await?;
+        if let Err(err) = self.subscribe_user_trades(&mut ws).await {
+            eprintln!("Gate WS user trade subscribe failed: {:#}", err);
+        }
         let (sink, stream) = ws.split();
         Ok((sink, stream))
     }
@@ -299,22 +401,21 @@ impl GateWsWorker {
         loop {
             match ws.next().await {
                 Some(Ok(Message::Text(text))) => {
-                    let resp: WsResponse = serde_json::from_str(&text)
+                    let raw: Value = serde_json::from_str(&text)
+                        .with_context(|| format!("failed to parse login response: {}", text))?;
+                    let resp: WsResponse = serde_json::from_value(raw.clone())
                         .with_context(|| format!("failed to parse login response: {}", text))?;
                     if resp.request_id.as_deref() == Some(&req_id) {
                         if resp.is_success() {
+                            if self.user_id.is_none() {
+                                if let Some(uid) = extract_user_id_value(&raw) {
+                                    self.user_id = Some(uid);
+                                }
+                            }
                             return Ok(());
                         }
                         let err_msg = resp
-                            .data
-                            .and_then(|d| d.errs)
-                            .map(|e| {
-                                format!(
-                                    "{}: {}",
-                                    e.label.unwrap_or_default(),
-                                    e.message.unwrap_or_default()
-                                )
-                            })
+                            .error_message()
                             .unwrap_or_else(|| "login failed".to_string());
                         bail!(err_msg);
                     }
@@ -327,6 +428,38 @@ impl GateWsWorker {
                 None => bail!("connection closed before login ack"),
             }
         }
+    }
+
+    async fn subscribe_user_trades(
+        &mut self,
+        ws: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+    ) -> Result<()> {
+        let uid = if let Some(uid) = self.user_id.clone() {
+            uid
+        } else if let Ok(env_uid) = env::var("GATE_UID") {
+            env_uid
+        } else {
+            return Err(anyhow!(
+                "Gate login did not provide uid; set GATE_UID to enable user trade stream"
+            ));
+        };
+
+        let ts = current_unix_ts();
+        let sign = sign_subscribe(&self.cfg.api_secret, GateioWs::USER_TRADES, ts);
+        let payload = json!({
+            "time": ts,
+            "channel": GateioWs::USER_TRADES,
+            "event": "subscribe",
+            "payload": [uid, "!all"],
+            "auth": {
+                "method": "api_key",
+                "KEY": self.cfg.api_key,
+                "SIGN": sign,
+            }
+        });
+
+        ws.send(Message::Text(payload.to_string())).await?;
+        Ok(())
     }
 
     async fn handle_command(
@@ -375,23 +508,11 @@ impl GateWsWorker {
                 );
                 Ok(false)
             }
-            GatewayCommand::Cancel { id, resp } => {
-                let exchange_id = {
-                    let guard = self.client_to_exchange.lock().await;
-                    guard.get(&id).cloned()
-                };
-
-                if let Some(exch) = exchange_id {
-                    self.deferred_cancels.remove(&id);
-                    self.send_cancel_request(id, exch.0, resp, sink, pending)
-                        .await;
+            GatewayCommand::Cancel { ids, resp } => {
+                if ids.is_empty() {
+                    let _ = resp.send(Ok(()));
                 } else {
-                    if let Some(old) = self.deferred_cancels.insert(id.clone(), resp) {
-                        let _ = old.send(Err(anyhow!(
-                            "duplicate cancel request for {}; retaining latest",
-                            id
-                        )));
-                    }
+                    self.send_cancel_request(ids, resp, sink, pending).await;
                 }
                 Ok(false)
             }
@@ -421,7 +542,22 @@ impl GateWsWorker {
     ) -> Result<()> {
         match msg {
             Message::Text(text) => {
-                let resp: WsResponse = match serde_json::from_str(&text) {
+                let raw: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => return Ok(()),
+                };
+
+                if raw
+                    .get("channel")
+                    .and_then(|v| v.as_str())
+                    .map(|ch| ch == GateioWs::USER_TRADES)
+                    .unwrap_or(false)
+                {
+                    self.handle_user_trades_message(&raw).await?;
+                    return Ok(());
+                }
+
+                let resp: WsResponse = match serde_json::from_value(raw) {
                     Ok(r) => r,
                     Err(_) => return Ok(()),
                 };
@@ -436,34 +572,24 @@ impl GateWsWorker {
                         match pending_req {
                             PendingRequest::Submit { intents, resp_tx } => {
                                 match self.process_submit_response(intents, &resp).await {
-                                    Ok((acks, reports, followup_cancels)) => {
+                                    Ok((acks, reports)) => {
                                         {
                                             let mut guard = self.reports.lock().await;
                                             guard.extend(reports);
                                         }
                                         let _ = resp_tx.send(Ok(acks));
-                                        for (cid, eid, cancel_resp) in followup_cancels {
-                                            self.send_cancel_request(
-                                                cid,
-                                                eid,
-                                                cancel_resp,
-                                                sink,
-                                                pending,
-                                            )
-                                            .await;
-                                        }
                                     }
                                     Err(err) => {
                                         let _ = resp_tx.send(Err(err));
                                     }
                                 }
                             }
-                            PendingRequest::Cancel { id, resp_tx } => {
-                                match self.process_cancel_response(&id, &resp).await {
-                                    Ok(report_opt) => {
-                                        if let Some(report) = report_opt {
+                            PendingRequest::Cancel { ids, resp_tx } => {
+                                match self.process_cancel_response(ids, &resp).await {
+                                    Ok(mut reports) => {
+                                        if !reports.is_empty() {
                                             let mut guard = self.reports.lock().await;
-                                            guard.push(report);
+                                            guard.append(&mut reports);
                                         }
                                         let _ = resp_tx.send(Ok(()));
                                     }
@@ -492,11 +618,7 @@ impl GateWsWorker {
         &mut self,
         intents: Vec<QuoteIntent>,
         resp: &WsResponse,
-    ) -> Result<(
-        Vec<OrderAck>,
-        Vec<ExecutionReport>,
-        Vec<(ClientOrderId, String, oneshot::Sender<Result<()>>)>,
-    )> {
+    ) -> Result<(Vec<OrderAck>, Vec<ExecutionReport>)> {
         if !resp.is_success() {
             let err = resp
                 .error_message()
@@ -510,97 +632,69 @@ impl GateWsWorker {
             .and_then(|d| d.result.as_ref())
             .ok_or_else(|| anyhow!("missing result payload in order response"))?;
 
-        let intents_map: HashMap<String, QuoteIntent> = intents
-            .into_iter()
-            .map(|intent| (intent.client_order_id.to_string(), intent))
-            .collect();
-
         let arr = payload
             .as_array()
             .ok_or_else(|| anyhow!("order batch result is not an array"))?;
 
-        let mut order_acks = Vec::new();
-        let mut reports = Vec::new();
-        let mut followup_cancels = Vec::new();
+        if arr.len() != intents.len() {
+            return Err(anyhow!(
+                "order batch result length mismatch: got {} entries, expected {}",
+                arr.len(),
+                intents.len()
+            ));
+        }
 
-        for entry in arr {
+        let mut order_acks = Vec::with_capacity(arr.len());
+        let mut reports = Vec::with_capacity(arr.len());
+        for (entry, intent) in arr.iter().zip(intents.iter()) {
             let succeeded = entry
                 .get("succeeded")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
-            let text_opt = entry.get("text").and_then(|v| v.as_str());
-            let text_owned = text_opt.map(|s| s.to_string());
 
             if !succeeded {
                 let message = entry
                     .get("message")
                     .and_then(|v| v.as_str())
                     .unwrap_or("order rejected");
-                if let Some(text) = text_owned.as_deref() {
-                    if let Some(intent) = intents_map.get(text) {
-                        if let Some(resp_tx) = self.deferred_cancels.remove(&intent.client_order_id)
-                        {
-                            let _ = resp_tx.send(Err(anyhow!(message.to_string())));
-                        }
-                    }
-                }
                 // Prefer to surface the raw API rejection so the caller can react.
                 return Err(anyhow!(message.to_string()));
             }
 
-            let text = text_owned
-                .as_deref()
-                .ok_or_else(|| anyhow!("order response missing text field: {}", entry))?;
-            let client_intent = intents_map
-                .get(text)
-                .ok_or_else(|| anyhow!("order response text {} not found", text))?;
+            if let Some(text) = entry.get("text").and_then(|v| v.as_str()) {
+                if text != intent.client_order_id.0 {
+                    eprintln!(
+                        "warning: order response text {} does not match client id {}",
+                        text, intent.client_order_id
+                    );
+                }
+            }
 
             let exchange_id = entry.get("id").and_then(value_to_string);
             match exchange_id {
                 Some(ref eid) => {
                     let mut map_guard = self.client_to_exchange.lock().await;
-                    map_guard.insert(
-                        client_intent.client_order_id.clone(),
-                        ExchangeOrderId(eid.clone()),
-                    );
-                    if let Some(resp_tx) =
-                        self.deferred_cancels.remove(&client_intent.client_order_id)
-                    {
-                        followup_cancels.push((
-                            client_intent.client_order_id.clone(),
-                            eid.clone(),
-                            resp_tx,
-                        ));
-                    }
+                    map_guard.insert(intent.client_order_id.clone(), ExchangeOrderId(eid.clone()));
                 }
-                None => {
-                    if let Some(resp_tx) =
-                        self.deferred_cancels.remove(&client_intent.client_order_id)
-                    {
-                        let _ = resp_tx.send(Err(anyhow!(
-                            "order {} acknowledged without exchange id",
-                            client_intent.client_order_id
-                        )));
-                    }
-                }
+                None => {}
             }
 
             order_acks.push(OrderAck {
-                client_order_id: client_intent.client_order_id.clone(),
+                client_order_id: intent.client_order_id.clone(),
                 exchange_order_id: exchange_id.clone().map(ExchangeOrderId),
             });
 
-            let report = self.build_execution_report(entry, client_intent, exchange_id.clone());
+            let report = self.build_execution_report(entry, intent, exchange_id.clone());
             reports.push(report);
         }
 
-        Ok((order_acks, reports, followup_cancels))
+        Ok((order_acks, reports))
     }
     async fn process_cancel_response(
         &mut self,
-        id: &ClientOrderId,
+        ids: Vec<ClientOrderId>,
         resp: &WsResponse,
-    ) -> Result<Option<ExecutionReport>> {
+    ) -> Result<Vec<ExecutionReport>> {
         if !resp.is_success() {
             let err = resp
                 .error_message()
@@ -608,25 +702,63 @@ impl GateWsWorker {
             return Err(anyhow!(err));
         }
 
-        let exchange_id = {
-            let mut map_guard = self.client_to_exchange.lock().await;
-            map_guard.remove(id)
-        };
+        let mut results_map: HashMap<String, String> = HashMap::new();
+        if let Some(result) = resp
+            .data
+            .as_ref()
+            .and_then(|d| d.result.as_ref())
+            .and_then(|v| v.as_array())
+        {
+            for entry in result {
+                if let Some(id_str) = entry.get("id").and_then(|v| v.as_str()) {
+                    let msg = entry
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    results_map.insert(id_str.to_string(), msg);
+                }
+            }
+        }
 
-        Ok(Some(ExecutionReport {
-            client_order_id: id.clone(),
-            exchange_order_id: exchange_id,
-            status: OrderStatus::Canceled,
-            filled_qty: 0.0,
-            avg_fill_price: None,
-            ts: None,
-        }))
+        let mut map_guard = self.client_to_exchange.lock().await;
+        let mut reports = Vec::with_capacity(ids.len());
+        for cid in ids {
+            map_guard.remove(&cid);
+            let key = cid.to_string();
+            let message = results_map.get(&key).cloned().unwrap_or_default();
+            let status = if message.is_empty() || message.eq_ignore_ascii_case("success") {
+                OrderStatus::Canceled
+            } else if message.eq_ignore_ascii_case("order_not_exists")
+                || message.eq_ignore_ascii_case("order_not_found")
+                || message.eq_ignore_ascii_case("order_finished")
+            {
+                OrderStatus::Canceled
+            } else {
+                eprintln!(
+                    "warning: cancel response for {} returned message '{}'",
+                    key, message
+                );
+                OrderStatus::Unknown
+            };
+
+            reports.push(ExecutionReport {
+                client_order_id: cid,
+                exchange_order_id: None,
+                status,
+                filled_qty: 0.0,
+                avg_fill_price: None,
+                ts: None,
+            });
+        }
+        drop(map_guard);
+
+        Ok(reports)
     }
 
     async fn send_cancel_request(
         &mut self,
-        id: ClientOrderId,
-        exchange_id: String,
+        ids: Vec<ClientOrderId>,
         resp_tx: oneshot::Sender<Result<()>>,
         sink: &mut futures_util::stream::SplitSink<
             WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
@@ -634,7 +766,8 @@ impl GateWsWorker {
         >,
         pending: &mut HashMap<String, PendingRequest>,
     ) {
-        let req_param = json!([exchange_id]);
+        let texts: Vec<Value> = ids.iter().map(|id| Value::String(id.to_string())).collect();
+        let req_param = Value::Array(texts);
         let ts = current_unix_ts();
         let req_id = self.next_request_id("cancel");
         let request = match build_api_request(
@@ -656,7 +789,7 @@ impl GateWsWorker {
             return;
         }
 
-        pending.insert(req_id, PendingRequest::Cancel { id, resp_tx });
+        pending.insert(req_id, PendingRequest::Cancel { ids, resp_tx });
     }
 
     fn build_execution_report(
@@ -670,7 +803,7 @@ impl GateWsWorker {
         let filled_contracts = (size_contracts - left_contracts).max(0.0);
         let filled_qty = filled_contracts * self.cfg.contract_size;
 
-        let status = match entry
+        let mut status = match entry
             .get("status")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown")
@@ -693,6 +826,14 @@ impl GateWsWorker {
             }
             _ => OrderStatus::Unknown,
         };
+
+        if matches!(status, OrderStatus::Unknown | OrderStatus::Canceled) {
+            if let Some(label) = entry.get("label").and_then(|v| v.as_str()) {
+                if matches!(label, "ORDER_POC_IMMEDIATE" | "ORDER_POST_ONLY_FAILED") {
+                    status = OrderStatus::Rejected;
+                }
+            }
+        }
 
         let avg_fill_price = entry
             .get("fill_price")
@@ -755,9 +896,6 @@ impl GateWsWorker {
                     let _ = resp_tx.send(Err(anyhow!(err.to_string())));
                 }
             }
-        }
-        for (_, resp_tx) in self.deferred_cancels.drain() {
-            let _ = resp_tx.send(Err(anyhow!(err.to_string())));
         }
     }
 
@@ -874,10 +1012,50 @@ fn sign_api(secret: &str, channel: &str, req_param: &str, ts: i64) -> String {
         .collect::<String>()
 }
 
+fn sign_subscribe(secret: &str, channel: &str, ts: i64) -> String {
+    let mut mac =
+        Hmac::<Sha512>::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
+    let payload = format!("channel={channel}&event=subscribe&time={ts}");
+    mac.update(payload.as_bytes());
+    mac.finalize()
+        .into_bytes()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
+}
+
 fn value_to_string(value: &Value) -> Option<String> {
     match value {
         Value::String(s) => Some(s.clone()),
         Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn value_to_u64(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(n) => n.as_u64(),
+        Value::String(s) => s.parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+fn extract_user_id_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Object(map) => {
+            if let Some(uid) = map
+                .get("user_id")
+                .or_else(|| map.get("uid"))
+                .or_else(|| map.get("userId"))
+            {
+                extract_user_id_value(uid)
+            } else {
+                map.values().find_map(extract_user_id_value)
+            }
+        }
+        Value::Array(items) => items.iter().find_map(extract_user_id_value),
         _ => None,
     }
 }

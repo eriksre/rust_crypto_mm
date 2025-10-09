@@ -3,6 +3,7 @@
 use crate::base_classes::types::Ts;
 use crate::base_classes::ws::{ExchangeHandler, HeartbeatPayload};
 use crate::exchanges::endpoints::GateioWs;
+use std::time::Instant;
 
 /// Normalize a Gate.io contract symbol into the expected `BASE_QUOTE` form.
 pub fn canonical_contract_symbol<S: AsRef<str>>(symbol: S) -> String {
@@ -41,8 +42,11 @@ pub fn canonical_contract_symbol<S: AsRef<str>>(symbol: S) -> String {
 #[derive(Debug, Clone)]
 pub struct GateFrame {
     pub ts: Ts,
+    pub recv_instant: Instant,
     pub raw: Vec<u8>,
 }
+
+const ENABLE_ORDERBOOK_SUB: bool = false;
 
 pub struct GateHandler {
     // E.g. BTC_USDT
@@ -54,7 +58,7 @@ impl GateHandler {
     pub fn new<S: Into<String>>(symbol: S) -> Self {
         let contract = canonical_contract_symbol(symbol.into());
         let now = || now_secs();
-        let subs = vec![
+        let mut subs = vec![
             // Book ticker (BBO)
             format!(
                 r#"{{"time":{},"channel":"{}","event":"subscribe","payload":["{}"]}}"#,
@@ -76,13 +80,14 @@ impl GateHandler {
                 GateioWs::TICKER,
                 contract
             ),
-            // V2 OB updates (obu) with level 50 (~20ms)
-            format!(
+        ];
+        if ENABLE_ORDERBOOK_SUB {
+            subs.push(format!(
                 r#"{{"time":{},"channel":"futures.obu","event":"subscribe","payload":["ob.{}.50"]}}"#,
                 now(),
                 contract
-            ),
-        ];
+            ));
+        }
         Self { contract, subs }
     }
 }
@@ -95,15 +100,17 @@ impl ExchangeHandler for GateHandler {
     fn initial_subscriptions(&self) -> &[String] {
         &self.subs
     }
-    fn parse_text(&self, text: &str, ts: Ts) -> Option<Self::Out> {
+    fn parse_text(&self, text: &str, ts: Ts, recv_instant: Instant) -> Option<Self::Out> {
         Some(GateFrame {
             ts,
+            recv_instant,
             raw: text.as_bytes().to_vec(),
         })
     }
-    fn parse_binary(&self, data: &[u8], ts: Ts) -> Option<Self::Out> {
+    fn parse_binary(&self, data: &[u8], ts: Ts, recv_instant: Instant) -> Option<Self::Out> {
         Some(GateFrame {
             ts,
+            recv_instant,
             raw: data.to_vec(),
         })
     }

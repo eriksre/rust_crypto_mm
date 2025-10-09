@@ -46,7 +46,7 @@ fn main() {
         .nth(2)
         .unwrap_or_else(|| "all_exchanges_depth.csv".to_string());
 
-    let _engine = spawn_state_engine(symbol.clone());
+    let _engine = spawn_state_engine(symbol.clone(), None);
 
     eprintln!("Collecting orderbook top levels + trades to {out_path}. Ctrl-C to stop.");
     let file = File::create(&out_path).expect("create csv");

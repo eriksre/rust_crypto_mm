@@ -2,16 +2,19 @@ strategy:
   venue: gate
   symbol: DOGE_USDT
   size: 20
-  spread_bps: 2.0
+  spread_bps: 4.0
   min_tick: 0.00001
   reprice_bps: 1.0
   debounce_ms: 50
 risk:
-  max_notional: 50.0
-  max_order_notional: 20.0
+  max_notional: 200.0
+  max_order_notional: 100.0
 mode:
   dry_run: false
   log_fills: true
+logging:
+  enabled: true
+  path: logs/gate_activity.csv
 credentials:
   api_key_env: gateio_api_key
   api_secret_env: gateio_secret_key

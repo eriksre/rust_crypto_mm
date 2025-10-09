@@ -11,7 +11,7 @@ fn main() {
     const N: usize = 1 << 12;
 
     let (consumer, _jh) =
-        spawn_ws_worker::<GateHandler, N>(GateHandler::new(symbol.clone()), core_pin);
+        spawn_ws_worker::<GateHandler, N>(GateHandler::new(symbol.clone()), core_pin, None);
 
     eprintln!("Gate futures streaming for {symbol}. Enable ws backend features to connect.");
     eprintln!(

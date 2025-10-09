@@ -46,6 +46,7 @@ pub struct QuotePlan {
 pub struct ReferenceMeta {
     pub source: String,
     pub ts_ns: Option<u64>,
+    pub received_at: Instant,
 }
 
 pub struct SimpleQuoteStrategy {
@@ -117,6 +118,13 @@ impl SimpleQuoteStrategy {
             return None;
         }
 
+        let has_uncancelled_live_orders = self.active_orders.iter().any(|id| {
+            !self.pending_cancels.iter().any(|pending| pending == id)
+        });
+        if has_uncancelled_live_orders {
+            return None;
+        }
+
         let intents = self.build_intents(price);
 
         Some(QuotePlan {
@@ -131,27 +139,57 @@ impl SimpleQuoteStrategy {
     pub fn commit_plan(&mut self, plan: &QuotePlan) {
         self.last_reference = Some(plan.reference_price);
         self.last_refresh_at = Some(plan.planned_at);
-        self.active_orders = plan
-            .intents
-            .iter()
-            .map(|intent| intent.client_order_id.clone())
-            .collect();
+        for intent in &plan.intents {
+            if !self
+                .active_orders
+                .iter()
+                .any(|id| id == &intent.client_order_id)
+            {
+                self.active_orders.push(intent.client_order_id.clone());
+            }
+        }
         self.needs_requote = false;
     }
 
     pub fn handle_report(&mut self, report: &ExecutionReport) {
-        self.pending_cancels
-            .retain(|id| id != &report.client_order_id);
-        if matches!(
-            report.status,
-            OrderStatus::Filled | OrderStatus::Canceled | OrderStatus::Rejected
-        ) {
-            self.active_orders
-                .retain(|id| id != &report.client_order_id);
-            self.needs_requote = true;
-        }
-        if matches!(report.status, OrderStatus::PartiallyFilled) {
-            self.needs_requote = true;
+        match report.status {
+            OrderStatus::Filled | OrderStatus::Canceled | OrderStatus::Rejected => {
+                self.pending_cancels
+                    .retain(|id| id != &report.client_order_id);
+                self.active_orders
+                    .retain(|id| id != &report.client_order_id);
+                self.needs_requote = true;
+            }
+            OrderStatus::PartiallyFilled => {
+                self.pending_cancels
+                    .retain(|id| id != &report.client_order_id);
+                if !self
+                    .active_orders
+                    .iter()
+                    .any(|id| id == &report.client_order_id)
+                {
+                    self.active_orders.push(report.client_order_id.clone());
+                }
+                self.needs_requote = true;
+            }
+            OrderStatus::New | OrderStatus::Unknown => {
+                let was_pending_cancel = self
+                    .pending_cancels
+                    .iter()
+                    .any(|id| id == &report.client_order_id);
+                if was_pending_cancel {
+                    self.pending_cancels
+                        .retain(|id| id != &report.client_order_id);
+                    self.needs_requote = true;
+                }
+                if !self
+                    .active_orders
+                    .iter()
+                    .any(|id| id == &report.client_order_id)
+                {
+                    self.active_orders.push(report.client_order_id.clone());
+                }
+            }
         }
     }
 

@@ -12,7 +12,7 @@ fn main() {
     const N: usize = 1 << 12; // ring capacity (power of two)
 
     let (consumer, _jh) =
-        spawn_ws_worker::<BybitHandler, N>(BybitHandler::new(symbol.clone()), core_pin);
+        spawn_ws_worker::<BybitHandler, N>(BybitHandler::new(symbol.clone()), core_pin, None);
 
     eprintln!("Bybit streaming for {symbol}. Enable ws backend features to connect.");
     eprintln!(

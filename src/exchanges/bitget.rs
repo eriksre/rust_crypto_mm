@@ -3,10 +3,12 @@
 use crate::base_classes::types::Ts;
 use crate::base_classes::ws::{AppHeartbeat, ExchangeHandler, HeartbeatPayload};
 use crate::exchanges::endpoints::BitgetWs;
+use std::time::Instant;
 
 #[derive(Debug, Clone)]
 pub struct BitgetFrame {
     pub ts: Ts,
+    pub recv_instant: Instant,
     pub raw: Vec<u8>,
 }
 
@@ -36,15 +38,17 @@ impl ExchangeHandler for BitgetHandler {
     fn initial_subscriptions(&self) -> &[String] {
         &self.subs
     }
-    fn parse_text(&self, text: &str, ts: Ts) -> Option<Self::Out> {
+    fn parse_text(&self, text: &str, ts: Ts, recv_instant: Instant) -> Option<Self::Out> {
         Some(BitgetFrame {
             ts,
+            recv_instant,
             raw: text.as_bytes().to_vec(),
         })
     }
-    fn parse_binary(&self, data: &[u8], ts: Ts) -> Option<Self::Out> {
+    fn parse_binary(&self, data: &[u8], ts: Ts, recv_instant: Instant) -> Option<Self::Out> {
         Some(BitgetFrame {
             ts,
+            recv_instant,
             raw: data.to_vec(),
         })
     }

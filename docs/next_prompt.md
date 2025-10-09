@@ -1,7 +1,11 @@
-Maybe the proper way to do it will be to first de-mean on that 20s interval. and then from those de-meaned values, have a line for each exchanges feed. eg, binance trades feed. a separate strategy defined by each exchanges feed, and then run all of those into the big regression, trying to predict the 1s regression diff. we can first try it with all the other current strategies that are in there, and then depending on the results of that, we maybe might remove some of the current strategies from the regression. we do this for the file @evaluate_fair_value.py. unless the regression will already de-mean all the inter feed differences in the average, so that we're just exposed to the coefficient? not sure if it will. might not hurt to try potentially. but probably, demeaning everything first would be good. 
+add 20ms buffer for after we submit our last cancellation till the time we can send off a new quote
 
-we should also make each of the strategy graphs step graphs rather than normal line graphs.
+are our latency metrics actually correct?
 
-the check will be to check the graph on price spikes to see how noisy / not noisy it is. maybe we can do a train test split as well, so that we're not fitting out of sample. 
+make the prices on the csv the adjusted prices not the raw price pushes
 
-also how does the trade momentum strategy work? it seems to almost always be the very first mover out of all the strategies, but then lags behind after the move starts. 
+clean up the graph
+
+clean up tech debt
+
+

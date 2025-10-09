@@ -3,11 +3,13 @@
 use crate::base_classes::types::Ts;
 use crate::base_classes::ws::ExchangeHandler;
 use crate::exchanges::endpoints::BybitWs;
+use std::time::Instant;
 
 // Lightweight event wrapper. For production, map to typed events.
 #[derive(Debug, Clone)]
 pub struct BybitFrame {
     pub ts: Ts,
+    pub recv_instant: Instant,
     pub raw: Vec<u8>,
 }
 
@@ -60,17 +62,19 @@ impl ExchangeHandler for BybitHandler {
     }
 
     #[inline(always)]
-    fn parse_text(&self, text: &str, ts: Ts) -> Option<Self::Out> {
+    fn parse_text(&self, text: &str, ts: Ts, recv_instant: Instant) -> Option<Self::Out> {
         Some(BybitFrame {
             ts,
+            recv_instant,
             raw: text.as_bytes().to_vec(),
         })
     }
 
     #[inline(always)]
-    fn parse_binary(&self, data: &[u8], ts: Ts) -> Option<Self::Out> {
+    fn parse_binary(&self, data: &[u8], ts: Ts, recv_instant: Instant) -> Option<Self::Out> {
         Some(BybitFrame {
             ts,
+            recv_instant,
             raw: data.to_vec(),
         })
     }

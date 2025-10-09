@@ -14,6 +14,7 @@ fn main() {
     let (consumer, _jh) = spawn_ws_worker::<BinanceParsedHandler, N>(
         BinanceParsedHandler::new(symbol.clone()),
         core_pin,
+        None,
     );
     eprintln!("Binance parsed streaming for {symbol}. Features: ws_tungstenite,parse_binance");
     eprintln!(

@@ -2,9 +2,43 @@
 
 use crate::base_classes::ring_buffer::{Consumer, Producer};
 use crate::base_classes::types::Ts;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 // Exchange-specific handler trait. Implement this per venue.
+#[derive(Clone, Debug, Default)]
+pub struct FeedSignal {
+    inner: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl FeedSignal {
+    #[inline(always)]
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new((Mutex::new(false), Condvar::new())),
+        }
+    }
+
+    #[inline(always)]
+    pub fn notify(&self) {
+        let (mutex, condvar) = &*self.inner;
+        let mut flag = mutex.lock().unwrap();
+        *flag = true;
+        condvar.notify_one();
+    }
+
+    #[inline(always)]
+    pub fn wait(&self) {
+        let (mutex, condvar) = &*self.inner;
+        let mut flag = mutex.lock().unwrap();
+        while !*flag {
+            flag = condvar.wait(flag).unwrap();
+        }
+        *flag = false;
+    }
+}
+
 pub trait ExchangeHandler: Send + Sync + 'static {
     type Out: Send + 'static;
 
@@ -15,8 +49,8 @@ pub trait ExchangeHandler: Send + Sync + 'static {
     fn initial_subscriptions(&self) -> &[String];
 
     // Parse inbound frames to output messages pushed to the ring buffer.
-    fn parse_text(&self, text: &str, ts: Ts) -> Option<Self::Out>;
-    fn parse_binary(&self, data: &[u8], ts: Ts) -> Option<Self::Out>;
+    fn parse_text(&self, text: &str, ts: Ts, recv_instant: Instant) -> Option<Self::Out>;
+    fn parse_binary(&self, data: &[u8], ts: Ts, recv_instant: Instant) -> Option<Self::Out>;
 
     // Optional: application-level heartbeat (e.g., Binance JSON PING)
     fn app_heartbeat(&self) -> Option<AppHeartbeat> {
@@ -110,11 +144,13 @@ pub struct AppHeartbeat {
 pub fn spawn_ws_worker<E, const N: usize>(
     handler: E,
     core_id: Option<usize>,
+    signal: Option<FeedSignal>,
 ) -> (Consumer<E::Out, N>, JoinHandle<()>)
 where
     E: ExchangeHandler,
 {
     let (producer, consumer) = Producer::<E::Out, N>::new_pair();
+    let producer_signal = signal.clone();
     let handle = std::thread::Builder::new()
         .name("ws-worker".into())
         .spawn(move || {
@@ -124,13 +160,13 @@ where
             // Choose implementation depending on feature flags.
             #[cfg(feature = "ws_tungstenite")]
             {
-                run_ws_tungstenite(handler, producer);
+                run_ws_tungstenite(handler, producer, producer_signal);
                 return;
             }
 
             #[cfg(all(not(feature = "ws_tungstenite"), feature = "ws_fast"))]
             {
-                run_ws_fast(handler, producer);
+                run_ws_fast(handler, producer, producer_signal);
                 return;
             }
 
@@ -139,6 +175,7 @@ where
                 // Fallback no-op when no WS backend is enabled.
                 let _ = producer; // silence unused in non-feature builds
                 let _ = handler;
+                let _ = signal;
                 eprintln!("No websocket feature enabled (enable 'ws_tungstenite' or 'ws_fast').");
             }
         })
@@ -178,8 +215,11 @@ fn pin_to_core(_core_idx: usize) {
 
 // ---- tungstenite (sync) backend ----
 #[cfg(feature = "ws_tungstenite")]
-fn run_ws_tungstenite<E, const N: usize>(handler: E, producer: Producer<E::Out, N>)
-where
+fn run_ws_tungstenite<E, const N: usize>(
+    handler: E,
+    producer: Producer<E::Out, N>,
+    signal: Option<FeedSignal>,
+) where
     E: ExchangeHandler,
 {
     use std::time::{Duration, Instant};
@@ -288,8 +328,12 @@ where
                                     continue;
                                 }
                             }
-                            if let Some(out) = handler.parse_text(&txt, ts) {
+                            let recv_instant = Instant::now();
+                            if let Some(out) = handler.parse_text(&txt, ts, recv_instant) {
                                 producer.push_spin(out);
+                                if let Some(ref signal) = signal {
+                                    signal.notify();
+                                }
                             }
                         }
                         Message::Binary(bin) => {
@@ -298,8 +342,12 @@ where
                                     continue;
                                 }
                             }
-                            if let Some(out) = handler.parse_binary(&bin, ts) {
+                            let recv_instant = Instant::now();
+                            if let Some(out) = handler.parse_binary(&bin, ts, recv_instant) {
                                 producer.push_spin(out);
+                                if let Some(ref signal) = signal {
+                                    signal.notify();
+                                }
                             }
                         }
                         Message::Ping(p) => {
@@ -415,12 +463,24 @@ where
                                     OpCode::Text => {
                                         if let Ok(s) = std::str::from_utf8(&frame.payload) {
                                             if let Some((k, seq)) = handler.sequence_key_text(s) { if !seq_gate.accept(k, seq) { continue; } }
-                                            if let Some(out) = handler.parse_text(s, ts) { producer.push_spin(out); }
+                                            let recv_instant = Instant::now();
+                                            if let Some(out) = handler.parse_text(s, ts, recv_instant) {
+                                                producer.push_spin(out);
+                                                if let Some(ref signal) = signal {
+                                                    signal.notify();
+                                                }
+                                            }
                                         }
                                     }
                                     OpCode::Binary => {
                                         if let Some((k, seq)) = handler.sequence_key_binary(&frame.payload) { if !seq_gate.accept(k, seq) { continue; } }
-                                        if let Some(out) = handler.parse_binary(&frame.payload, ts) { producer.push_spin(out); }
+                                        let recv_instant = Instant::now();
+                                        if let Some(out) = handler.parse_binary(&frame.payload, ts, recv_instant) {
+                                            producer.push_spin(out);
+                                            if let Some(ref signal) = signal {
+                                                signal.notify();
+                                            }
+                                        }
                                     }
                                     OpCode::Close => break,
                                     OpCode::Ping => { let _ = ws.write_pong(Bytes::new()).await; }

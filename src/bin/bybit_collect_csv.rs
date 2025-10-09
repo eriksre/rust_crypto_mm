@@ -18,7 +18,7 @@ fn main() {
 
     const N: usize = 1 << 14; // More room
     let (consumer, _jh) =
-        spawn_ws_worker::<BybitHandler, N>(BybitHandler::new(symbol.clone()), core_pin);
+        spawn_ws_worker::<BybitHandler, N>(BybitHandler::new(symbol.clone()), core_pin, None);
 
     eprintln!("Collecting Bybit mids for {symbol} → {out_path} (Ctrl-C to stop)");
 

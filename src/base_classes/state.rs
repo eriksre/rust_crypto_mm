@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use crate::base_classes::types::Ts;
 
@@ -28,6 +29,7 @@ pub struct FeedSnap {
     pub direction: Option<TradeDirection>,
     pub bid_levels: [Option<(f64, f64)>; 3],
     pub ask_levels: [Option<(f64, f64)>; 3],
+    pub received_at: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -62,10 +64,25 @@ pub struct TickerSnap {
 }
 
 #[derive(Clone, Default, Debug)]
+pub struct UserTradeSnap {
+    pub price: Option<f64>,
+    pub contracts: Option<f64>,
+    pub quantity: Option<f64>,
+    pub fee: Option<f64>,
+    pub role: Option<String>,
+    pub text: Option<String>,
+    pub order_id: Option<String>,
+    pub ts_ns: Option<Ts>,
+    pub direction: Option<TradeDirection>,
+    pub seq: u64,
+}
+
+#[derive(Clone, Default, Debug)]
 pub struct ExchangeSnap {
     pub orderbook: FeedSnap,
     pub bbo: FeedSnap,
     pub trade: FeedSnap,
+    pub user_trade: UserTradeSnap,
     pub ticker: TickerSnap,
 }
 

@@ -18,12 +18,13 @@ fn main() {
     const N: usize = 1 << 12;
 
     let (bybit_c, _j1) =
-        spawn_ws_worker::<BybitHandler, N>(BybitHandler::new(symbol.clone()), None);
+        spawn_ws_worker::<BybitHandler, N>(BybitHandler::new(symbol.clone()), None, None);
     let (bin_c, _j2) =
-        spawn_ws_worker::<BinanceHandler, N>(BinanceHandler::new(symbol.clone()), None);
-    let (gate_c, _j3) = spawn_ws_worker::<GateHandler, N>(GateHandler::new(symbol.clone()), None);
+        spawn_ws_worker::<BinanceHandler, N>(BinanceHandler::new(symbol.clone()), None, None);
+    let (gate_c, _j3) =
+        spawn_ws_worker::<GateHandler, N>(GateHandler::new(symbol.clone()), None, None);
     let (bit_c, _j4) =
-        spawn_ws_worker::<BitgetHandler, N>(BitgetHandler::new(symbol.clone()), None);
+        spawn_ws_worker::<BitgetHandler, N>(BitgetHandler::new(symbol.clone()), None, None);
 
     // feeds: 0=bbo, 1=orderbook, 2=trade, 3=ticker
     let mut bybit_cnt = [0usize; 4];

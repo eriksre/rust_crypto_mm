@@ -40,9 +40,18 @@ impl OrderManager {
     }
 
     pub async fn cancel(&self, id: &ClientOrderId) -> Result<()> {
-        self.gateway.cancel(id).await?;
+        self.cancel_many(std::slice::from_ref(id)).await
+    }
+
+    pub async fn cancel_many(&self, ids: &[ClientOrderId]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        self.gateway.cancel_batch(ids).await?;
         let mut inflight = self.inflight.lock().await;
-        inflight.remove(id);
+        for id in ids {
+            inflight.remove(id);
+        }
         Ok(())
     }
 

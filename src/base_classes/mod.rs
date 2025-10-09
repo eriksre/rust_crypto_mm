@@ -3,6 +3,7 @@ pub mod bbo_store;
 pub mod demean;
 pub mod engine;
 pub mod order_book;
+pub mod reference;
 pub mod ring_buffer;
 pub mod state;
 pub mod tickers;

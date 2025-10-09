@@ -44,7 +44,7 @@ impl ExecutionGateway for DryRunGateway {
         Ok(acks)
     }
 
-    async fn cancel(&self, _id: &ClientOrderId) -> Result<()> {
+    async fn cancel_batch(&self, _ids: &[ClientOrderId]) -> Result<()> {
         Ok(())
     }
 
