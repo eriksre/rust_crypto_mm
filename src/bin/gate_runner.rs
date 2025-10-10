@@ -7,13 +7,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use rust_test::base_classes::engine::spawn_state_engine;
 use rust_test::base_classes::reference::ReferenceEvent;
 use rust_test::base_classes::state::state as global_state;
 use rust_test::base_classes::state::{ExchangeAdjustment, ExchangeSnap, FeedSnap, TradeDirection};
 use rust_test::base_classes::types::Side;
+use rust_test::exchanges::gate_rest;
 use rust_test::execution::{
     ClientOrderId, DryRunGateway, ExecutionGateway, ExecutionReport, GateWsConfig, GateWsGateway,
     OrderAck, OrderManager, OrderStatus, QuoteIntent, Venue,
@@ -188,6 +189,14 @@ async fn main() -> Result<()> {
     let config = load_config(&cli.config)?;
     let debug = DebugLogger::new(config.mode.debug_prints);
 
+    let contract_size = resolve_contract_size(&config).await?;
+    debug.info(|| {
+        format!(
+            "resolved contract size for {}: {}",
+            config.strategy.symbol, contract_size
+        )
+    });
+
     let logger = if config.logging.is_enabled() {
         let handle = QuoteLogHandle::spawn(&config, debug.clone())?;
         debug.info(|| format!("Activity logging enabled -> {}", handle.path().display()));
@@ -208,7 +217,7 @@ async fn main() -> Result<()> {
     let gateway: Arc<dyn ExecutionGateway> = if config.mode.dry_run {
         Arc::new(DryRunGateway::new())
     } else {
-        Arc::new(setup_live_gateway(&config).await?)
+        Arc::new(setup_live_gateway(&config, contract_size).await?)
     };
     let order_manager = Arc::new(OrderManager::new(gateway, Duration::from_secs(30)));
     let mut strategy = SimpleQuoteStrategy::new(config.strategy.clone());
@@ -280,6 +289,7 @@ async fn main() -> Result<()> {
                             now,
                             &mut strategy,
                             &config,
+                            contract_size,
                             order_manager.clone(),
                             logger.clone(),
                             debug.clone(),
@@ -388,12 +398,13 @@ async fn handle_quote_tick(
     now: Instant,
     strategy: &mut SimpleQuoteStrategy,
     config: &RunnerConfig,
+    contract_size: f64,
     order_manager: Arc<OrderManager>,
     logger: Option<QuoteLogHandle>,
     debug: DebugLogger,
 ) -> Result<()> {
     if let Some(plan) = strategy.plan_quotes(now) {
-        enforce_risk(&plan.intents, &config.risk)?;
+        enforce_risk(&plan.intents, &config.risk, contract_size)?;
         let latency_debug = latency_debug_enabled();
 
         let ref_meta = if let Some(meta) = plan.reference_meta.as_ref() {
@@ -532,22 +543,39 @@ async fn drain_reports(
     Ok(())
 }
 
-fn enforce_risk(intents: &[QuoteIntent], risk: &RiskConfig) -> Result<()> {
+fn enforce_risk(intents: &[QuoteIntent], risk: &RiskConfig, contract_size: f64) -> Result<()> {
+    if !contract_size.is_finite() || contract_size <= 0.0 {
+        bail!("invalid contract size {contract_size}");
+    }
+
     let mut batch_notional = 0.0;
     for intent in intents {
-        let notional = intent.price.abs() * intent.size.abs();
+        let contracts = (intent.size.abs() / contract_size).round() as i64;
+        if contracts == 0 {
+            bail!(
+                "intent {} size {:.8} is below contract size {}",
+                intent.client_order_id,
+                intent.size,
+                contract_size
+            );
+        }
+
+        let effective_size = contracts as f64 * contract_size;
+        let notional = intent.price.abs() * effective_size;
         if notional > risk.max_order_notional {
-            anyhow::bail!(
-                "intent {} exceeds per-order notional limit: {:.2} > {:.2}",
+            bail!(
+                "intent {} exceeds per-order notional limit: {:.2} > {:.2} (contracts={} size={:.8})",
                 intent.client_order_id,
                 notional,
-                risk.max_order_notional
+                risk.max_order_notional,
+                contracts,
+                effective_size
             );
         }
         batch_notional += notional;
     }
     if batch_notional > risk.max_notional {
-        anyhow::bail!(
+        bail!(
             "batch exceeds max notional limit: {:.2} > {:.2}",
             batch_notional,
             risk.max_notional
@@ -1253,7 +1281,24 @@ async fn ctrl_c_notifier() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-async fn setup_live_gateway(config: &RunnerConfig) -> Result<GateWsGateway> {
+async fn resolve_contract_size(config: &RunnerConfig) -> Result<f64> {
+    let symbol = &config.strategy.symbol;
+    let meta = gate_rest::fetch_contract_meta_async(symbol)
+        .await
+        .ok_or_else(|| anyhow!("failed to fetch Gate contract metadata for {}", symbol))?;
+    let multiplier = meta
+        .quanto_multiplier
+        .filter(|m| m.is_finite() && *m > 0.0)
+        .ok_or_else(|| {
+            anyhow!(
+                "contract metadata missing valid quanto_multiplier for {}",
+                symbol
+            )
+        })?;
+    Ok(multiplier)
+}
+
+async fn setup_live_gateway(config: &RunnerConfig, contract_size: f64) -> Result<GateWsGateway> {
     let creds = config.credentials.clone().unwrap_or_default();
     let key_env = creds
         .api_key_env
@@ -1272,7 +1317,7 @@ async fn setup_live_gateway(config: &RunnerConfig) -> Result<GateWsGateway> {
         symbol: config.strategy.symbol.clone(),
         settle: config.settle.clone(),
         ws_url: None,
-        contract_size: None,
+        contract_size: Some(contract_size),
     };
 
     GateWsGateway::connect(ws_config).await

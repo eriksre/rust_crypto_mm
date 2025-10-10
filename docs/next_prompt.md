@@ -33,3 +33,5 @@ Global state relies on std::sync::Mutex that gets locked inside async tasks; hol
 The execution worker parses every frame with serde_json::from_str into Value and stamps times with SystemTime::now, both relatively heavy system calls on the critical path; message rate spikes will magnify this overhead and SystemTime isn’t monotonic (src/execution/gate_ws.rs:403, src/base_classes/ws.rs:190, src/bin/gate_runner.rs:351).
 
 fix the inventory issues where it doesn't respect the max notional. start by init with the starting size via a get req, and then stream updates to that via ws. refresh every min or so. 
+
+binance orderbook isn't being used. neither is gate. honestly, the books might actually just be worse, and more laggy than everything else, so kill the orderbook feeds maybe? 
