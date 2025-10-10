@@ -5,16 +5,19 @@ strategy:
   spread_bps: 4.0
   min_tick: 0.00001
   reprice_bps: 1.0
-  debounce_ms: 50
+  debounce_ms: 50 #this is the clock for the quoting system
+  cancel_buffer_ms: 50 #this is the buffer for after we submit our last cancellation till the time we can send off a new quote
 risk:
   max_notional: 200.0
   max_order_notional: 100.0
 mode:
-  dry_run: false
-  log_fills: true
+  dry_run: false #switch for live vs dry run
+  log_fills: false
+  debug_prints: false
 logging:
   enabled: true
   path: logs/gate_activity.csv
+  flush_interval_ms: 200
 credentials:
   api_key_env: gateio_api_key
   api_secret_env: gateio_secret_key

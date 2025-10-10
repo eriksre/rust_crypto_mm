@@ -257,10 +257,7 @@ pub fn spawn_state_engine(
                                             )
                                         } else {
                                             let (bid_vec, ask_vec) = bybit_book.top_levels_f64(1);
-                                            (
-                                                levels_to_array(&bid_vec),
-                                                levels_to_array(&ask_vec),
-                                            )
+                                            (levels_to_array(&bid_vec), levels_to_array(&ask_vec))
                                         };
                                         demean.record_other(
                                             ExchangeKind::Bybit,
@@ -900,9 +897,7 @@ impl ReferencePublisher {
             price: candidate.price,
             ts_ns: candidate.ts_ns,
             source: candidate.source,
-            received_at: candidate
-                .received_at
-                .unwrap_or_else(Instant::now),
+            received_at: candidate.received_at.unwrap_or_else(Instant::now),
         };
         let _ = tx.send(event);
     }
@@ -916,27 +911,27 @@ impl ReferencePublisher {
                             idx: u8,
                             source: String,
                             received_at: Option<Instant>| {
-                if seq == 0 {
-                    return;
-                }
-                if let Some(price) = price {
-                    let cand = Candidate {
-                        price,
-                        seq,
-                        ts_ns: ts,
-                        source_idx: idx,
-                        source,
-                        received_at,
-                    };
-                    if let Some(current) = &best {
-                        if Self::is_newer(&cand, current) {
-                            best = Some(cand);
-                        }
-                    } else {
+            if seq == 0 {
+                return;
+            }
+            if let Some(price) = price {
+                let cand = Candidate {
+                    price,
+                    seq,
+                    ts_ns: ts,
+                    source_idx: idx,
+                    source,
+                    received_at,
+                };
+                if let Some(current) = &best {
+                    if Self::is_newer(&cand, current) {
                         best = Some(cand);
                     }
+                } else {
+                    best = Some(cand);
                 }
-            };
+            }
+        };
 
         consider(
             st.gate.bbo.price,

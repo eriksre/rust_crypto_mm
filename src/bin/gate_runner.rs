@@ -15,11 +15,11 @@ use rust_test::base_classes::state::state as global_state;
 use rust_test::base_classes::state::{ExchangeAdjustment, ExchangeSnap, FeedSnap, TradeDirection};
 use rust_test::base_classes::types::Side;
 use rust_test::execution::{
-    DryRunGateway, ExecutionGateway, ExecutionReport, GateWsConfig, GateWsGateway, OrderAck,
-    OrderManager, OrderStatus, QuoteIntent, Venue,
+    ClientOrderId, DryRunGateway, ExecutionGateway, ExecutionReport, GateWsConfig, GateWsGateway,
+    OrderAck, OrderManager, OrderStatus, QuoteIntent, Venue,
 };
 use rust_test::strategy::{QuoteConfig, ReferenceMeta, SimpleQuoteStrategy};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use tokio::time::{MissedTickBehavior, interval};
 
 #[derive(Debug, Parser)]
@@ -42,6 +42,8 @@ struct ModeConfig {
     dry_run: bool,
     #[serde(default)]
     log_fills: bool,
+    #[serde(default)]
+    debug_prints: bool,
 }
 
 #[derive(Debug, serde::Deserialize, Clone, Default)]
@@ -49,6 +51,8 @@ struct ModeConfig {
 struct LoggingConfig {
     enabled: bool,
     path: Option<String>,
+    #[serde(default = "default_flush_interval_ms")]
+    flush_interval_ms: u64,
 }
 
 impl LoggingConfig {
@@ -62,10 +66,70 @@ impl LoggingConfig {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("logs/gate_activity.csv"))
     }
+
+    fn flush_interval(&self) -> Duration {
+        Duration::from_millis(self.flush_interval_ms.max(1))
+    }
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_flush_interval_ms() -> u64 {
+    200
+}
+
+#[derive(Clone)]
+struct DebugLogger {
+    tx: mpsc::UnboundedSender<DebugEvent>,
+    debug_enabled: bool,
+}
+
+enum DebugEvent {
+    Info(String),
+    Warn(String),
+    Error(String),
+}
+
+impl DebugLogger {
+    fn new(debug_enabled: bool) -> Self {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                match event {
+                    DebugEvent::Info(msg) => println!("{}", msg),
+                    DebugEvent::Warn(msg) => eprintln!("{}", msg),
+                    DebugEvent::Error(msg) => eprintln!("{}", msg),
+                }
+            }
+        });
+        Self { tx, debug_enabled }
+    }
+
+    fn info<F>(&self, msg: F)
+    where
+        F: FnOnce() -> String,
+    {
+        if !self.debug_enabled {
+            return;
+        }
+        let _ = self.tx.send(DebugEvent::Info(msg()));
+    }
+
+    fn error<F>(&self, msg: F)
+    where
+        F: FnOnce() -> String,
+    {
+        let _ = self.tx.send(DebugEvent::Error(msg()));
+    }
+
+    fn latency<F>(&self, msg: F)
+    where
+        F: FnOnce() -> String,
+    {
+        let _ = self.tx.send(DebugEvent::Warn(msg()));
+    }
 }
 
 #[derive(Debug, serde::Deserialize, Clone)]
@@ -122,21 +186,24 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     let cli = Cli::parse();
     let config = load_config(&cli.config)?;
+    let debug = DebugLogger::new(config.mode.debug_prints);
 
     let logger = if config.logging.is_enabled() {
-        let logger = QuoteCsvLogger::new(&config)?;
-        println!("Activity logging enabled -> {}", logger.path.display());
-        Some(Arc::new(Mutex::new(logger)))
+        let handle = QuoteLogHandle::spawn(&config, debug.clone())?;
+        debug.info(|| format!("Activity logging enabled -> {}", handle.path().display()));
+        Some(handle)
     } else {
         None
     };
 
     let (reference_tx, mut reference_rx) = mpsc::unbounded_channel();
     let _engine = spawn_state_engine(config.strategy.symbol.clone(), Some(reference_tx));
-    println!(
-        "Gate runner started for {} (dry_run: {})",
-        config.strategy.symbol, config.mode.dry_run
-    );
+    debug.info(|| {
+        format!(
+            "Gate runner started for {} (dry_run: {})",
+            config.strategy.symbol, config.mode.dry_run
+        )
+    });
 
     let gateway: Arc<dyn ExecutionGateway> = if config.mode.dry_run {
         Arc::new(DryRunGateway::new())
@@ -155,7 +222,7 @@ async fn main() -> Result<()> {
 
     tokio::select! {
         _ = ctrl_c_notifier() => {
-            println!("Received shutdown signal; exiting.");
+            debug.info(|| "Received shutdown signal; exiting.".to_string());
         }
         _ = async {
             loop {
@@ -172,24 +239,20 @@ async fn main() -> Result<()> {
                                     &config,
                                     order_manager.clone(),
                                     logger.clone(),
+                                    debug.clone(),
                                 ).await {
-                                    eprintln!("error handling market update: {:#}", err);
+                                    debug.error(|| format!("error handling market update: {:#}", err));
                                 }
                             }
                             None => {
-                                eprintln!("reference channel closed; exiting.");
+                                debug.error(|| "reference channel closed; exiting.".to_string());
                                 break;
                             }
                         }
                     }
                     _ = market_timer.tick() => {
                         if let Some(logger) = logger.as_ref() {
-                            if let Err(err) = {
-                                let mut guard = logger.lock().await;
-                                guard.log_market_snapshot()
-                            } {
-                                eprintln!("error logging market snapshot: {:#}", err);
-                            }
+                            logger.log_market_snapshot();
                         }
 
                         if start_time.elapsed() < warmup {
@@ -202,9 +265,10 @@ async fn main() -> Result<()> {
                                 &config,
                                 order_manager.clone(),
                                 logger.clone(),
+                                debug.clone(),
                             ).await
                         {
-                            eprintln!("error processing reports: {:#}", err);
+                            debug.error(|| format!("error processing reports: {:#}", err));
                         }
                     }
                     _ = quote_timer.tick() => {
@@ -218,8 +282,9 @@ async fn main() -> Result<()> {
                             &config,
                             order_manager.clone(),
                             logger.clone(),
+                            debug.clone(),
                         ).await {
-                            eprintln!("error handling quote tick: {:#}", err);
+                            debug.error(|| format!("error handling quote tick: {:#}", err));
                         }
                     }
                 }
@@ -243,9 +308,10 @@ async fn handle_market_update(
     strategy: &mut SimpleQuoteStrategy,
     config: &RunnerConfig,
     order_manager: Arc<OrderManager>,
-    logger: Option<LoggerHandle>,
+    logger: Option<QuoteLogHandle>,
+    debug: DebugLogger,
 ) -> Result<()> {
-    let debug = latency_debug_enabled();
+    let latency_debug = latency_debug_enabled();
     let now = Instant::now();
     let reference_age = now.saturating_duration_since(reference.received_at);
     let meta = ReferenceMeta {
@@ -258,61 +324,59 @@ async fn handle_market_update(
         strategy.on_market_update(reference.price, Some(meta.clone()), reference.received_at);
     let strat_dur = strat_start.elapsed();
 
-    if debug && (reference_age > REF_WARN || strat_dur > STAGE_WARN) {
-        eprintln!(
-            "latency-debug::market ref_age={}us on_market={}us source={} cancels={}",
-            dur_us(reference_age),
-            dur_us(strat_dur),
-            reference.source,
-            cancels.len()
-        );
+    if latency_debug && (reference_age > REF_WARN || strat_dur > STAGE_WARN) {
+        debug.latency(|| {
+            format!(
+                "latency-debug::market ref_age={}us on_market={}us source={} cancels={}",
+                dur_us(reference_age),
+                dur_us(strat_dur),
+                reference.source,
+                cancels.len()
+            )
+        });
     }
 
     if !cancels.is_empty() {
-        println!(
-            "repricing {} on {} (ts={:?}); cancelling {} orders",
-            config.strategy.symbol,
-            reference.source,
-            reference.ts_ns,
-            cancels.len()
-        );
+        debug.info(|| {
+            format!(
+                "repricing {} on {} (ts={:?}); cancelling {} orders",
+                config.strategy.symbol,
+                reference.source,
+                reference.ts_ns,
+                cancels.len()
+            )
+        });
         let send_start = Instant::now();
+        strategy.record_cancel_submission(send_start);
         let cancel_internal = send_start.saturating_duration_since(reference.received_at);
         let sent_ts = SystemTime::now();
         if let Some(logger) = logger.as_ref() {
             for id in &cancels {
-                if let Err(err) = {
-                    let mut guard = logger.lock().await;
-                    guard.log_cancel(
-                        &id.0,
-                        &reference,
-                        cancel_internal,
-                        send_start,
-                        sent_ts,
-                    )
-                } {
-                    eprintln!("error logging cancel {}: {:#}", id, err);
-                }
+                logger.log_cancel(id, &reference, cancel_internal, send_start, sent_ts);
             }
         }
 
         let cancels_to_send = cancels.clone();
         let order_manager_clone = order_manager.clone();
+        let debug_clone = debug.clone();
         tokio::spawn(async move {
             let call_start = Instant::now();
             if let Err(err) = order_manager_clone.cancel_many(&cancels_to_send).await {
-                for id in &cancels_to_send {
-                    eprintln!("cancel {} failed: {:#}", id, err);
-                }
+                let ids = cancels_to_send.clone();
+                let err_msg = format!("{:#}", err);
+                debug_clone.error(move || format!("cancel {:?} failed: {}", ids, err_msg));
             }
             if latency_debug_enabled() {
                 let call_elapsed = call_start.elapsed();
-                eprintln!(
-                    "latency-debug::cancel ref_age={}us call={}us ids={}",
-                    dur_us(cancel_internal),
-                    dur_us(call_elapsed),
-                    cancels_to_send.len()
-                );
+                let cancel_count = cancels_to_send.len();
+                debug_clone.latency(|| {
+                    format!(
+                        "latency-debug::cancel ref_age={}us call={}us ids={}",
+                        dur_us(cancel_internal),
+                        dur_us(call_elapsed),
+                        cancel_count
+                    )
+                });
             }
         });
     }
@@ -325,28 +389,33 @@ async fn handle_quote_tick(
     strategy: &mut SimpleQuoteStrategy,
     config: &RunnerConfig,
     order_manager: Arc<OrderManager>,
-    logger: Option<LoggerHandle>,
+    logger: Option<QuoteLogHandle>,
+    debug: DebugLogger,
 ) -> Result<()> {
     if let Some(plan) = strategy.plan_quotes(now) {
         enforce_risk(&plan.intents, &config.risk)?;
-        let debug = latency_debug_enabled();
+        let latency_debug = latency_debug_enabled();
 
         let ref_meta = if let Some(meta) = plan.reference_meta.as_ref() {
-            println!(
-                "quoting {} on {} (ts={:?}) latency={}µs",
-                config.strategy.symbol,
-                meta.source,
-                meta.ts_ns,
-                now.checked_duration_since(plan.planned_at)
-                    .unwrap_or_default()
-                    .as_micros()
-            );
+            debug.info(|| {
+                format!(
+                    "quoting {} on {} (ts={:?}) latency={}µs",
+                    config.strategy.symbol,
+                    meta.source,
+                    meta.ts_ns,
+                    now.checked_duration_since(plan.planned_at)
+                        .unwrap_or_default()
+                        .as_micros()
+                )
+            });
             Some(meta.clone())
         } else {
-            println!(
-                "quoting {} with latest price {:.4}",
-                config.strategy.symbol, plan.reference_price
-            );
+            debug.info(|| {
+                format!(
+                    "quoting {} with latest price {:.4}",
+                    config.strategy.symbol, plan.reference_price
+                )
+            });
             None
         };
 
@@ -356,9 +425,7 @@ async fn handle_quote_tick(
         let sent_ts = SystemTime::now();
         let debounce_budget = Duration::from_millis(config.strategy.debounce_ms.max(1));
         let (reference_instant, timer_wait) = if let Some(meta) = ref_meta.as_ref() {
-            let age = plan
-                .planned_at
-                .saturating_duration_since(meta.received_at);
+            let age = plan.planned_at.saturating_duration_since(meta.received_at);
             if age <= debounce_budget {
                 (meta.received_at, age)
             } else {
@@ -370,36 +437,31 @@ async fn handle_quote_tick(
         let raw_latency = send_start.saturating_duration_since(reference_instant);
         let quote_internal = raw_latency.saturating_sub(timer_wait);
 
-        if debug {
+        if latency_debug {
             if let Some(meta) = ref_meta.as_ref() {
                 let meta_age = now.saturating_duration_since(meta.received_at);
                 if meta_age > REF_WARN {
-                    eprintln!(
-                        "latency-debug::quote ref_age={}us planned_age={}us intents={}",
-                        dur_us(meta_age),
-                        dur_us(plan
-                            .planned_at
-                            .saturating_duration_since(meta.received_at)),
-                        intents.len()
-                    );
+                    debug.latency(|| {
+                        format!(
+                            "latency-debug::quote ref_age={}us planned_age={}us intents={}",
+                            dur_us(meta_age),
+                            dur_us(plan.planned_at.saturating_duration_since(meta.received_at)),
+                            intents.len()
+                        )
+                    });
                 }
             }
         }
 
         if let Some(logger) = logger.as_ref() {
-            if let Err(err) = {
-                let mut guard = logger.lock().await;
-                guard.log_quote_submission(
-                    &intents,
-                    ref_meta.as_ref(),
-                    plan.reference_price,
-                    Some(quote_internal),
-                    send_start,
-                    sent_ts,
-                )
-            } {
-                eprintln!("error logging quote submission: {:#}", err);
-            }
+            logger.log_quote_submission(
+                &intents,
+                ref_meta.as_ref(),
+                plan.reference_price,
+                Some(quote_internal),
+                send_start,
+                sent_ts,
+            );
         }
         strategy.commit_plan(&plan);
 
@@ -408,18 +470,21 @@ async fn handle_quote_tick(
         let config_clone = config.clone();
         let order_manager_clone = order_manager.clone();
         let quote_internal_for_send = quote_internal;
+        let debug_clone = debug.clone();
         tokio::spawn(async move {
             let call_start = Instant::now();
             match order_manager_clone.submit(intents_for_send.clone()).await {
                 Ok(acks) => {
                     if latency_debug_enabled() {
                         let call_elapsed = call_start.elapsed();
-                        eprintln!(
-                            "latency-debug::submit call={}us internal={}us intents={}",
-                            dur_us(call_elapsed),
-                            dur_us(quote_internal_for_send),
-                            intents_for_send.len()
-                        );
+                        debug_clone.latency(|| {
+                            format!(
+                                "latency-debug::submit call={}us internal={}us intents={}",
+                                dur_us(call_elapsed),
+                                dur_us(quote_internal_for_send),
+                                intents_for_send.len()
+                            )
+                        });
                     }
                     log_submission(
                         &intents_for_send,
@@ -428,10 +493,14 @@ async fn handle_quote_tick(
                         reference_price,
                         Some(quote_internal_for_send),
                         &config_clone,
+                        &debug_clone,
                     );
                 }
                 Err(err) => {
-                    eprintln!("submit {:?} failed: {:#}", intents_for_send, err);
+                    let err_msg = format!("{:#}", err);
+                    let intents_copy = intents_for_send.clone();
+                    debug_clone
+                        .error(move || format!("submit {:?} failed: {}", intents_copy, err_msg));
                 }
             }
         });
@@ -443,7 +512,8 @@ async fn drain_reports(
     strategy: &mut SimpleQuoteStrategy,
     config: &RunnerConfig,
     order_manager: Arc<OrderManager>,
-    logger: Option<LoggerHandle>,
+    logger: Option<QuoteLogHandle>,
+    debug: DebugLogger,
 ) -> Result<()> {
     let reports = order_manager.poll_reports().await?;
     if reports.is_empty() {
@@ -455,15 +525,10 @@ async fn drain_reports(
     }
 
     if let Some(logger) = logger.as_ref() {
-        let mut guard = logger.lock().await;
-        for report in &reports {
-            if let Err(err) = guard.log_report(report) {
-                eprintln!("error logging report {}: {:#}", report.client_order_id, err);
-            }
-        }
+        logger.log_reports(&reports);
     }
 
-    log_reports(&reports, config);
+    log_reports(&reports, config, &debug);
     Ok(())
 }
 
@@ -498,6 +563,7 @@ fn log_submission(
     reference_price: f64,
     quote_internal: Option<Duration>,
     config: &RunnerConfig,
+    debug: &DebugLogger,
 ) {
     let (source, ts_ns) = reference_meta
         .map(|meta| (meta.source.as_str(), meta.ts_ns))
@@ -508,27 +574,31 @@ fn log_submission(
         "live"
     };
     for (intent, ack) in intents.iter().zip(acks.iter()) {
-        println!(
-            "ref {:.4} ({}) -> {:?} {:.4} @ {:.4} ({}) exch_id={:?} latency={}µs",
-            reference_price,
-            source,
-            intent.side,
-            intent.size,
-            intent.price,
-            mode,
-            ack.exchange_order_id,
-            quote_internal.map(|dur| dur.as_micros()).unwrap_or(0)
-        );
+        debug.info(|| {
+            format!(
+                "ref {:.4} ({}) -> {:?} {:.4} @ {:.4} ({}) exch_id={:?} latency={}µs",
+                reference_price,
+                source,
+                intent.side,
+                intent.size,
+                intent.price,
+                mode,
+                ack.exchange_order_id,
+                quote_internal.map(|dur| dur.as_micros()).unwrap_or(0)
+            )
+        });
         if config.mode.log_fills {
-            println!(
-                "  intent {} tif={} size={:.4} ts={:?}",
-                intent.client_order_id, intent.tif, intent.size, ts_ns
-            );
+            debug.info(|| {
+                format!(
+                    "  intent {} tif={} size={:.4} ts={:?}",
+                    intent.client_order_id, intent.tif, intent.size, ts_ns
+                )
+            });
         }
     }
 }
 
-fn log_reports(reports: &[ExecutionReport], config: &RunnerConfig) {
+fn log_reports(reports: &[ExecutionReport], config: &RunnerConfig, debug: &DebugLogger) {
     for report in reports {
         let should_log = config.mode.log_fills
             || matches!(
@@ -536,14 +606,16 @@ fn log_reports(reports: &[ExecutionReport], config: &RunnerConfig) {
                 OrderStatus::Filled | OrderStatus::PartiallyFilled | OrderStatus::Rejected
             );
         if should_log {
-            println!(
-                "report {} status {:?} filled {:.6} avg {:?} ts={:?}",
-                report.client_order_id,
-                report.status,
-                report.filled_qty,
-                report.avg_fill_price,
-                report.ts
-            );
+            debug.info(|| {
+                format!(
+                    "report {} status {:?} filled {:.6} avg {:?} ts={:?}",
+                    report.client_order_id,
+                    report.status,
+                    report.filled_qty,
+                    report.avg_fill_price,
+                    report.ts
+                )
+            });
         }
     }
 }
@@ -580,7 +652,158 @@ enum ExchangeId {
     Bitget,
 }
 
-type LoggerHandle = Arc<Mutex<QuoteCsvLogger>>;
+enum LogEvent {
+    MarketSnapshot,
+    QuoteSubmission {
+        intents: Vec<QuoteIntent>,
+        reference_meta: Option<ReferenceMeta>,
+        reference_price: f64,
+        quote_internal: Option<Duration>,
+        send_instant: Instant,
+        sent_ts: SystemTime,
+    },
+    Cancel {
+        order_id: String,
+        reference: ReferenceEvent,
+        cancel_internal: Duration,
+        send_instant: Instant,
+        sent_ts: SystemTime,
+    },
+    Reports(Vec<ExecutionReport>),
+}
+
+#[derive(Clone)]
+struct QuoteLogHandle {
+    tx: mpsc::UnboundedSender<LogEvent>,
+    path: PathBuf,
+}
+
+impl QuoteLogHandle {
+    fn spawn(config: &RunnerConfig, debug: DebugLogger) -> Result<Self> {
+        let logger = QuoteCsvLogger::new(config)?;
+        let path = logger.path.clone();
+        let flush_interval = config.logging.flush_interval();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut logger = logger;
+            let mut last_flush = Instant::now();
+            while let Some(event) = rx.recv().await {
+                let res = match event {
+                    LogEvent::MarketSnapshot => logger.log_market_snapshot(),
+                    LogEvent::QuoteSubmission {
+                        intents,
+                        reference_meta,
+                        reference_price,
+                        quote_internal,
+                        send_instant,
+                        sent_ts,
+                    } => logger.log_quote_submission(
+                        &intents,
+                        reference_meta.as_ref(),
+                        reference_price,
+                        quote_internal,
+                        send_instant,
+                        sent_ts,
+                    ),
+                    LogEvent::Cancel {
+                        order_id,
+                        reference,
+                        cancel_internal,
+                        send_instant,
+                        sent_ts,
+                    } => logger.log_cancel(
+                        &order_id,
+                        &reference,
+                        cancel_internal,
+                        send_instant,
+                        sent_ts,
+                    ),
+                    LogEvent::Reports(reports) => {
+                        let mut result = Ok(());
+                        for report in &reports {
+                            if let Err(err) = logger.log_report(report) {
+                                result = Err(err);
+                                break;
+                            }
+                        }
+                        result
+                    }
+                };
+
+                if let Err(err) = res {
+                    debug.error(|| format!("csv logger error: {:#}", err));
+                }
+
+                if last_flush.elapsed() >= flush_interval {
+                    if let Err(err) = logger.flush() {
+                        debug.error(|| format!("csv logger flush error: {:#}", err));
+                    }
+                    last_flush = Instant::now();
+                }
+            }
+
+            if let Err(err) = logger.flush() {
+                debug.error(|| format!("csv logger final flush error: {:#}", err));
+            }
+        });
+
+        Ok(Self { tx, path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn log_market_snapshot(&self) {
+        let _ = self.tx.send(LogEvent::MarketSnapshot);
+    }
+
+    fn log_quote_submission(
+        &self,
+        intents: &[QuoteIntent],
+        reference_meta: Option<&ReferenceMeta>,
+        reference_price: f64,
+        quote_internal: Option<Duration>,
+        send_instant: Instant,
+        sent_ts: SystemTime,
+    ) {
+        if intents.is_empty() {
+            return;
+        }
+        let _ = self.tx.send(LogEvent::QuoteSubmission {
+            intents: intents.to_vec(),
+            reference_meta: reference_meta.cloned(),
+            reference_price,
+            quote_internal,
+            send_instant,
+            sent_ts,
+        });
+    }
+
+    fn log_cancel(
+        &self,
+        order_id: &ClientOrderId,
+        reference: &ReferenceEvent,
+        cancel_internal: Duration,
+        send_instant: Instant,
+        sent_ts: SystemTime,
+    ) {
+        let _ = self.tx.send(LogEvent::Cancel {
+            order_id: order_id.0.clone(),
+            reference: reference.clone(),
+            cancel_internal,
+            send_instant,
+            sent_ts,
+        });
+    }
+
+    fn log_reports(&self, reports: &[ExecutionReport]) {
+        if reports.is_empty() {
+            return;
+        }
+        let _ = self.tx.send(LogEvent::Reports(reports.to_vec()));
+    }
+}
 
 impl QuoteCsvLogger {
     fn new(config: &RunnerConfig) -> Result<Self> {
@@ -616,10 +839,25 @@ impl QuoteCsvLogger {
             .lock()
             .map_err(|_| anyhow!("global state poisoned"))?;
 
-        self.write_exchange(ExchangeId::Bybit, "bybit", &st.bybit, Some(&st.demean.bybit))?;
-        self.write_exchange(ExchangeId::Binance, "binance", &st.binance, Some(&st.demean.binance))?;
+        self.write_exchange(
+            ExchangeId::Bybit,
+            "bybit",
+            &st.bybit,
+            Some(&st.demean.bybit),
+        )?;
+        self.write_exchange(
+            ExchangeId::Binance,
+            "binance",
+            &st.binance,
+            Some(&st.demean.binance),
+        )?;
         self.write_exchange(ExchangeId::Gate, "gate", &st.gate, None)?;
-        self.write_exchange(ExchangeId::Bitget, "bitget", &st.bitget, Some(&st.demean.bitget))?;
+        self.write_exchange(
+            ExchangeId::Bitget,
+            "bitget",
+            &st.bitget,
+            Some(&st.demean.bitget),
+        )?;
         Ok(())
     }
 
@@ -914,6 +1152,11 @@ impl QuoteCsvLogger {
         Ok(())
     }
 
+    fn flush(&mut self) -> Result<()> {
+        self.writer.flush()?;
+        Ok(())
+    }
+
     fn write_row(
         writer: &mut BufWriter<File>,
         ts_ns: u64,
@@ -955,7 +1198,6 @@ impl QuoteCsvLogger {
             cancel_external_us.map_or(String::new(), |v| v.to_string()),
             sent_ts_ns.map_or(String::new(), |v| v.to_string()),
         )?;
-        writer.flush()?;
         Ok(())
     }
 }

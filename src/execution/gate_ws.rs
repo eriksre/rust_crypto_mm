@@ -12,6 +12,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::Sha512;
 use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::task::spawn_blocking;
 use tokio::time::sleep;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
@@ -276,20 +277,25 @@ impl GateWsWorker {
                     .map(|secs| secs.saturating_mul(1_000_000_000))
             });
 
-        {
+        let role_for_state = role.clone();
+        let text_for_state = text.clone();
+        let order_id_for_state = order_id.clone();
+        spawn_blocking(move || {
             let mut st = state().lock().unwrap();
             let snap = &mut st.gate.user_trade;
             snap.price = price;
             snap.contracts = Some(size_contracts);
             snap.quantity = quantity;
             snap.fee = fee;
-            snap.role = role.clone();
-            snap.text = text.clone();
-            snap.order_id = order_id.clone();
+            snap.role = role_for_state;
+            snap.text = text_for_state;
+            snap.order_id = order_id_for_state;
             snap.ts_ns = ts_ns;
             snap.direction = direction;
             snap.seq = snap.seq.wrapping_add(1);
-        }
+        })
+        .await
+        .map_err(|e| anyhow!("user trade state update failed: {e}"))?;
 
         if let Some(ref text_id) = text {
             let client_id = ClientOrderId::new(text_id.clone());
@@ -316,11 +322,13 @@ impl GateWsWorker {
     }
 
     async fn run(mut self) -> Result<()> {
-        let mut backoff = Duration::from_secs(1);
+        let initial_backoff = Duration::from_millis(10);
+        let max_backoff = Duration::from_millis(1_000);
+        let mut backoff = initial_backoff;
         loop {
             match self.establish().await {
                 Ok((mut sink, mut stream)) => {
-                    backoff = Duration::from_secs(1);
+                    backoff = initial_backoff;
                     let mut pending: HashMap<String, PendingRequest> = HashMap::new();
                     let mut should_exit = false;
                     while !should_exit {
@@ -358,7 +366,7 @@ impl GateWsWorker {
                 }
             }
             sleep(backoff).await;
-            backoff = (backoff * 2).min(Duration::from_secs(30));
+            backoff = std::cmp::min(backoff * 2, max_backoff);
         }
     }
 
@@ -401,15 +409,15 @@ impl GateWsWorker {
         loop {
             match ws.next().await {
                 Some(Ok(Message::Text(text))) => {
-                    let raw: Value = serde_json::from_str(&text)
-                        .with_context(|| format!("failed to parse login response: {}", text))?;
-                    let resp: WsResponse = serde_json::from_value(raw.clone())
+                    let resp: WsResponse = serde_json::from_str(&text)
                         .with_context(|| format!("failed to parse login response: {}", text))?;
                     if resp.request_id.as_deref() == Some(&req_id) {
                         if resp.is_success() {
                             if self.user_id.is_none() {
-                                if let Some(uid) = extract_user_id_value(&raw) {
-                                    self.user_id = Some(uid);
+                                if let Ok(raw) = serde_json::from_str::<Value>(&text) {
+                                    if let Some(uid) = extract_user_id_value(&raw) {
+                                        self.user_id = Some(uid);
+                                    }
                                 }
                             }
                             return Ok(());
@@ -542,22 +550,21 @@ impl GateWsWorker {
     ) -> Result<()> {
         match msg {
             Message::Text(text) => {
-                let raw: Value = match serde_json::from_str(&text) {
-                    Ok(v) => v,
-                    Err(_) => return Ok(()),
-                };
-
-                if raw
-                    .get("channel")
-                    .and_then(|v| v.as_str())
-                    .map(|ch| ch == GateioWs::USER_TRADES)
-                    .unwrap_or(false)
-                {
-                    self.handle_user_trades_message(&raw).await?;
-                    return Ok(());
+                if text.contains(GateioWs::USER_TRADES) && text.contains("\"channel\"") {
+                    if let Ok(raw) = serde_json::from_str::<Value>(&text) {
+                        if raw
+                            .get("channel")
+                            .and_then(|v| v.as_str())
+                            .map(|ch| ch == GateioWs::USER_TRADES)
+                            .unwrap_or(false)
+                        {
+                            self.handle_user_trades_message(&raw).await?;
+                            return Ok(());
+                        }
+                    }
                 }
 
-                let resp: WsResponse = match serde_json::from_value(raw) {
+                let resp: WsResponse = match serde_json::from_str(&text) {
                     Ok(r) => r,
                     Err(_) => return Ok(()),
                 };

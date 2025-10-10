@@ -2,7 +2,7 @@
 
 use crate::base_classes::ring_buffer::{Consumer, Producer};
 use crate::base_classes::types::Ts;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -186,10 +186,18 @@ where
 
 #[inline(always)]
 fn now_ts_ns() -> Ts {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    static CLOCK_BASE: OnceLock<(SystemTime, Instant)> = OnceLock::new();
+    let (base_system, base_instant) =
+        CLOCK_BASE.get_or_init(|| (SystemTime::now(), Instant::now()));
+
+    let elapsed = Instant::now().saturating_duration_since(*base_instant);
+    let monotonic_system = base_system.checked_add(elapsed).unwrap_or(*base_system);
+
+    monotonic_system
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or(Duration::ZERO)
         .as_nanos() as Ts
 }
 
@@ -226,19 +234,24 @@ fn run_ws_tungstenite<E, const N: usize>(
     use tungstenite::{Message, connect};
     let url = handler.url().to_string();
     let label = handler.label();
-    let mut backoff = 1u64;
+    let initial_backoff = Duration::from_millis(10);
+    let max_backoff = Duration::from_millis(1_000);
+    let mut backoff = initial_backoff;
     loop {
         // connect
         let (mut socket, _response) = match connect(url::Url::parse(&url).unwrap()) {
             Ok(ok) => ok,
             Err(err) => {
-                eprintln!("WS[{label}] connect error: {err}; reconnecting in {backoff}s");
-                std::thread::sleep(Duration::from_secs(backoff));
-                backoff = (backoff * 2).min(30);
+                eprintln!(
+                    "WS[{label}] connect error: {err}; reconnecting in {}ms",
+                    backoff.as_millis()
+                );
+                std::thread::sleep(backoff);
+                backoff = std::cmp::min(backoff * 2, max_backoff);
                 continue;
             }
         };
-        backoff = 1; // reset
+        backoff = initial_backoff; // reset
 
         // Seq gate per-session
         const SEQ_SLOTS: usize = 256;
@@ -361,9 +374,12 @@ fn run_ws_tungstenite<E, const N: usize>(
                     }
                 }
                 Err(e) => {
-                    eprintln!("WS[{label}] read error: {e}; reconnecting in {backoff}s");
-                    std::thread::sleep(Duration::from_secs(backoff));
-                    backoff = (backoff * 2).min(30);
+                    eprintln!(
+                        "WS[{label}] read error: {e}; reconnecting in {}ms",
+                        backoff.as_millis()
+                    );
+                    std::thread::sleep(backoff);
+                    backoff = std::cmp::min(backoff * 2, max_backoff);
                     break; // reconnect
                 }
             }
@@ -396,7 +412,9 @@ where
         .build()
         .expect("tokio rt");
     rt.block_on(async move {
-        let mut backoff = 1u64;
+        let initial_backoff = Duration::from_millis(10);
+        let max_backoff = Duration::from_millis(1_000);
+        let mut backoff = initial_backoff;
         loop {
             const SEQ_SLOTS: usize = 256;
             let mut seq_gate: SequenceGate<SEQ_SLOTS> = SequenceGate::new();
@@ -409,20 +427,44 @@ where
 
             let stream = match TcpStream::connect(addr).await {
                 Ok(s) => s,
-                Err(e) => { eprintln!("tcp[{label}] connect: {e}; reconnecting in {backoff}s"); tokio::time::sleep(Duration::from_secs(backoff)).await; backoff=(backoff*2).min(30); continue; }
+                Err(e) => {
+                    eprintln!(
+                        "tcp[{label}] connect: {e}; reconnecting in {}ms",
+                        backoff.as_millis()
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = std::cmp::min(backoff * 2, max_backoff);
+                    continue;
+                }
             };
 
             let (mut sender, conn) = match http1::handshake(stream).await {
                 Ok(ok) => ok,
-                Err(e) => { eprintln!("http[{label}] handshake: {e}; reconnecting in {backoff}s"); tokio::time::sleep(Duration::from_secs(backoff)).await; backoff=(backoff*2).min(30); continue; }
+                Err(e) => {
+                    eprintln!(
+                        "http[{label}] handshake: {e}; reconnecting in {}ms",
+                        backoff.as_millis()
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = std::cmp::min(backoff * 2, max_backoff);
+                    continue;
+                }
             };
             tokio::spawn(async move { if let Err(e) = conn.await { eprintln!("hyper[{label}] conn error: {e}"); } });
 
             let (ws, _) = match Client::new(&uri).client_handshake(&mut sender).await {
                 Ok(ok) => ok,
-                Err(e) => { eprintln!("ws[{label}] handshake: {e}; reconnecting in {backoff}s"); tokio::time::sleep(Duration::from_secs(backoff)).await; backoff=(backoff*2).min(30); continue; }
+                Err(e) => {
+                    eprintln!(
+                        "ws[{label}] handshake: {e}; reconnecting in {}ms",
+                        backoff.as_millis()
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = std::cmp::min(backoff * 2, max_backoff);
+                    continue;
+                }
             };
-            backoff = 1;
+            backoff = initial_backoff;
             let mut ws = FragmentCollector::new(ws);
 
             // send initial subscriptions
@@ -487,7 +529,15 @@ where
                                     _ => {}
                                 }
                             }
-                            Err(e) => { eprintln!("ws[{label}] read: {e}; reconnecting in {backoff}s"); tokio::time::sleep(Duration::from_secs(backoff)).await; backoff=(backoff*2).min(30); break; }
+                            Err(e) => {
+                                eprintln!(
+                                    "ws[{label}] read: {e}; reconnecting in {}ms",
+                                    backoff.as_millis()
+                                );
+                                tokio::time::sleep(backoff).await;
+                                backoff = std::cmp::min(backoff * 2, max_backoff);
+                                break;
+                            }
                         }
                     }
                     _ = hb.tick() => { let _ = ws.write_ping(Bytes::new()).await; }

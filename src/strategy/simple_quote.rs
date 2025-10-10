@@ -11,6 +11,7 @@ use crate::execution::{
 
 const DEFAULT_REPRICE_BPS: f64 = 2.0;
 const DEFAULT_DEBOUNCE_MS: u64 = 50;
+const DEFAULT_CANCEL_BUFFER_MS: u64 = 50;
 
 fn default_reprice_bps() -> f64 {
     DEFAULT_REPRICE_BPS
@@ -18,6 +19,10 @@ fn default_reprice_bps() -> f64 {
 
 fn default_debounce_ms() -> u64 {
     DEFAULT_DEBOUNCE_MS
+}
+
+fn default_cancel_buffer_ms() -> u64 {
+    DEFAULT_CANCEL_BUFFER_MS
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -31,6 +36,8 @@ pub struct QuoteConfig {
     pub reprice_bps: f64,
     #[serde(default = "default_debounce_ms")]
     pub debounce_ms: u64,
+    #[serde(default = "default_cancel_buffer_ms")]
+    pub cancel_buffer_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +66,7 @@ pub struct SimpleQuoteStrategy {
     latest_price: Option<f64>,
     latest_meta: Option<ReferenceMeta>,
     needs_requote: bool,
+    last_cancel_submission_at: Option<Instant>,
 }
 
 impl SimpleQuoteStrategy {
@@ -73,6 +81,7 @@ impl SimpleQuoteStrategy {
             latest_price: None,
             latest_meta: None,
             needs_requote: true,
+            last_cancel_submission_at: None,
         }
     }
 
@@ -114,13 +123,18 @@ impl SimpleQuoteStrategy {
             return None;
         }
 
+        if !self.cancel_buffer_elapsed(now) {
+            return None;
+        }
+
         if !self.active_orders.is_empty() && !self.debounce_elapsed(now) {
             return None;
         }
 
-        let has_uncancelled_live_orders = self.active_orders.iter().any(|id| {
-            !self.pending_cancels.iter().any(|pending| pending == id)
-        });
+        let has_uncancelled_live_orders = self
+            .active_orders
+            .iter()
+            .any(|id| !self.pending_cancels.iter().any(|pending| pending == id));
         if has_uncancelled_live_orders {
             return None;
         }
@@ -149,6 +163,10 @@ impl SimpleQuoteStrategy {
             }
         }
         self.needs_requote = false;
+    }
+
+    pub fn record_cancel_submission(&mut self, when: Instant) {
+        self.last_cancel_submission_at = Some(when);
     }
 
     pub fn handle_report(&mut self, report: &ExecutionReport) {
@@ -252,6 +270,20 @@ impl SimpleQuoteStrategy {
     fn debounce_elapsed(&self, now: Instant) -> bool {
         self.last_refresh_at
             .map(|ts| now.saturating_duration_since(ts) >= self.debounce_duration())
+            .unwrap_or(true)
+    }
+
+    fn cancel_buffer_duration(&self) -> Duration {
+        Duration::from_millis(self.config.cancel_buffer_ms)
+    }
+
+    fn cancel_buffer_elapsed(&self, now: Instant) -> bool {
+        let buffer = self.cancel_buffer_duration();
+        if buffer.is_zero() {
+            return true;
+        }
+        self.last_cancel_submission_at
+            .map(|ts| now.saturating_duration_since(ts) >= buffer)
             .unwrap_or(true)
     }
 
