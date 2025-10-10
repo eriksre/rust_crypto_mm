@@ -322,8 +322,8 @@ impl GateWsWorker {
     }
 
     async fn run(mut self) -> Result<()> {
-        let initial_backoff = Duration::from_millis(10);
-        let max_backoff = Duration::from_millis(1_000);
+        let initial_backoff = Duration::from_millis(250);
+        let max_backoff = Duration::from_millis(3_000);
         let mut backoff = initial_backoff;
         loop {
             match self.establish().await {
@@ -367,6 +367,7 @@ impl GateWsWorker {
             }
             sleep(backoff).await;
             backoff = std::cmp::min(backoff * 2, max_backoff);
+            backoff += Duration::from_millis(25);
         }
     }
 

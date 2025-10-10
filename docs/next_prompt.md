@@ -17,7 +17,7 @@ look through for anything that's not hft like, and report back on it. eg any sle
 separate switch for logging on and off, for max performance (can turn logger off from yaml file for max performance). 
 
 verify that im picking up all the data by running alongside my python mm data puller
-
+s
 maybe implement the bbo queue reduction stuff, where if I have multiple BBOs in the queue, just remove the older ones - only the newer ones matter, as feed is monotonic. see if that's already been done, and if not, do it maybe. 
 
 we need to have the trades that we make (ie, private trades) use the exchange's timestamp, not our wire timestamp. actually, we should probably log both, and modify the graph to show both of them
@@ -31,3 +31,5 @@ Recovery from feed/execution disconnects backs off with hard sleeps up to 30 s
 Global state relies on std::sync::Mutex that gets locked inside async tasks; holding a blocking mutex while running on Tokio executors risks scheduler stalls and adds contention on every user-trade/report update (src/base_classes/state.rs:3, src/execution/gate_ws.rs:280, src/bin/gate_runner.rs:382).
 
 The execution worker parses every frame with serde_json::from_str into Value and stamps times with SystemTime::now, both relatively heavy system calls on the critical path; message rate spikes will magnify this overhead and SystemTime isn’t monotonic (src/execution/gate_ws.rs:403, src/base_classes/ws.rs:190, src/bin/gate_runner.rs:351).
+
+fix the inventory issues where it doesn't respect the max notional. start by init with the starting size via a get req, and then stream updates to that via ws. refresh every min or so. 

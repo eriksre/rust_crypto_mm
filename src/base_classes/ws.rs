@@ -234,8 +234,8 @@ fn run_ws_tungstenite<E, const N: usize>(
     use tungstenite::{Message, connect};
     let url = handler.url().to_string();
     let label = handler.label();
-    let initial_backoff = Duration::from_millis(10);
-    let max_backoff = Duration::from_millis(1_000);
+    let initial_backoff = Duration::from_millis(250);
+    let max_backoff = Duration::from_millis(3_000);
     let mut backoff = initial_backoff;
     loop {
         // connect
@@ -380,6 +380,7 @@ fn run_ws_tungstenite<E, const N: usize>(
                     );
                     std::thread::sleep(backoff);
                     backoff = std::cmp::min(backoff * 2, max_backoff);
+                    backoff += Duration::from_millis(25);
                     break; // reconnect
                 }
             }
@@ -412,8 +413,8 @@ where
         .build()
         .expect("tokio rt");
     rt.block_on(async move {
-        let initial_backoff = Duration::from_millis(10);
-        let max_backoff = Duration::from_millis(1_000);
+        let initial_backoff = Duration::from_millis(250);
+        let max_backoff = Duration::from_millis(3_000);
         let mut backoff = initial_backoff;
         loop {
             const SEQ_SLOTS: usize = 256;
@@ -433,7 +434,8 @@ where
                         backoff.as_millis()
                     );
                     tokio::time::sleep(backoff).await;
-                    backoff = std::cmp::min(backoff * 2, max_backoff);
+            backoff = std::cmp::min(backoff * 2, max_backoff);
+            backoff += Duration::from_millis(25);
                     continue;
                 }
             };
@@ -447,6 +449,7 @@ where
                     );
                     tokio::time::sleep(backoff).await;
                     backoff = std::cmp::min(backoff * 2, max_backoff);
+                    backoff += Duration::from_millis(25);
                     continue;
                 }
             };
@@ -461,6 +464,7 @@ where
                     );
                     tokio::time::sleep(backoff).await;
                     backoff = std::cmp::min(backoff * 2, max_backoff);
+                    backoff += Duration::from_millis(25);
                     continue;
                 }
             };
@@ -536,6 +540,7 @@ where
                                 );
                                 tokio::time::sleep(backoff).await;
                                 backoff = std::cmp::min(backoff * 2, max_backoff);
+                                backoff += Duration::from_millis(25);
                                 break;
                             }
                         }
