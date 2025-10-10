@@ -8,4 +8,5 @@ clean up the graph
 
 clean up tech debt
 
+fix up the logs that print out whenever I run it. there are no zero fills, or 0 latency things
 

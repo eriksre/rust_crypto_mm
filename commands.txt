@@ -1,0 +1,3 @@
+taskset -c 0 chrt -f 99 cargo run --release --bin gate_runner --features gate_exec
+
+run the file with cpu core pinning
