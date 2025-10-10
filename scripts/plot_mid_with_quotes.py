@@ -265,6 +265,10 @@ def plot_quote_bars(ax: plt.Axes, lifecycles: pd.DataFrame) -> None:
         return
 
     legend_added = defaultdict(bool)
+    
+    # Define distinct colors for bid/ask
+    bid_color = "#2E86DE"  # Bright blue
+    ask_color = "#EE5A6F"  # Bright red/pink
 
     for _, row in lifecycles.iterrows():
         start = row["quote_dt"]
@@ -278,67 +282,92 @@ def plot_quote_bars(ax: plt.Axes, lifecycles: pd.DataFrame) -> None:
 
         price = row["quote_price"]
         side = row["side"]
-        color = "tab:blue" if side == "bid" else ("tab:red" if side == "ask" else "grey")
+        color = bid_color if side == "bid" else (ask_color if side == "ask" else "grey")
 
+        # Quote lifecycle bar
         ax.hlines(
             y=price,
             xmin=start,
             xmax=end,
             colors=color,
-            linewidth=2.0,
-            alpha=0.9,
+            linewidth=2.5,
+            alpha=0.7,
         )
+        
+        # Quote start marker
         label = f"{side} quote"
         if not legend_added[label]:
-            ax.scatter(start, price, marker="|", c=color, s=120, label=label)
+            ax.scatter(start, price, marker="|", c=color, s=140, linewidths=2.5, label=label, alpha=0.9)
             legend_added[label] = True
         else:
-            ax.scatter(start, price, marker="|", c=color, s=120)
+            ax.scatter(start, price, marker="|", c=color, s=140, linewidths=2.5, alpha=0.9)
 
+        # Cancel marker
         if pd.notna(row.get("cancel_dt")):
-            ax.scatter(row["cancel_dt"], price, marker="x", c=color, s=60, alpha=0.9)
+            cancel_label = f"{side} cancel"
+            ax.scatter(
+                row["cancel_dt"], 
+                price, 
+                marker="x", 
+                c=color, 
+                s=80, 
+                alpha=0.9,
+                linewidths=2.0,
+                label=None if legend_added[cancel_label] else cancel_label,
+            )
+            legend_added[cancel_label] = True
 
+        # Fill marker (lifecycle fills - passive fills from our quotes)
         if pd.notna(row.get("fill_dt")) and pd.notna(row.get("fill_price")):
-            label_key = f"{side} fill"
+            label_key = f"{side} passive fill"
             ax.scatter(
                 row["fill_dt"],
                 row["fill_price"],
-                marker="X",
+                marker="D",  # Diamond for passive fills
                 c=color,
-                s=70,
-                alpha=0.9,
-                label=None if legend_added[label_key] else f"{side} fill",
+                s=100,
+                alpha=0.95,
+                edgecolors="white",
+                linewidths=1.5,
+                label=None if legend_added[label_key] else label_key,
+                zorder=6,
             )
             legend_added[label_key] = True
 
         # Reference markers
         if pd.notna(row.get("quote_ref_dt")) and pd.notna(row.get("quote_reference_price")):
+            ref_label = f"{side} quote ref"
             ax.scatter(
                 row["quote_ref_dt"],
                 row["quote_reference_price"],
                 marker="*",
                 c=color,
-                s=80,
-                alpha=0.8,
-                label=None if legend_added[f"{side} quote ref"] else f"{side} quote ref",
+                s=100,
+                alpha=0.6,
+                label=None if legend_added[ref_label] else ref_label,
                 edgecolors="k",
+                linewidths=0.5,
             )
-            legend_added[f"{side} quote ref"] = True
+            legend_added[ref_label] = True
 
         if pd.notna(row.get("cancel_ref_dt")) and pd.notna(row.get("cancel_reference_price")):
+            cancel_ref_label = f"{side} cancel ref"
             ax.scatter(
                 row["cancel_ref_dt"],
                 row["cancel_reference_price"],
-                marker="D",
+                marker="d",  # Small diamond
                 c=color,
-                s=50,
-                alpha=0.7,
-                label=None if legend_added[f"{side} cancel ref"] else f"{side} cancel ref",
+                s=60,
+                alpha=0.6,
+                label=None if legend_added[cancel_ref_label] else cancel_ref_label,
+                edgecolors="k",
+                linewidths=0.5,
             )
-            legend_added[f"{side} cancel ref"] = True
+            legend_added[cancel_ref_label] = True
 
 
 def plot_fills(ax: plt.Axes, fills: pd.DataFrame) -> None:
+    """Plot standalone fill events (typically aggressive fills)."""
     if fills.empty:
         return
 
@@ -351,27 +380,34 @@ def plot_fills(ax: plt.Axes, fills: pd.DataFrame) -> None:
     if fills.empty:
         return
 
+    # Use distinct colors for aggressive fills
+    bid_color = "#10AC84"  # Green for bid fills (buying)
+    ask_color = "#FF6348"  # Orange-red for ask fills (selling)
+
     for side, group in fills.groupby("side"):
-        color = "tab:blue" if side == "bid" else ("tab:red" if side == "ask" else "grey")
-        label = f"our {side} fills"
+        color = bid_color if side == "bid" else (ask_color if side == "ask" else "grey")
+        label = f"{side} aggressive fill"
+        
         if "size" in group.columns:
             sizes = group["size"].abs().fillna(0.0)
         else:
             sizes = pd.Series(0.0, index=group.index)
 
+        # Scale marker sizes based on fill quantity
         scaled = sizes.clip(lower=0.0).pow(0.5)
-        marker_sizes = (scaled * 60.0 + 50.0).clip(upper=220.0)
+        marker_sizes = (scaled * 60.0 + 60.0).clip(upper=250.0)
+        
         ax.scatter(
             group["dt"],
             group["price"],
-            marker="X",
+            marker="P",  # Plus (filled) marker for aggressive fills
             c=color,
             s=marker_sizes,
-            alpha=0.85,
+            alpha=0.9,
             label=label,
-            edgecolors="k",
-            linewidths=0.6,
-            zorder=5,
+            edgecolors="white",
+            linewidths=1.2,
+            zorder=7,
         )
 
 

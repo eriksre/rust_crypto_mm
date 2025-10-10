@@ -250,25 +250,21 @@ pub fn spawn_state_engine(
                                                     bybit_bbo.get(symbol).copied()
                                                 })
                                             });
-                                        let (bid_levels, ask_levels, ts_eff) = if let Some(e) =
-                                            entry
-                                        {
+                                        let (bid_levels, ask_levels) = if let Some(e) = entry {
                                             (
                                                 level_from_option(Some((e.bid_px, e.bid_qty))),
                                                 level_from_option(Some((e.ask_px, e.ask_qty))),
-                                                if e.ts != 0 { e.ts } else { ts },
                                             )
                                         } else {
                                             let (bid_vec, ask_vec) = bybit_book.top_levels_f64(1);
                                             (
                                                 levels_to_array(&bid_vec),
                                                 levels_to_array(&ask_vec),
-                                                ts,
                                             )
                                         };
                                         demean.record_other(
                                             ExchangeKind::Bybit,
-                                            Some(ts_eff),
+                                            Some(ts),
                                             Some(mid),
                                         );
                                         {
@@ -276,7 +272,7 @@ pub fn spawn_state_engine(
                                             let snap = &mut st.bybit.bbo;
                                             snap.price = Some(mid);
                                             snap.seq = snap.seq.wrapping_add(1);
-                                            snap.ts_ns = Some(ts_eff);
+                                            snap.ts_ns = Some(ts);
                                             snap.bid_levels = bid_levels;
                                             snap.ask_levels = ask_levels;
                                             snap.direction = None;
@@ -309,12 +305,7 @@ pub fn spawn_state_engine(
                     if bybit::update_trades(s, &mut bybit_trades) {
                         if let Some(trade) = bybit_trades.last() {
                             let px = (trade.px as f64) / crate::exchanges::bybit_book::PRICE_SCALE;
-                            let trade_ts = if trade.ts != 0 {
-                                (trade.ts as u128 * 1_000_000) as u64
-                            } else {
-                                ts
-                            };
-                            demean.record_other(ExchangeKind::Bybit, Some(trade_ts), Some(px));
+                            demean.record_other(ExchangeKind::Bybit, Some(ts), Some(px));
                             let direction = if trade.is_buyer_maker {
                                 TradeDirection::Sell
                             } else {
@@ -324,7 +315,7 @@ pub fn spawn_state_engine(
                                 let mut st = state().lock().unwrap();
                                 st.bybit.trade.price = Some(px);
                                 st.bybit.trade.seq = st.bybit.trade.seq.wrapping_add(1);
-                                st.bybit.trade.ts_ns = Some(trade_ts);
+                                st.bybit.trade.ts_ns = Some(ts);
                                 st.bybit.trade.direction = Some(direction);
                                 st.bybit.trade.bid_levels = [None; 3];
                                 st.bybit.trade.ask_levels = [None; 3];
@@ -385,13 +376,7 @@ pub fn spawn_state_engine(
                             entry.seq.wrapping_add(1)
                         };
                         entry.seq = seq;
-
-                        let ticker_ts = if ticker.ticker.ts != 0 {
-                            ticker.ticker.ts
-                        } else {
-                            ts
-                        };
-                        entry.ts_ns = Some(ticker_ts);
+                        entry.ts_ns = Some(ts);
                     }
                 }
             }
@@ -430,33 +415,31 @@ pub fn spawn_state_engine(
                                     .and_then(|symbol| binance_bbo.get(symbol).copied())
                             });
                             #[cfg(feature = "binance_book")]
-                            let (bid_levels, ask_levels, ts_eff) = if let Some(e) = entry {
+                            let (bid_levels, ask_levels) = if let Some(e) = entry {
                                 (
                                     level_from_option(Some((e.bid_px, e.bid_qty))),
                                     level_from_option(Some((e.ask_px, e.ask_qty))),
-                                    if e.ts != 0 { e.ts } else { ts },
                                 )
                             } else {
                                 let (bid_vec, ask_vec) = binance_book.top_levels_f64(1);
-                                (levels_to_array(&bid_vec), levels_to_array(&ask_vec), ts)
+                                (levels_to_array(&bid_vec), levels_to_array(&ask_vec))
                             };
                             #[cfg(not(feature = "binance_book"))]
-                            let (bid_levels, ask_levels, ts_eff) = if let Some(e) = entry {
+                            let (bid_levels, ask_levels) = if let Some(e) = entry {
                                 (
                                     level_from_option(Some((e.bid_px, e.bid_qty))),
                                     level_from_option(Some((e.ask_px, e.ask_qty))),
-                                    if e.ts != 0 { e.ts } else { ts },
                                 )
                             } else {
-                                ([None; 3], [None; 3], ts)
+                                ([None; 3], [None; 3])
                             };
-                            demean.record_other(ExchangeKind::Binance, Some(ts_eff), Some(mid));
+                            demean.record_other(ExchangeKind::Binance, Some(ts), Some(mid));
                             {
                                 let mut st = state().lock().unwrap();
                                 let snap = &mut st.binance.bbo;
                                 snap.price = Some(mid);
                                 snap.seq = snap.seq.wrapping_add(1);
-                                snap.ts_ns = Some(ts_eff);
+                                snap.ts_ns = Some(ts);
                                 snap.bid_levels = bid_levels;
                                 snap.ask_levels = ask_levels;
                                 snap.direction = None;
@@ -468,8 +451,7 @@ pub fn spawn_state_engine(
                     if binance::update_trades(s, &mut binance_trades) {
                         if let Some(trade) = binance_trades.last() {
                             let px = (trade.px as f64) / binance::PRICE_SCALE;
-                            let trade_ts = if trade.ts != 0 { trade.ts } else { ts };
-                            demean.record_other(ExchangeKind::Binance, Some(trade_ts), Some(px));
+                            demean.record_other(ExchangeKind::Binance, Some(ts), Some(px));
                             let direction = if trade.is_buyer_maker {
                                 TradeDirection::Sell
                             } else {
@@ -479,7 +461,7 @@ pub fn spawn_state_engine(
                                 let mut st = state().lock().unwrap();
                                 st.binance.trade.price = Some(px);
                                 st.binance.trade.seq = st.binance.trade.seq.wrapping_add(1);
-                                st.binance.trade.ts_ns = Some(trade_ts);
+                                st.binance.trade.ts_ns = Some(ts);
                                 st.binance.trade.direction = Some(direction);
                                 st.binance.trade.bid_levels = [None; 3];
                                 st.binance.trade.ask_levels = [None; 3];
@@ -542,13 +524,7 @@ pub fn spawn_state_engine(
                             entry.seq.wrapping_add(1)
                         };
                         entry.seq = seq;
-
-                        let ticker_ts = if ticker.ticker.ts != 0 {
-                            ticker.ticker.ts
-                        } else {
-                            ts
-                        };
-                        entry.ts_ns = Some(ticker_ts);
+                        entry.ts_ns = Some(ts);
                     }
                 }
             }
@@ -591,28 +567,27 @@ pub fn spawn_state_engine(
                                     .last_symbol()
                                     .and_then(|symbol| gate_bbo.get(symbol).copied())
                             });
-                            let (bid_levels, ask_levels, ts_eff) = if let Some(e) = entry {
+                            let (bid_levels, ask_levels) = if let Some(e) = entry {
                                 (
                                     level_from_option(Some((e.bid_px, e.bid_qty))),
                                     level_from_option(Some((e.ask_px, e.ask_qty))),
-                                    if e.ts != 0 { e.ts } else { ts },
                                 )
                             } else {
                                 let (bid_vec, ask_vec) = gate_book.top_levels_f64(1);
-                                (levels_to_array(&bid_vec), levels_to_array(&ask_vec), ts)
+                                (levels_to_array(&bid_vec), levels_to_array(&ask_vec))
                             };
                             {
                                 let mut st = state().lock().unwrap();
                                 let snap = &mut st.gate.bbo;
                                 snap.price = Some(mid);
                                 snap.seq = snap.seq.wrapping_add(1);
-                                snap.ts_ns = Some(ts_eff);
+                                snap.ts_ns = Some(ts);
                                 snap.bid_levels = bid_levels;
                                 snap.ask_levels = ask_levels;
                                 snap.direction = None;
                                 snap.received_at = Some(f.recv_instant);
                             }
-                            let updates = demean.on_gate_event(Some(ts_eff), Some(mid));
+                            let updates = demean.on_gate_event(Some(ts), Some(mid));
                             apply_demean(&updates);
                             publisher.publish();
                         }
@@ -620,7 +595,6 @@ pub fn spawn_state_engine(
                     if gate::update_trades(s, &mut gate_trades) {
                         if let Some(trade) = gate_trades.last() {
                             let px = (trade.px as f64) / gate::PRICE_SCALE;
-                            let trade_ts = if trade.ts != 0 { trade.ts } else { ts };
                             let direction = if trade.is_buyer_maker {
                                 TradeDirection::Sell
                             } else {
@@ -630,13 +604,13 @@ pub fn spawn_state_engine(
                                 let mut st = state().lock().unwrap();
                                 st.gate.trade.price = Some(px);
                                 st.gate.trade.seq = st.gate.trade.seq.wrapping_add(1);
-                                st.gate.trade.ts_ns = Some(trade_ts);
+                                st.gate.trade.ts_ns = Some(ts);
                                 st.gate.trade.direction = Some(direction);
                                 st.gate.trade.bid_levels = [None; 3];
                                 st.gate.trade.ask_levels = [None; 3];
                                 st.gate.trade.received_at = Some(f.recv_instant);
                             }
-                            let updates = demean.on_gate_event(Some(trade_ts), Some(px));
+                            let updates = demean.on_gate_event(Some(ts), Some(px));
                             apply_demean(&updates);
                             publisher.publish();
                         }
@@ -736,13 +710,7 @@ pub fn spawn_state_engine(
                             entry.seq.wrapping_add(1)
                         };
                         entry.seq = seq;
-
-                        let ticker_ts = if ticker.ticker.ts != 0 {
-                            ticker.ticker.ts
-                        } else {
-                            ts
-                        };
-                        entry.ts_ns = Some(ticker_ts);
+                        entry.ts_ns = Some(ts);
                     }
                 }
             }
@@ -781,23 +749,22 @@ pub fn spawn_state_engine(
                                     .last_symbol()
                                     .and_then(|symbol| bitget_bbo.get(symbol).copied())
                             });
-                            let (bid_levels, ask_levels, ts_eff) = if let Some(e) = entry {
+                            let (bid_levels, ask_levels) = if let Some(e) = entry {
                                 (
                                     level_from_option(Some((e.bid_px, e.bid_qty))),
                                     level_from_option(Some((e.ask_px, e.ask_qty))),
-                                    if e.ts != 0 { e.ts } else { ts },
                                 )
                             } else {
                                 let (bid_vec, ask_vec) = bitget_book.top_levels_f64(1);
-                                (levels_to_array(&bid_vec), levels_to_array(&ask_vec), ts)
+                                (levels_to_array(&bid_vec), levels_to_array(&ask_vec))
                             };
-                            demean.record_other(ExchangeKind::Bitget, Some(ts_eff), Some(mid));
+                            demean.record_other(ExchangeKind::Bitget, Some(ts), Some(mid));
                             {
                                 let mut st = state().lock().unwrap();
                                 let snap = &mut st.bitget.bbo;
                                 snap.price = Some(mid);
                                 snap.seq = snap.seq.wrapping_add(1);
-                                snap.ts_ns = Some(ts_eff);
+                                snap.ts_ns = Some(ts);
                                 snap.bid_levels = bid_levels;
                                 snap.ask_levels = ask_levels;
                                 snap.direction = None;
@@ -809,8 +776,7 @@ pub fn spawn_state_engine(
                     if bitget::update_trades(s, &mut bitget_trades) {
                         if let Some(trade) = bitget_trades.last() {
                             let px = (trade.px as f64) / bitget::PRICE_SCALE;
-                            let trade_ts = if trade.ts != 0 { trade.ts } else { ts };
-                            demean.record_other(ExchangeKind::Bitget, Some(trade_ts), Some(px));
+                            demean.record_other(ExchangeKind::Bitget, Some(ts), Some(px));
                             let direction = if trade.is_buyer_maker {
                                 TradeDirection::Sell
                             } else {
@@ -820,7 +786,7 @@ pub fn spawn_state_engine(
                                 let mut st = state().lock().unwrap();
                                 st.bitget.trade.price = Some(px);
                                 st.bitget.trade.seq = st.bitget.trade.seq.wrapping_add(1);
-                                st.bitget.trade.ts_ns = Some(trade_ts);
+                                st.bitget.trade.ts_ns = Some(ts);
                                 st.bitget.trade.direction = Some(direction);
                                 st.bitget.trade.bid_levels = [None; 3];
                                 st.bitget.trade.ask_levels = [None; 3];
