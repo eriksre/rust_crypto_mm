@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 def main():
-    path = '/Users/eriksreinfelds/Documents/GitHub/rust_test/output.csv'
+    path = '/Users/eriksreinfelds/Documents/GitHub/rust_test/all_exchanges.csv'
     csv_path = Path(path).expanduser()
     if not csv_path.exists():
         print(f"Error: file not found: {csv_path}")

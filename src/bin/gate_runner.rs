@@ -14,14 +14,19 @@ use rust_test::base_classes::reference::ReferenceEvent;
 use rust_test::base_classes::state::state as global_state;
 use rust_test::base_classes::state::{ExchangeAdjustment, ExchangeSnap, FeedSnap, TradeDirection};
 use rust_test::base_classes::types::Side;
-use rust_test::exchanges::gate_rest;
+use rust_test::exchanges::{endpoints::GateioGet, gate_rest};
 use rust_test::execution::{
     ClientOrderId, DryRunGateway, ExecutionGateway, ExecutionReport, GateWsConfig, GateWsGateway,
     OrderAck, OrderManager, OrderStatus, QuoteIntent, Venue,
 };
 use rust_test::strategy::{QuoteConfig, ReferenceMeta, SimpleQuoteStrategy};
-use tokio::sync::mpsc;
-use tokio::time::{MissedTickBehavior, interval};
+use serde_json::Value;
+use tokio::sync::{Mutex, mpsc};
+use tokio::time::{self, MissedTickBehavior, interval};
+
+use hmac::{Hmac, Mac};
+use reqwest::{Client, Method};
+use sha2::{Digest, Sha512};
 
 #[derive(Debug, Parser)]
 #[command(name = "gate-runner", about = "Gate.io MVP dry-run executor")]
@@ -33,8 +38,9 @@ struct Cli {
 
 #[derive(Debug, serde::Deserialize, Clone)]
 struct RiskConfig {
-    max_notional: f64,
     max_order_notional: f64,
+    #[serde(default)]
+    max_position_notional: f64,
 }
 
 #[derive(Debug, serde::Deserialize, Clone)]
@@ -79,6 +85,221 @@ fn default_true() -> bool {
 
 fn default_flush_interval_ms() -> u64 {
     200
+}
+
+#[derive(Debug, Clone)]
+struct GateCredentials {
+    api_key: String,
+    api_secret: String,
+}
+
+#[derive(Debug, Default)]
+struct InventoryTracker {
+    contract_size: f64,
+    net_contracts: f64,
+    orders: HashMap<ClientOrderId, OrderFillState>,
+    dangling: HashMap<ClientOrderId, DanglingFill>,
+}
+
+#[derive(Debug)]
+struct OrderFillState {
+    side: Side,
+    filled_qty: f64,
+}
+
+#[derive(Debug, Clone)]
+struct InventoryUpdate {
+    client_order_id: ClientOrderId,
+    side: Side,
+    prev_contracts: f64,
+    new_contracts: f64,
+    delta_contracts: f64,
+    fill_qty: f64,
+    fill_price: Option<f64>,
+    status: OrderStatus,
+    source: InventoryUpdateSource,
+}
+
+#[derive(Debug, Clone)]
+struct DanglingFill {
+    side: Side,
+    filled_qty: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum InventoryUpdateSource {
+    Registered,
+    Inferred,
+}
+
+enum InventoryReportOutcome {
+    None,
+    Applied(InventoryUpdate),
+    Missing {
+        order_id: ClientOrderId,
+        filled_qty: f64,
+        avg_price: Option<f64>,
+        status: OrderStatus,
+    },
+}
+
+impl InventoryTracker {
+    fn new(contract_size: f64, initial_contracts: f64) -> Self {
+        Self {
+            contract_size,
+            net_contracts: initial_contracts,
+            orders: HashMap::new(),
+            dangling: HashMap::new(),
+        }
+    }
+
+    fn net_contracts(&self) -> f64 {
+        self.net_contracts
+    }
+
+    fn record_orders(&mut self, intents: &[QuoteIntent]) -> Vec<ClientOrderId> {
+        let mut added = Vec::with_capacity(intents.len());
+        for intent in intents {
+            let id = intent.client_order_id.clone();
+            let mut state = OrderFillState {
+                side: intent.side,
+                filled_qty: 0.0,
+            };
+            if let Some(dangling) = self.dangling.remove(&id) {
+                state.filled_qty = dangling.filled_qty;
+            }
+            self.orders.insert(id.clone(), state);
+            added.push(id);
+        }
+        added
+    }
+
+    fn apply_report(&mut self, report: &ExecutionReport) -> InventoryReportOutcome {
+        if let Some(entry) = self.orders.get_mut(&report.client_order_id) {
+            let side = entry.side;
+            let mut update: Option<InventoryUpdate> = None;
+
+            if report.filled_qty > entry.filled_qty + f64::EPSILON {
+                let delta_qty = report.filled_qty - entry.filled_qty;
+                let delta_contracts = if self.contract_size > 0.0 {
+                    delta_qty / self.contract_size
+                } else {
+                    0.0
+                };
+
+                if delta_contracts.abs() > f64::EPSILON {
+                    let prev_contracts = self.net_contracts;
+                    match side {
+                        Side::Bid => self.net_contracts += delta_contracts,
+                        Side::Ask => self.net_contracts -= delta_contracts,
+                    }
+                    entry.filled_qty = report.filled_qty;
+                    update = Some(InventoryUpdate {
+                        client_order_id: report.client_order_id.clone(),
+                        side,
+                        prev_contracts,
+                        new_contracts: self.net_contracts,
+                        delta_contracts: self.net_contracts - prev_contracts,
+                        fill_qty: delta_qty,
+                        fill_price: report.avg_fill_price,
+                        status: report.status.clone(),
+                        source: InventoryUpdateSource::Registered,
+                    });
+                }
+            }
+
+            if matches!(
+                report.status,
+                OrderStatus::Filled | OrderStatus::Canceled | OrderStatus::Rejected
+            ) {
+                self.orders.remove(&report.client_order_id);
+                self.dangling.remove(&report.client_order_id);
+            }
+
+            if let Some(update) = update {
+                InventoryReportOutcome::Applied(update)
+            } else {
+                InventoryReportOutcome::None
+            }
+        } else if report.filled_qty > f64::EPSILON {
+            let (side, prev_filled) =
+                if let Some(dangling) = self.dangling.get(&report.client_order_id) {
+                    (dangling.side, dangling.filled_qty)
+                } else if let Some(inferred) = infer_side_from_id(&report.client_order_id) {
+                    (inferred, 0.0)
+                } else {
+                    return InventoryReportOutcome::Missing {
+                        order_id: report.client_order_id.clone(),
+                        filled_qty: report.filled_qty,
+                        avg_price: report.avg_fill_price,
+                        status: report.status.clone(),
+                    };
+                };
+
+            let delta_qty = report.filled_qty - prev_filled;
+            let delta_contracts = if self.contract_size > 0.0 {
+                delta_qty / self.contract_size
+            } else {
+                0.0
+            };
+            if delta_contracts.abs() > f64::EPSILON {
+                let prev = self.net_contracts;
+                match side {
+                    Side::Bid => self.net_contracts += delta_contracts,
+                    Side::Ask => self.net_contracts -= delta_contracts,
+                }
+                let update = InventoryUpdate {
+                    client_order_id: report.client_order_id.clone(),
+                    side,
+                    prev_contracts: prev,
+                    new_contracts: self.net_contracts,
+                    delta_contracts: self.net_contracts - prev,
+                    fill_qty: delta_qty,
+                    fill_price: report.avg_fill_price,
+                    status: report.status.clone(),
+                    source: InventoryUpdateSource::Inferred,
+                };
+
+                self.dangling.insert(
+                    report.client_order_id.clone(),
+                    DanglingFill {
+                        side,
+                        filled_qty: report.filled_qty,
+                    },
+                );
+
+                if matches!(
+                    report.status,
+                    OrderStatus::Filled | OrderStatus::Canceled | OrderStatus::Rejected
+                ) {
+                    self.dangling.remove(&report.client_order_id);
+                }
+
+                InventoryReportOutcome::Applied(update)
+            } else {
+                self.dangling.insert(
+                    report.client_order_id.clone(),
+                    DanglingFill {
+                        side,
+                        filled_qty: report.filled_qty,
+                    },
+                );
+                InventoryReportOutcome::None
+            }
+        } else {
+            InventoryReportOutcome::None
+        }
+    }
+
+    fn replace_from_rest(&mut self, contracts: f64) -> Option<(f64, f64)> {
+        let prev = self.net_contracts;
+        if (contracts - prev).abs() > 1e-9 {
+            self.net_contracts = contracts;
+            Some((prev, contracts))
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -186,10 +407,51 @@ fn apply_demean(price: f64, adj: Option<&ExchangeAdjustment>) -> f64 {
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     let cli = Cli::parse();
-    let config = load_config(&cli.config)?;
+    let mut config = load_config(&cli.config)?;
     let debug = DebugLogger::new(config.mode.debug_prints);
 
-    let contract_size = resolve_contract_size(&config).await?;
+    let contract_meta = gate_rest::fetch_contract_meta_async(&config.strategy.symbol)
+        .await
+        .ok_or_else(|| {
+            anyhow!(
+                "failed to fetch Gate contract metadata for {}",
+                config.strategy.symbol
+            )
+        })?;
+
+    if contract_meta.in_delisting.unwrap_or(false) {
+        bail!(
+            "{} is marked for delisting on Gate; aborting execution",
+            config.strategy.symbol
+        );
+    }
+
+    if let Some(min_tick) = contract_meta
+        .order_price_round
+        .or(contract_meta.rounding_precision)
+        .filter(|v| v.is_finite() && *v > 0.0)
+    {
+        if (config.strategy.min_tick - min_tick).abs() > f64::EPSILON {
+            debug.info(|| {
+                format!(
+                    "overriding min_tick for {} from {:.8} to {:.8}",
+                    config.strategy.symbol, config.strategy.min_tick, min_tick
+                )
+            });
+        }
+        config.strategy.min_tick = min_tick;
+    }
+
+    let contract_size = contract_meta
+        .quanto_multiplier
+        .filter(|m| m.is_finite() && *m > 0.0)
+        .ok_or_else(|| {
+            anyhow!(
+                "contract metadata missing valid quanto_multiplier for {}",
+                config.strategy.symbol
+            )
+        })?;
+
     debug.info(|| {
         format!(
             "resolved contract size for {}: {}",
@@ -205,6 +467,93 @@ async fn main() -> Result<()> {
         None
     };
 
+    let settle = config.settle.clone().unwrap_or_else(|| "usdt".to_string());
+
+    let credentials = if config.mode.dry_run {
+        None
+    } else {
+        Some(load_gate_credentials(&config)?)
+    };
+
+    let rest_client = credentials
+        .as_ref()
+        .map(|creds| GateRestClient::new(creds.clone()));
+
+    let initial_contracts = if let Some(client) = rest_client.as_ref() {
+        match client
+            .fetch_position_contracts(&settle, &config.strategy.symbol)
+            .await
+        {
+            Ok(Some(contracts)) => {
+                debug
+                    .info(|| format!("Initial REST position: {} contracts", format_f64(contracts)));
+                contracts
+            }
+            Ok(None) => {
+                debug.info(|| "Initial REST position: none reported".to_string());
+                0.0
+            }
+            Err(err) => {
+                debug.error(|| format!("failed to fetch initial position: {:#}", err));
+                0.0
+            }
+        }
+    } else {
+        0.0
+    };
+
+    let inventory = Arc::new(Mutex::new(InventoryTracker::new(
+        contract_size,
+        initial_contracts,
+    )));
+
+    if let Some(client) = rest_client.clone() {
+        let inventory_clone = inventory.clone();
+        let settle_clone = settle.clone();
+        let symbol_clone = config.strategy.symbol.clone();
+        let debug_clone = debug.clone();
+        tokio::spawn(async move {
+            let mut ticker = time::interval(Duration::from_secs(60));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                match client
+                    .fetch_position_contracts(&settle_clone, &symbol_clone)
+                    .await
+                {
+                    Ok(Some(contracts)) => {
+                        debug_clone
+                            .info(|| format!("REST refresh: {} contracts", format_f64(contracts)));
+                        let change = {
+                            let mut guard = inventory_clone.lock().await;
+                            guard.replace_from_rest(contracts)
+                        };
+                        if let Some((prev, new)) = change {
+                            debug_clone.info(|| {
+                                format!("inventory sync (REST) {:.4} -> {:.4} contracts", prev, new)
+                            });
+                        }
+                    }
+                    Ok(None) => {
+                        debug_clone.info(|| "REST refresh: no position reported".to_string());
+                        let change = {
+                            let mut guard = inventory_clone.lock().await;
+                            guard.replace_from_rest(0.0)
+                        };
+                        if let Some((prev, new)) = change {
+                            debug_clone.info(|| {
+                                format!("inventory sync (REST) {:.4} -> {:.4} contracts", prev, new)
+                            });
+                        }
+                    }
+                    Err(err) => {
+                        debug_clone.error(|| format!("REST position refresh failed: {:#}", err));
+                    }
+                }
+            }
+        });
+    }
+
     let (reference_tx, mut reference_rx) = mpsc::unbounded_channel();
     let _engine = spawn_state_engine(config.strategy.symbol.clone(), Some(reference_tx));
     debug.info(|| {
@@ -217,7 +566,11 @@ async fn main() -> Result<()> {
     let gateway: Arc<dyn ExecutionGateway> = if config.mode.dry_run {
         Arc::new(DryRunGateway::new())
     } else {
-        Arc::new(setup_live_gateway(&config, contract_size).await?)
+        let creds = credentials
+            .as_ref()
+            .expect("credentials must exist for live mode")
+            .clone();
+        Arc::new(setup_live_gateway(&config, contract_size, &creds).await?)
     };
     let order_manager = Arc::new(OrderManager::new(gateway, Duration::from_secs(30)));
     let mut strategy = SimpleQuoteStrategy::new(config.strategy.clone());
@@ -275,6 +628,7 @@ async fn main() -> Result<()> {
                                 order_manager.clone(),
                                 logger.clone(),
                                 debug.clone(),
+                                inventory.clone(),
                             ).await
                         {
                             debug.error(|| format!("error processing reports: {:#}", err));
@@ -293,6 +647,7 @@ async fn main() -> Result<()> {
                             order_manager.clone(),
                             logger.clone(),
                             debug.clone(),
+                            inventory.clone(),
                         ).await {
                             debug.error(|| format!("error handling quote tick: {:#}", err));
                         }
@@ -311,6 +666,134 @@ fn load_config(path: &str) -> Result<RunnerConfig> {
     let config: RunnerConfig = serde_yaml::from_str(&contents)
         .with_context(|| format!("failed to parse config at {}", path))?;
     Ok(config)
+}
+
+#[derive(Clone)]
+struct GateRestClient {
+    client: Client,
+    credentials: GateCredentials,
+}
+
+struct FilteredIntents {
+    allowed: Vec<QuoteIntent>,
+    skipped: Vec<(ClientOrderId, String)>,
+}
+
+impl GateRestClient {
+    fn new(credentials: GateCredentials) -> Self {
+        let client = Client::builder()
+            .user_agent("gate-runner/0.1")
+            .build()
+            .expect("reqwest client");
+        Self {
+            client,
+            credentials,
+        }
+    }
+
+    async fn fetch_position_contracts(&self, settle: &str, contract: &str) -> Result<Option<f64>> {
+        let path = format!("/api/v4/futures/{}/positions", settle);
+        let query = format!("contract={}", contract);
+        let value = self
+            .signed_request(Method::GET, &path, &query, "")
+            .await
+            .with_context(|| format!("failed to GET positions for {}", contract))?;
+
+        let matching_entry = match &value {
+            Value::Array(entries) => entries.iter().find(|entry| {
+                entry
+                    .get("contract")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.eq_ignore_ascii_case(contract))
+                    .unwrap_or(false)
+            }),
+            Value::Object(_) => {
+                if value
+                    .get("contract")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.eq_ignore_ascii_case(contract))
+                    .unwrap_or(false)
+                {
+                    Some(&value)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
+        Ok(matching_entry.and_then(extract_position_contracts))
+    }
+
+    async fn signed_request(
+        &self,
+        method: Method,
+        path: &str,
+        query: &str,
+        body: &str,
+    ) -> Result<Value> {
+        let method_name = method.as_str();
+        let ts = current_unix_seconds_string();
+        let payload_hash = sha512_hex(body);
+        let sign_payload = format!(
+            "{}\n{}\n{}\n{}\n{}",
+            method_name, path, query, payload_hash, ts
+        );
+
+        let mut mac = Hmac::<Sha512>::new_from_slice(self.credentials.api_secret.as_bytes())
+            .expect("HMAC accepts any key size");
+        mac.update(sign_payload.as_bytes());
+        let signature = hex_bytes(mac.finalize().into_bytes());
+
+        let url = if query.is_empty() {
+            format!("{}{}", GateioGet::BASE, path)
+        } else {
+            format!("{}{}?{}", GateioGet::BASE, path, query)
+        };
+
+        let mut request = self.client.request(method, &url);
+        if !body.is_empty() {
+            request = request.body(body.to_string());
+        }
+        let response = request
+            .header("KEY", &self.credentials.api_key)
+            .header("Timestamp", &ts)
+            .header("SIGN", signature)
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
+            .send()
+            .await?;
+
+        let status = response.status();
+        let text = response.text().await?;
+        if !status.is_success() {
+            bail!("HTTP {} -> {}", status, text);
+        }
+        if text.trim().is_empty() {
+            return Ok(Value::Null);
+        }
+        let value: Value = serde_json::from_str(&text)
+            .with_context(|| format!("failed to parse JSON response: {}", text))?;
+        Ok(value)
+    }
+}
+
+fn load_gate_credentials(config: &RunnerConfig) -> Result<GateCredentials> {
+    let creds = config.credentials.clone().unwrap_or_default();
+    let key_env = creds
+        .api_key_env
+        .unwrap_or_else(|| "GATEIO_API_KEY".to_string());
+    let secret_env = creds
+        .api_secret_env
+        .unwrap_or_else(|| "GATEIO_SECRET_KEY".to_string());
+
+    let api_key = std::env::var(&key_env).with_context(|| format!("missing env var {key_env}"))?;
+    let api_secret =
+        std::env::var(&secret_env).with_context(|| format!("missing env var {secret_env}"))?;
+    Ok(GateCredentials {
+        api_key,
+        api_secret,
+    })
 }
 
 async fn handle_market_update(
@@ -402,9 +885,40 @@ async fn handle_quote_tick(
     order_manager: Arc<OrderManager>,
     logger: Option<QuoteLogHandle>,
     debug: DebugLogger,
+    inventory: Arc<Mutex<InventoryTracker>>,
 ) -> Result<()> {
-    if let Some(plan) = strategy.plan_quotes(now) {
-        enforce_risk(&plan.intents, &config.risk, contract_size)?;
+    drain_reports(
+        strategy,
+        config,
+        order_manager.clone(),
+        logger.clone(),
+        debug.clone(),
+        inventory.clone(),
+    )
+    .await?;
+
+    if let Some(mut plan) = strategy.plan_quotes(now) {
+        let reference_price = plan.reference_price;
+        let net_contracts = {
+            let guard = inventory.lock().await;
+            guard.net_contracts()
+        };
+        let filter = filter_intents(
+            &plan.intents,
+            &config.risk,
+            contract_size,
+            net_contracts,
+            reference_price,
+        )?;
+        if !filter.skipped.is_empty() {
+            for (id, reason) in &filter.skipped {
+                debug.info(|| format!("skipping intent {} -> {}", id, reason));
+            }
+        }
+        if filter.allowed.is_empty() {
+            return Ok(());
+        }
+        plan.intents = filter.allowed.clone();
         let latency_debug = latency_debug_enabled();
 
         let ref_meta = if let Some(meta) = plan.reference_meta.as_ref() {
@@ -431,7 +945,6 @@ async fn handle_quote_tick(
         };
 
         let intents = plan.intents.clone();
-        let reference_price = plan.reference_price;
         let send_start = Instant::now();
         let sent_ts = SystemTime::now();
         let debounce_budget = Duration::from_millis(config.strategy.debounce_ms.max(1));
@@ -475,6 +988,24 @@ async fn handle_quote_tick(
             );
         }
         strategy.commit_plan(&plan);
+        {
+            let added_ids = {
+                let mut guard = inventory.lock().await;
+                guard.record_orders(&intents)
+            };
+            if !added_ids.is_empty() {
+                debug.info(|| {
+                    format!(
+                        "inventory register: {}",
+                        added_ids
+                            .iter()
+                            .map(|id| id.0.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                });
+            }
+        }
 
         let intents_for_send = intents.clone();
         let ref_meta_for_send = ref_meta.clone();
@@ -525,6 +1056,7 @@ async fn drain_reports(
     order_manager: Arc<OrderManager>,
     logger: Option<QuoteLogHandle>,
     debug: DebugLogger,
+    inventory: Arc<Mutex<InventoryTracker>>,
 ) -> Result<()> {
     let reports = order_manager.poll_reports().await?;
     if reports.is_empty() {
@@ -533,6 +1065,46 @@ async fn drain_reports(
 
     for report in &reports {
         strategy.handle_report(report);
+        let outcome = {
+            let mut guard = inventory.lock().await;
+            guard.apply_report(report)
+        };
+
+        match outcome {
+            InventoryReportOutcome::Applied(update) => {
+                debug.info(|| {
+                    format!(
+                        "inventory update ({:?}): {} {:?} status {:?} delta={:.4} contracts (fill_qty={:.4} @ {:?}) {prev:.4} -> {next:.4}",
+                        update.source,
+                        update.client_order_id,
+                        update.side,
+                        update.status,
+                        update.delta_contracts,
+                        update.fill_qty,
+                        update.fill_price,
+                        prev = update.prev_contracts,
+                        next = update.new_contracts
+                    )
+                });
+            }
+            InventoryReportOutcome::Missing {
+                order_id,
+                filled_qty,
+                avg_price,
+                status,
+            } => {
+                debug.error(|| {
+                    format!(
+                        "inventory warning: missing order {} for fill {:.4} (avg {:?}, status {:?})",
+                        order_id,
+                        filled_qty,
+                        avg_price,
+                        status
+                    )
+                });
+            }
+            InventoryReportOutcome::None => {}
+        }
     }
 
     if let Some(logger) = logger.as_ref() {
@@ -543,12 +1115,24 @@ async fn drain_reports(
     Ok(())
 }
 
-fn enforce_risk(intents: &[QuoteIntent], risk: &RiskConfig, contract_size: f64) -> Result<()> {
+fn filter_intents(
+    intents: &[QuoteIntent],
+    risk: &RiskConfig,
+    contract_size: f64,
+    current_contracts: f64,
+    reference_price: f64,
+) -> Result<FilteredIntents> {
     if !contract_size.is_finite() || contract_size <= 0.0 {
         bail!("invalid contract size {contract_size}");
     }
+    if !reference_price.is_finite() || reference_price <= 0.0 {
+        bail!("invalid reference price {reference_price}");
+    }
 
-    let mut batch_notional = 0.0;
+    let mut running_contracts = current_contracts;
+    let mut allowed = Vec::with_capacity(intents.len());
+    let mut skipped = Vec::new();
+
     for intent in intents {
         let contracts = (intent.size.abs() / contract_size).round() as i64;
         if contracts == 0 {
@@ -561,7 +1145,8 @@ fn enforce_risk(intents: &[QuoteIntent], risk: &RiskConfig, contract_size: f64) 
         }
 
         let effective_size = contracts as f64 * contract_size;
-        let notional = intent.price.abs() * effective_size;
+        let price = intent.price.abs();
+        let notional = price * effective_size;
         if notional > risk.max_order_notional {
             bail!(
                 "intent {} exceeds per-order notional limit: {:.2} > {:.2} (contracts={} size={:.8})",
@@ -572,16 +1157,48 @@ fn enforce_risk(intents: &[QuoteIntent], risk: &RiskConfig, contract_size: f64) 
                 effective_size
             );
         }
-        batch_notional += notional;
+
+        if risk.max_position_notional > 0.0 {
+            let contracts_as_f64 = contracts as f64;
+            let projected_contracts = match intent.side {
+                Side::Bid => running_contracts + contracts_as_f64,
+                Side::Ask => running_contracts - contracts_as_f64,
+            };
+            let basis_price = price.max(reference_price.abs());
+            let projected_notional = projected_contracts.abs() * contract_size * basis_price;
+            let current_notional = running_contracts.abs() * contract_size * basis_price;
+
+            let breaches_limit = projected_notional > risk.max_position_notional;
+            let increases_exposure = projected_notional > current_notional + 1e-9;
+
+            if breaches_limit && increases_exposure {
+                skipped.push((
+                    intent.client_order_id.clone(),
+                    format!(
+                        "projected notional {:.2} exceeds {:.2}",
+                        projected_notional, risk.max_position_notional
+                    ),
+                ));
+                continue;
+            }
+            running_contracts = projected_contracts;
+        }
+
+        allowed.push(intent.clone());
     }
-    if batch_notional > risk.max_notional {
-        bail!(
-            "batch exceeds max notional limit: {:.2} > {:.2}",
-            batch_notional,
-            risk.max_notional
-        );
+
+    Ok(FilteredIntents { allowed, skipped })
+}
+
+fn infer_side_from_id(id: &ClientOrderId) -> Option<Side> {
+    let lower = id.0.to_ascii_lowercase();
+    if lower.contains("-b-") {
+        Some(Side::Bid)
+    } else if lower.contains("-s-") {
+        Some(Side::Ask)
+    } else {
+        None
     }
-    Ok(())
 }
 
 fn log_submission(
@@ -1281,39 +1898,14 @@ async fn ctrl_c_notifier() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-async fn resolve_contract_size(config: &RunnerConfig) -> Result<f64> {
-    let symbol = &config.strategy.symbol;
-    let meta = gate_rest::fetch_contract_meta_async(symbol)
-        .await
-        .ok_or_else(|| anyhow!("failed to fetch Gate contract metadata for {}", symbol))?;
-    let multiplier = meta
-        .quanto_multiplier
-        .filter(|m| m.is_finite() && *m > 0.0)
-        .ok_or_else(|| {
-            anyhow!(
-                "contract metadata missing valid quanto_multiplier for {}",
-                symbol
-            )
-        })?;
-    Ok(multiplier)
-}
-
-async fn setup_live_gateway(config: &RunnerConfig, contract_size: f64) -> Result<GateWsGateway> {
-    let creds = config.credentials.clone().unwrap_or_default();
-    let key_env = creds
-        .api_key_env
-        .unwrap_or_else(|| "GATEIO_API_KEY".to_string());
-    let secret_env = creds
-        .api_secret_env
-        .unwrap_or_else(|| "GATEIO_SECRET_KEY".to_string());
-
-    let api_key = std::env::var(&key_env).with_context(|| format!("missing env var {key_env}"))?;
-    let api_secret =
-        std::env::var(&secret_env).with_context(|| format!("missing env var {secret_env}"))?;
-
+async fn setup_live_gateway(
+    config: &RunnerConfig,
+    contract_size: f64,
+    creds: &GateCredentials,
+) -> Result<GateWsGateway> {
     let ws_config = GateWsConfig {
-        api_key,
-        api_secret,
+        api_key: creds.api_key.clone(),
+        api_secret: creds.api_secret.clone(),
         symbol: config.strategy.symbol.clone(),
         settle: config.settle.clone(),
         ws_url: None,
@@ -1321,4 +1913,47 @@ async fn setup_live_gateway(config: &RunnerConfig, contract_size: f64) -> Result
     };
 
     GateWsGateway::connect(ws_config).await
+}
+
+fn extract_position_contracts(value: &Value) -> Option<f64> {
+    let fields = ["size", "current_size", "position", "contracts"];
+    for key in fields {
+        if let Some(entry) = value.get(key) {
+            if let Some(val) = value_to_f64(entry) {
+                return Some(val);
+            }
+        }
+    }
+    None
+}
+
+fn value_to_f64(value: &Value) -> Option<f64> {
+    match value {
+        Value::Number(num) => num.as_f64(),
+        Value::String(s) => s.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn sha512_hex(input: &str) -> String {
+    let mut hasher = Sha512::new();
+    hasher.update(input.as_bytes());
+    hex_bytes(hasher.finalize())
+}
+
+fn hex_bytes(bytes: impl AsRef<[u8]>) -> String {
+    bytes
+        .as_ref()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
+}
+
+fn current_unix_seconds_string() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before epoch");
+    let secs = now.as_secs();
+    let nanos = now.subsec_nanos();
+    format!("{}.{:09}", secs, nanos)
 }

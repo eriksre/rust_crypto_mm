@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -30,6 +31,14 @@ pub struct FeedSnap {
     pub bid_levels: [Option<(f64, f64)>; 3],
     pub ask_levels: [Option<(f64, f64)>; 3],
     pub received_at: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Default, Debug)]
+pub struct TradeEvent {
+    pub ts_ns: Ts,
+    pub price: f64,
+    pub direction: Option<TradeDirection>,
+    pub quantity: Option<f64>,
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -84,6 +93,7 @@ pub struct ExchangeSnap {
     pub trade: FeedSnap,
     pub user_trade: UserTradeSnap,
     pub ticker: TickerSnap,
+    pub trade_events: VecDeque<TradeEvent>,
 }
 
 #[derive(Default, Debug)]

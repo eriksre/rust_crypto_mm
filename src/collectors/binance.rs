@@ -133,7 +133,7 @@ pub fn events_for_book<const N: usize>(
 }
 
 // Update trades store from aggTrade frames; emit from store only (caller reads last px)
-pub fn update_trades<const N: usize>(s: &str, trades: &mut FixedTrades<N>) -> bool {
+pub fn update_trades<const N: usize>(s: &str, trades: &mut FixedTrades<N>) -> usize {
     if let Ok(raw) = serde_json::from_str::<Value>(s) {
         let payload = event_payload(&raw);
         if payload.get("e").and_then(|v| v.as_str()) == Some("aggTrade") {
@@ -154,11 +154,11 @@ pub fn update_trades<const N: usize>(s: &str, trades: &mut FixedTrades<N>) -> bo
                 let is_buyer_maker = payload.get("m").and_then(|v| v.as_bool()).unwrap_or(false);
                 let trade = Trade::new(px_i, qty_i, ts_ns, agg_id, is_buyer_maker);
                 trades.push(trade);
-                return true;
+                return 1;
             }
         }
     }
-    false
+    0
 }
 
 #[cfg(test)]

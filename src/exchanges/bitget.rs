@@ -112,6 +112,15 @@ impl BitgetFrame {
         }
         "(unknown)"
     }
+
+    pub fn action(&self) -> &str {
+        if let Ok(s) = core::str::from_utf8(&self.raw) {
+            if let Some(v) = find_json_string(s, "action") {
+                return v;
+            }
+        }
+        "(unknown)"
+    }
 }
 
 #[inline(always)]

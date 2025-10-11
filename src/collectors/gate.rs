@@ -277,10 +277,10 @@ pub fn update_bbo_store(s: &str, store: &mut BboStore) -> bool {
 }
 
 // Update trades store for Gate from futures.trades
-pub fn update_trades<const N: usize>(s: &str, trades: &mut FixedTrades<N>) -> bool {
+pub fn update_trades<const N: usize>(s: &str, trades: &mut FixedTrades<N>) -> usize {
     if let Ok(raw) = serde_json::from_str::<Value>(s) {
         if raw.get("channel").and_then(|v| v.as_str()) == Some("futures.trades") {
-            let mut pushed = false;
+            let mut inserted = 0usize;
             if let Some(entries) = raw.get("result").and_then(|res| {
                 if res.is_array() {
                     Some(res.as_array().unwrap())
@@ -316,20 +316,14 @@ pub fn update_trades<const N: usize>(s: &str, trades: &mut FixedTrades<N>) -> bo
                             .or_else(|| entry.get("trade_id"))
                             .and_then(as_u64)
                             .unwrap_or(0) as Seq;
-                        let is_buyer_maker = entry
-                            .get("side")
-                            .and_then(|v| v.as_str())
-                            .map(|side| side.eq_ignore_ascii_case("sell"))
-                            .unwrap_or(false);
+                        let is_buyer_maker = size < 0.0;
                         trades.push(Trade::new(px_i, qty_i, ts_ns, seq, is_buyer_maker));
-                        pushed = true;
+                        inserted += 1;
                     }
                 }
             }
-            if pushed {
-                return true;
-            }
+            return inserted;
         }
     }
-    false
+    0
 }

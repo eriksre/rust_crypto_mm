@@ -10,11 +10,16 @@ use crate::execution::{
 };
 
 const DEFAULT_REPRICE_BPS: f64 = 2.0;
+const DEFAULT_MIN_TICK: f64 = 1e-8;
 const DEFAULT_DEBOUNCE_MS: u64 = 50;
 const DEFAULT_CANCEL_BUFFER_MS: u64 = 50;
 
 fn default_reprice_bps() -> f64 {
     DEFAULT_REPRICE_BPS
+}
+
+fn default_min_tick() -> f64 {
+    DEFAULT_MIN_TICK
 }
 
 fn default_debounce_ms() -> u64 {
@@ -31,6 +36,7 @@ pub struct QuoteConfig {
     pub symbol: String,
     pub size: f64,
     pub spread_bps: f64,
+    #[serde(default = "default_min_tick")]
     pub min_tick: f64,
     #[serde(default = "default_reprice_bps")]
     pub reprice_bps: f64,

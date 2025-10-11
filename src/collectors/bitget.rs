@@ -285,7 +285,7 @@ pub fn update_bbo_store(s: &str, store: &mut BboStore) -> bool {
 }
 
 // Update trades store for Bitget from public trade channel
-pub fn update_trades<const N: usize>(s: &str, trades: &mut FixedTrades<N>) -> bool {
+pub fn update_trades<const N: usize>(s: &str, trades: &mut FixedTrades<N>) -> usize {
     if let Ok(raw) = serde_json::from_str::<Value>(s) {
         let channel = raw
             .get("channel")
@@ -293,7 +293,7 @@ pub fn update_trades<const N: usize>(s: &str, trades: &mut FixedTrades<N>) -> bo
             .and_then(|v| v.as_str());
         if channel == Some("trade") {
             if let Some(entries) = raw.get("data").and_then(|v| v.as_array()) {
-                let mut pushed = false;
+                let mut inserted = 0usize;
                 // Bitget sends the newest trade first; reverse iterate so the newest
                 // trade is the last one we push, keeping `FixedTrades::last()` stable.
                 for entry in entries.iter().rev() {
@@ -331,14 +331,12 @@ pub fn update_trades<const N: usize>(s: &str, trades: &mut FixedTrades<N>) -> bo
                             .map(|side| side.eq_ignore_ascii_case("sell"))
                             .unwrap_or(false);
                         trades.push(Trade::new(px_i, qty_i, ts_ns, seq, is_buyer_maker));
-                        pushed = true;
+                        inserted += 1;
                     }
                 }
-                if pushed {
-                    return true;
-                }
+                return inserted;
             }
         }
     }
-    false
+    0
 }

@@ -83,16 +83,16 @@ pub fn update_bbo_store(s: &str, store: &mut BboStore) -> bool {
 }
 
 // Update Bybit trades store from publicTrade messages
-pub fn update_trades<const N: usize>(s: &str, trades: &mut FixedTrades<N>) -> bool {
+pub fn update_trades<const N: usize>(s: &str, trades: &mut FixedTrades<N>) -> usize {
     if let Some(topic) = find_json_string(s, "topic") {
         if !topic.starts_with("publicTrade.") {
-            return false;
+            return 0;
         }
     } else {
-        return false;
+        return 0;
     }
 
-    let mut updated = false;
+    let mut inserted = 0usize;
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(s) {
         if let Some(data) = value.get("data").and_then(|d| d.as_array()) {
             for entry in data {
@@ -144,11 +144,11 @@ pub fn update_trades<const N: usize>(s: &str, trades: &mut FixedTrades<N>) -> bo
 
                 let trade = Trade::new(px_i, qty_i, ts, seq, is_buyer_maker);
                 trades.push(trade);
-                updated = true;
+                inserted += 1;
             }
         }
     }
-    updated
+    inserted
 }
 
 pub fn update_tickers(s: &str, store: &mut TickerStore) -> Option<(String, TickerSnapshot)> {

@@ -35,3 +35,10 @@ The execution worker parses every frame with serde_json::from_str into Value and
 fix the inventory issues where it doesn't respect the max notional. start by init with the starting size via a get req, and then stream updates to that via ws. refresh every min or so. 
 
 binance orderbook isn't being used. neither is gate. honestly, the books might actually just be worse, and more laggy than everything else, so kill the orderbook feeds maybe? 
+
+Gate WS stream error: WebSocket protocol error: Connection reset without closing handshake
+^ still get a bunch of these. fix
+
+risk engine is still fucked
+
+think about how I want trading to work, with regards to whether it will use the last trade if a series of trades is pushed. Will need to de-noise this, because the last trade in the sequence has a higher probability of being incorrect sometimes, though it might be a good conservative cancellation signal. 
