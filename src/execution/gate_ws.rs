@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::{SinkExt, StreamExt};
@@ -18,6 +18,9 @@ use crate::base_classes::state::{TradeDirection, state};
 use crate::base_classes::types::Side;
 use crate::exchanges::gate_rest;
 use crate::exchanges::{endpoints::GateioWs, gate_sign};
+use crate::utils::parsing::{value_to_f64, value_to_string, value_to_u64, extract_user_id};
+use crate::utils::time::{current_unix_ts, current_unix_ms};
+use crate::utils::math::format_price;
 
 use super::gateway::ExecutionGateway;
 use super::types::{
@@ -279,7 +282,16 @@ impl GateWsWorker {
         let text_for_state = text.clone();
         let order_id_for_state = order_id.clone();
         spawn_blocking(move || {
-            let mut st = state().lock().unwrap();
+            let mut st = match state().lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => {
+                    eprintln!("FATAL: State lock poisoned in Gate user trades handler: {}", poisoned);
+                    eprintln!("This indicates a panic occurred while holding the state lock.");
+                    eprintln!("User trade: price={:?}, contracts={}, order_id={:?}",
+                              price, size_contracts, order_id_for_state);
+                    panic!("State lock poisoned - cannot process user trades safely");
+                }
+            };
             let snap = &mut st.gate.user_trade;
             snap.price = price;
             snap.contracts = Some(size_contracts);
@@ -414,7 +426,7 @@ impl GateWsWorker {
                         if resp.is_success() {
                             if self.user_id.is_none() {
                                 if let Ok(raw) = serde_json::from_str::<Value>(&text) {
-                                    if let Some(uid) = extract_user_id_value(&raw) {
+                                    if let Some(uid) = extract_user_id(&raw) {
                                         self.user_id = Some(uid);
                                     }
                                 }
@@ -1016,68 +1028,3 @@ fn sign_subscribe(secret: &str, channel: &str, ts: i64) -> String {
     gate_sign::hmac_sha512_hex(secret, &payload)
 }
 
-fn value_to_string(value: &Value) -> Option<String> {
-    match value {
-        Value::String(s) => Some(s.clone()),
-        Value::Number(n) => Some(n.to_string()),
-        _ => None,
-    }
-}
-
-fn value_to_u64(value: &Value) -> Option<u64> {
-    match value {
-        Value::Number(n) => n.as_u64(),
-        Value::String(s) => s.parse::<u64>().ok(),
-        _ => None,
-    }
-}
-
-fn extract_user_id_value(value: &Value) -> Option<String> {
-    match value {
-        Value::String(s) => Some(s.clone()),
-        Value::Number(n) => Some(n.to_string()),
-        Value::Object(map) => {
-            if let Some(uid) = map
-                .get("user_id")
-                .or_else(|| map.get("uid"))
-                .or_else(|| map.get("userId"))
-            {
-                extract_user_id_value(uid)
-            } else {
-                map.values().find_map(extract_user_id_value)
-            }
-        }
-        Value::Array(items) => items.iter().find_map(extract_user_id_value),
-        _ => None,
-    }
-}
-
-fn value_to_f64(value: &Value) -> Option<f64> {
-    match value {
-        Value::Number(n) => n.as_f64(),
-        Value::String(s) => s.parse::<f64>().ok(),
-        _ => None,
-    }
-}
-
-fn current_unix_ts() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time before epoch")
-        .as_secs() as i64
-}
-
-fn current_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time before epoch")
-        .as_millis() as u64
-}
-
-fn format_price(price: f64) -> String {
-    let formatted = format!("{:.8}", price);
-    formatted
-        .trim_end_matches('0')
-        .trim_end_matches('.')
-        .to_string()
-}

@@ -1,6 +1,7 @@
 pub mod base_classes;
 pub mod collectors;
 pub mod exchanges;
+pub mod utils;
 
 #[cfg(feature = "gate_exec")]
 pub mod execution;

@@ -19,61 +19,8 @@ use crate::config::runner::RunnerConfig;
 use crate::execution::{ClientOrderId, ExecutionReport, QuoteIntent, Venue};
 use crate::strategy::ReferenceMeta;
 
-#[derive(Clone)]
-pub struct DebugLogger {
-    tx: mpsc::UnboundedSender<DebugEvent>,
-    debug_enabled: bool,
-}
-
-enum DebugEvent {
-    Info(String),
-    Warn(String),
-    Error(String),
-}
-
-impl DebugLogger {
-    pub fn new(debug_enabled: bool) -> Self {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        tokio::spawn(async move {
-            while let Some(event) = rx.recv().await {
-                match event {
-                    DebugEvent::Info(msg) => println!("{}", msg),
-                    DebugEvent::Warn(msg) => eprintln!("{}", msg),
-                    DebugEvent::Error(msg) => eprintln!("{}", msg),
-                }
-            }
-        });
-        Self { tx, debug_enabled }
-    }
-
-    pub fn info<F>(&self, msg: F)
-    where
-        F: FnOnce() -> String,
-    {
-        if !self.debug_enabled {
-            return;
-        }
-        let _ = self.tx.send(DebugEvent::Info(msg()));
-    }
-
-    pub fn error<F>(&self, msg: F)
-    where
-        F: FnOnce() -> String,
-    {
-        let _ = self.tx.send(DebugEvent::Error(msg()));
-    }
-
-    pub fn latency<F>(&self, msg: F)
-    where
-        F: FnOnce() -> String,
-    {
-        let _ = self.tx.send(DebugEvent::Warn(msg()));
-    }
-
-    pub fn is_enabled(&self) -> bool {
-        self.debug_enabled
-    }
-}
+// Re-export shared debug logger
+pub use super::debug_logger::DebugLogger;
 
 #[derive(Clone)]
 pub struct QuoteLogHandle {
@@ -148,7 +95,9 @@ impl QuoteLogHandle {
     }
 
     pub fn log_market_snapshot(&self) {
-        let _ = self.tx.send(LogEvent::MarketSnapshot);
+        if let Err(err) = self.tx.send(LogEvent::MarketSnapshot) {
+            eprintln!("ERROR: Failed to log market snapshot (logger channel closed): {}", err);
+        }
     }
 
     pub fn log_quote_submission(
@@ -163,14 +112,16 @@ impl QuoteLogHandle {
         if intents.is_empty() {
             return;
         }
-        let _ = self.tx.send(LogEvent::QuoteSubmission {
+        if let Err(err) = self.tx.send(LogEvent::QuoteSubmission {
             intents: intents.to_vec(),
             reference_meta: reference_meta.cloned(),
             reference_price,
             quote_internal,
             send_instant,
             sent_ts,
-        });
+        }) {
+            eprintln!("ERROR: Failed to log quote submission (logger channel closed): {}", err);
+        }
     }
 
     pub fn log_cancel(
@@ -181,20 +132,24 @@ impl QuoteLogHandle {
         send_instant: Instant,
         sent_ts: SystemTime,
     ) {
-        let _ = self.tx.send(LogEvent::Cancel {
+        if let Err(err) = self.tx.send(LogEvent::Cancel {
             order_id: order_id.0.clone(),
             reference: reference.clone(),
             cancel_internal,
             send_instant,
             sent_ts,
-        });
+        }) {
+            eprintln!("ERROR: Failed to log cancel (logger channel closed): {}", err);
+        }
     }
 
     pub fn log_reports(&self, reports: &[ExecutionReport]) {
         if reports.is_empty() {
             return;
         }
-        let _ = self.tx.send(LogEvent::Reports(reports.to_vec()));
+        if let Err(err) = self.tx.send(LogEvent::Reports(reports.to_vec())) {
+            eprintln!("ERROR: Failed to log reports (logger channel closed): {}", err);
+        }
     }
 }
 

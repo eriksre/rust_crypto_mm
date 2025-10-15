@@ -5,6 +5,8 @@ use reqwest::{Client, Method};
 use serde_json::Value;
 
 use crate::exchanges::{endpoints::GateioGet, gate_sign};
+use crate::utils::parsing::value_to_f64;
+use crate::utils::time::current_unix_seconds_string;
 
 use super::types::{ExecutionReport, OrderAck, QuoteIntent};
 
@@ -145,21 +147,3 @@ fn extract_position_contracts(value: &Value) -> Option<f64> {
     None
 }
 
-fn value_to_f64(value: &Value) -> Option<f64> {
-    match value {
-        Value::Number(num) => num.as_f64(),
-        Value::String(s) => s.parse::<f64>().ok(),
-        _ => None,
-    }
-}
-
-fn current_unix_seconds_string() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time before epoch");
-    let secs = now.as_secs();
-    let nanos = now.subsec_nanos();
-    format!("{}.{:09}", secs, nanos)
-}

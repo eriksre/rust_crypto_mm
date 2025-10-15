@@ -1,0 +1,1 @@
+You have access to a relatively large high frequency market making codebase. When writing new code, or modifying old code, be careful not to slow anything down at all. When writing new code and modifying old code, we do not want errors to be silent, we want them to be LOUD.
