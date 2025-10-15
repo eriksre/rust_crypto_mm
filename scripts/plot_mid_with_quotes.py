@@ -33,7 +33,6 @@ def parse_args() -> argparse.Namespace:
 
 def load_dataframe(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path, low_memory=False)
-    df = df.tail(20000)
     if "event_type" not in df.columns:
         raise SystemExit(
             "CSV is missing 'event_type'. Did you pass the activity logger output?"

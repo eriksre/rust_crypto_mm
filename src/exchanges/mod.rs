@@ -14,3 +14,5 @@ pub mod endpoints;
 pub mod gate;
 pub mod gate_book;
 pub mod gate_rest;
+#[cfg(feature = "gate_exec")]
+pub mod gate_sign;

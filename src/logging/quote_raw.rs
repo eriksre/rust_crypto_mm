@@ -1,33 +1,53 @@
-#![cfg(feature = "gate_exec")]
+#[derive(Clone)]
+struct DebugLogger {
+    tx: mpsc::UnboundedSender<DebugEvent>,
+    debug_enabled: bool,
+}
 
-use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant, SystemTime};
+enum DebugEvent {
+    Info(String),
+    Warn(String),
+    Error(String),
+}
 
-use anyhow::{Result, anyhow, bail};
-use clap::Parser;
-use rust_test::base_classes::engine::spawn_state_engine;
-use rust_test::base_classes::reference::ReferenceEvent;
-use rust_test::base_classes::types::Side;
-use rust_test::config::runner::{
-    RiskConfig, RunnerConfig, load_gate_credentials, load_runner_config,
-};
-use rust_test::exchanges::gate_rest;
-use rust_test::execution::{
-    ClientOrderId, DryRunGateway, ExecutionGateway, ExecutionReport, GateClient, GateCredentials,
-    GateWsConfig, GateWsGateway, InventoryReportOutcome, InventoryTracker, OrderAck, OrderManager,
-    OrderStatus, QuoteIntent,
-};
-use rust_test::logging::quote::{DebugLogger, QuoteLogHandle, format_f64};
-use rust_test::strategy::{ReferenceMeta, SimpleQuoteStrategy};
-use tokio::sync::{Mutex, mpsc};
-use tokio::time::{self, MissedTickBehavior, interval};
+impl DebugLogger {
+    fn new(debug_enabled: bool) -> Self {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                match event {
+                    DebugEvent::Info(msg) => println!("{}", msg),
+                    DebugEvent::Warn(msg) => eprintln!("{}", msg),
+                    DebugEvent::Error(msg) => eprintln!("{}", msg),
+                }
+            }
+        });
+        Self { tx, debug_enabled }
+    }
 
-#[derive(Debug, Parser)]
-#[command(name = "gate-runner", about = "Gate.io MVP dry-run executor")]
-struct Cli {
-    /// Path to YAML configuration
-    #[arg(long, default_value = "config/gate_mvp.yaml")]
-    config: String,
+    fn info<F>(&self, msg: F)
+    where
+        F: FnOnce() -> String,
+    {
+        if !self.debug_enabled {
+            return;
+        }
+        let _ = self.tx.send(DebugEvent::Info(msg()));
+    }
+
+    fn error<F>(&self, msg: F)
+    where
+        F: FnOnce() -> String,
+    {
+        let _ = self.tx.send(DebugEvent::Error(msg()));
+    }
+
+    fn latency<F>(&self, msg: F)
+    where
+        F: FnOnce() -> String,
+    {
+        let _ = self.tx.send(DebugEvent::Warn(msg()));
+    }
 }
 
 fn latency_debug_enabled() -> bool {
@@ -45,6 +65,18 @@ fn dur_us(d: Duration) -> u128 {
 
 const REF_WARN: Duration = Duration::from_millis(20);
 const STAGE_WARN: Duration = Duration::from_millis(5);
+
+fn apply_demean(price: f64, adj: Option<&ExchangeAdjustment>) -> f64 {
+    if !price.is_finite() || price <= 0.0 {
+        return price;
+    }
+    if let Some(adj) = adj {
+        if adj.samples > 0 {
+            return price - adj.offset.unwrap_or(0.0);
+        }
+    }
+    price
+}
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
@@ -765,23 +797,632 @@ fn log_reports(reports: &[ExecutionReport], config: &RunnerConfig, debug: &Debug
     }
 }
 
-async fn ctrl_c_notifier() {
-    let _ = tokio::signal::ctrl_c().await;
+struct QuoteSnapshot {
+    side: Side,
+    price: f64,
+    size: f64,
+    filled_qty: f64,
+    sent_ns: Option<u128>,
+    send_instant: Option<Instant>,
 }
 
-async fn setup_live_gateway(
-    config: &RunnerConfig,
-    contract_size: f64,
-    creds: &GateCredentials,
-) -> Result<GateWsGateway> {
-    let ws_config = GateWsConfig {
-        api_key: creds.api_key.clone(),
-        api_secret: creds.api_secret.clone(),
-        symbol: config.strategy.symbol.clone(),
-        settle: config.settle.clone(),
-        ws_url: None,
-        contract_size: Some(contract_size),
-    };
-
-    GateWsGateway::connect(ws_config).await
+struct CancelSnapshot {
+    send_instant: Instant,
 }
+
+struct QuoteCsvLogger {
+    writer: BufWriter<File>,
+    path: PathBuf,
+    venue: String,
+    last_bybit: (u64, u64, u64),
+    last_binance: (u64, u64, u64),
+    last_gate: (u64, u64, u64),
+    last_bitget: (u64, u64, u64),
+    orders: HashMap<String, QuoteSnapshot>,
+    pending_cancels: HashMap<String, CancelSnapshot>,
+}
+
+enum ExchangeId {
+    Bybit,
+    Binance,
+    Gate,
+    Bitget,
+}
+
+enum LogEvent {
+    MarketSnapshot,
+    QuoteSubmission {
+        intents: Vec<QuoteIntent>,
+        reference_meta: Option<ReferenceMeta>,
+        reference_price: f64,
+        quote_internal: Option<Duration>,
+        send_instant: Instant,
+        sent_ts: SystemTime,
+    },
+    Cancel {
+        order_id: String,
+        reference: ReferenceEvent,
+        cancel_internal: Duration,
+        send_instant: Instant,
+        sent_ts: SystemTime,
+    },
+    Reports(Vec<ExecutionReport>),
+}
+
+#[derive(Clone)]
+struct QuoteLogHandle {
+    tx: mpsc::UnboundedSender<LogEvent>,
+    path: PathBuf,
+}
+
+impl QuoteLogHandle {
+    fn spawn(config: &RunnerConfig, debug: DebugLogger) -> Result<Self> {
+        let logger = QuoteCsvLogger::new(config)?;
+        let path = logger.path.clone();
+        let flush_interval = config.logging.flush_interval();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut logger = logger;
+            let mut last_flush = Instant::now();
+            while let Some(event) = rx.recv().await {
+                let res = match event {
+                    LogEvent::MarketSnapshot => logger.log_market_snapshot(),
+                    LogEvent::QuoteSubmission {
+                        intents,
+                        reference_meta,
+                        reference_price,
+                        quote_internal,
+                        send_instant,
+                        sent_ts,
+                    } => logger.log_quote_submission(
+                        &intents,
+                        reference_meta.as_ref(),
+                        reference_price,
+                        quote_internal,
+                        send_instant,
+                        sent_ts,
+                    ),
+                    LogEvent::Cancel {
+                        order_id,
+                        reference,
+                        cancel_internal,
+                        send_instant,
+                        sent_ts,
+                    } => logger.log_cancel(
+                        &order_id,
+                        &reference,
+                        cancel_internal,
+                        send_instant,
+                        sent_ts,
+                    ),
+                    LogEvent::Reports(reports) => {
+                        let mut result = Ok(());
+                        for report in &reports {
+                            if let Err(err) = logger.log_report(report) {
+                                result = Err(err);
+                                break;
+                            }
+                        }
+                        result
+                    }
+                };
+
+                if let Err(err) = res {
+                    debug.error(|| format!("csv logger error: {:#}", err));
+                }
+
+                if last_flush.elapsed() >= flush_interval {
+                    if let Err(err) = logger.flush() {
+                        debug.error(|| format!("csv logger flush error: {:#}", err));
+                    }
+                    last_flush = Instant::now();
+                }
+            }
+
+            if let Err(err) = logger.flush() {
+                debug.error(|| format!("csv logger final flush error: {:#}", err));
+            }
+        });
+
+        Ok(Self { tx, path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn log_market_snapshot(&self) {
+        let _ = self.tx.send(LogEvent::MarketSnapshot);
+    }
+
+    fn log_quote_submission(
+        &self,
+        intents: &[QuoteIntent],
+        reference_meta: Option<&ReferenceMeta>,
+        reference_price: f64,
+        quote_internal: Option<Duration>,
+        send_instant: Instant,
+        sent_ts: SystemTime,
+    ) {
+        if intents.is_empty() {
+            return;
+        }
+        let _ = self.tx.send(LogEvent::QuoteSubmission {
+            intents: intents.to_vec(),
+            reference_meta: reference_meta.cloned(),
+            reference_price,
+            quote_internal,
+            send_instant,
+            sent_ts,
+        });
+    }
+
+    fn log_cancel(
+        &self,
+        order_id: &ClientOrderId,
+        reference: &ReferenceEvent,
+        cancel_internal: Duration,
+        send_instant: Instant,
+        sent_ts: SystemTime,
+    ) {
+        let _ = self.tx.send(LogEvent::Cancel {
+            order_id: order_id.0.clone(),
+            reference: reference.clone(),
+            cancel_internal,
+            send_instant,
+            sent_ts,
+        });
+    }
+
+    fn log_reports(&self, reports: &[ExecutionReport]) {
+        if reports.is_empty() {
+            return;
+        }
+        let _ = self.tx.send(LogEvent::Reports(reports.to_vec()));
+    }
+}
+
+impl QuoteCsvLogger {
+    fn new(config: &RunnerConfig) -> Result<Self> {
+        let path = config.logging.resolve_path();
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create log dir {}", parent.display()))?;
+        }
+        let file = File::create(&path)
+            .with_context(|| format!("failed to create log file {}", path.display()))?;
+        let mut writer = BufWriter::new(file);
+        writeln!(
+            writer,
+            "ts_ns,exchange,feed,price,direction,event_type,client_order_id,side,size,reference_source,reference_ts_ns,reference_price,quote_internal_us,cancel_internal_us,quote_external_us,cancel_external_us,sent_ts_ns"
+        )?;
+        writer.flush()?;
+
+        Ok(Self {
+            writer,
+            path,
+            venue: venue_to_string(config.strategy.venue).to_string(),
+            last_bybit: (0, 0, 0),
+            last_binance: (0, 0, 0),
+            last_gate: (0, 0, 0),
+            last_bitget: (0, 0, 0),
+            orders: HashMap::new(),
+            pending_cancels: HashMap::new(),
+        })
+    }
+
+    fn log_market_snapshot(&mut self) -> Result<()> {
+        let st = global_state()
+            .lock()
+            .map_err(|_| anyhow!("global state poisoned"))?;
+
+        self.write_exchange(
+            ExchangeId::Bybit,
+            "bybit",
+            &st.bybit,
+            Some(&st.demean.bybit),
+        )?;
+        self.write_exchange(
+            ExchangeId::Binance,
+            "binance",
+            &st.binance,
+            Some(&st.demean.binance),
+        )?;
+        self.write_exchange(ExchangeId::Gate, "gate", &st.gate, None)?;
+        self.write_exchange(
+            ExchangeId::Bitget,
+            "bitget",
+            &st.bitget,
+            Some(&st.demean.bitget),
+        )?;
+        Ok(())
+    }
+
+    fn write_exchange(
+        &mut self,
+        id: ExchangeId,
+        exchange: &str,
+        snap: &ExchangeSnap,
+        adj: Option<&ExchangeAdjustment>,
+    ) -> Result<()> {
+        let cache = match id {
+            ExchangeId::Bybit => &mut self.last_bybit,
+            ExchangeId::Binance => &mut self.last_binance,
+            ExchangeId::Gate => &mut self.last_gate,
+            ExchangeId::Bitget => &mut self.last_bitget,
+        };
+        let (orderbook_seq, bbo_seq, trade_seq) = cache;
+        let writer = &mut self.writer;
+        Self::write_feed_entry(
+            writer,
+            exchange,
+            "orderbook",
+            &snap.orderbook,
+            orderbook_seq,
+            adj,
+        )?;
+        Self::write_feed_entry(writer, exchange, "bbo", &snap.bbo, bbo_seq, adj)?;
+        Self::write_feed_entry(writer, exchange, "trade", &snap.trade, trade_seq, adj)?;
+        Ok(())
+    }
+
+    fn write_feed_entry(
+        writer: &mut BufWriter<File>,
+        exchange: &str,
+        feed: &str,
+        snap: &FeedSnap,
+        last_seq: &mut u64,
+        adj: Option<&ExchangeAdjustment>,
+    ) -> Result<()> {
+        if snap.seq == *last_seq {
+            return Ok(());
+        }
+        if let Some(price) = snap.price.filter(|p| p.is_finite()) {
+            *last_seq = snap.seq;
+            let ts = snap.ts_ns.unwrap_or(0);
+            let direction = trade_direction_str(snap.direction);
+            let price_adj = apply_demean(price, adj);
+            Self::write_row(
+                writer,
+                ts,
+                exchange,
+                feed,
+                Some(price_adj),
+                direction,
+                "market",
+                "",
+                "",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn log_quote_submission(
+        &mut self,
+        intents: &[QuoteIntent],
+        reference_meta: Option<&ReferenceMeta>,
+        reference_price: f64,
+        quote_internal: Option<Duration>,
+        send_instant: Instant,
+        sent_ts: SystemTime,
+    ) -> Result<()> {
+        let quote_internal_us = quote_internal.map(|d| d.as_micros() as i128);
+        let sent_ns = system_time_to_ns(sent_ts);
+        let venue = self.venue.clone();
+        for intent in intents {
+            self.orders.insert(
+                intent.client_order_id.0.clone(),
+                QuoteSnapshot {
+                    side: intent.side,
+                    price: intent.price,
+                    size: intent.size,
+                    filled_qty: 0.0,
+                    sent_ns: Some(sent_ns),
+                    send_instant: Some(send_instant),
+                },
+            );
+            Self::write_row(
+                &mut self.writer,
+                clamp_u128_to_u64(sent_ns),
+                venue.as_str(),
+                "quote",
+                Some(intent.price),
+                side_to_direction(intent.side),
+                "quote",
+                &intent.client_order_id.0,
+                side_to_str(intent.side),
+                Some(intent.size),
+                reference_meta.map(|m| m.source.as_str()),
+                reference_meta.and_then(|m| m.ts_ns),
+                Some(reference_price),
+                quote_internal_us,
+                None,
+                None,
+                None,
+                Some(sent_ns),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn log_cancel(
+        &mut self,
+        order_id: &str,
+        reference: &ReferenceEvent,
+        cancel_internal: Duration,
+        send_instant: Instant,
+        sent_ts: SystemTime,
+    ) -> Result<()> {
+        let cancel_internal_us = cancel_internal.as_micros() as i128;
+        let sent_ns = system_time_to_ns(sent_ts);
+        self.pending_cancels
+            .insert(order_id.to_string(), CancelSnapshot { send_instant });
+
+        let snapshot = self.orders.get(order_id);
+        let (side_str, direction, price, size) = if let Some(snapshot) = snapshot {
+            (
+                side_to_str(snapshot.side),
+                side_to_direction(snapshot.side),
+                Some(snapshot.price),
+                Some(snapshot.size),
+            )
+        } else {
+            ("", "", None, None)
+        };
+        let venue = self.venue.clone();
+
+        Self::write_row(
+            &mut self.writer,
+            clamp_u128_to_u64(sent_ns),
+            venue.as_str(),
+            "cancel",
+            price,
+            direction,
+            "cancel",
+            order_id,
+            side_str,
+            size,
+            Some(reference.source.as_str()),
+            reference.ts_ns,
+            Some(reference.price),
+            None,
+            Some(cancel_internal_us),
+            None,
+            None,
+            Some(sent_ns),
+        )
+    }
+
+    fn log_report(&mut self, report: &ExecutionReport) -> Result<()> {
+        let now_instant = Instant::now();
+        let id_str = report.client_order_id.0.clone();
+        let mut cancel_external_us: Option<i128> = None;
+        let mut quote_external_us: Option<i128> = None;
+
+        if let Some(cancel_info) = self.pending_cancels.remove(&id_str) {
+            let cancel_dur = now_instant
+                .checked_duration_since(cancel_info.send_instant)
+                .unwrap_or_default();
+            cancel_external_us = Some(cancel_dur.as_micros() as i128);
+        }
+
+        let mut price_for_status = None;
+        let mut direction = "unknown";
+        let mut side_str = "";
+        let mut sent_ns_for_status: Option<u128> = None;
+
+        if let Some(snapshot) = self.orders.get_mut(&id_str) {
+            price_for_status = Some(snapshot.price);
+            direction = side_to_direction(snapshot.side);
+            side_str = side_to_str(snapshot.side);
+            sent_ns_for_status = snapshot.sent_ns;
+            if let Some(send_inst) = snapshot.send_instant.take() {
+                let ack_dur = now_instant
+                    .checked_duration_since(send_inst)
+                    .unwrap_or_default();
+                quote_external_us = Some(ack_dur.as_micros() as i128);
+            }
+        }
+
+        if report.filled_qty > 0.0 {
+            let mut delta = report.filled_qty;
+            let mut price = report.avg_fill_price;
+            let mut direction = "unknown";
+            let mut side_str = "";
+            let mut sent_ns = None;
+
+            if let Some(snapshot) = self.orders.get_mut(&report.client_order_id.0) {
+                let fill_delta = report.filled_qty - snapshot.filled_qty;
+                if fill_delta > f64::EPSILON {
+                    delta = fill_delta;
+                } else {
+                    delta = 0.0;
+                }
+                snapshot.filled_qty = report.filled_qty;
+                price = price.or(Some(snapshot.price));
+                direction = side_to_direction(snapshot.side);
+                side_str = side_to_str(snapshot.side);
+                sent_ns = snapshot.sent_ns;
+            }
+
+            if delta > 0.0 {
+                let ts_ns_u128 = report
+                    .ts
+                    .map(|ts| ts as u128)
+                    .unwrap_or_else(|| system_time_to_ns(SystemTime::now()));
+                Self::write_row(
+                    &mut self.writer,
+                    clamp_u128_to_u64(ts_ns_u128),
+                    &self.venue,
+                    "fill",
+                    price,
+                    direction,
+                    "fill",
+                    &report.client_order_id.0,
+                    side_str,
+                    Some(delta),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    quote_external_us,
+                    cancel_external_us,
+                    sent_ns,
+                )?;
+            }
+        }
+
+        let event_type = match report.status {
+            OrderStatus::New => Some("quote_ack"),
+            OrderStatus::PartiallyFilled => Some("quote_ack"),
+            OrderStatus::Filled => Some("quote_ack"),
+            OrderStatus::Canceled => Some("cancel_ack"),
+            OrderStatus::Rejected => Some("quote_reject"),
+            _ => None,
+        };
+
+        if let Some(event) = event_type {
+            let ts_ns_u128 = report
+                .ts
+                .map(|ts| ts as u128)
+                .unwrap_or_else(|| system_time_to_ns(SystemTime::now()));
+            Self::write_row(
+                &mut self.writer,
+                clamp_u128_to_u64(ts_ns_u128),
+                &self.venue,
+                event,
+                price_for_status,
+                direction,
+                "report",
+                &report.client_order_id.0,
+                side_str,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                quote_external_us,
+                cancel_external_us,
+                sent_ns_for_status,
+            )?;
+        }
+
+        if matches!(
+            report.status,
+            OrderStatus::Filled | OrderStatus::Canceled | OrderStatus::Rejected
+        ) {
+            self.orders.remove(&report.client_order_id.0);
+            self.pending_cancels.remove(&report.client_order_id.0);
+        }
+
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    fn write_row(
+        writer: &mut BufWriter<File>,
+        ts_ns: u64,
+        exchange: &str,
+        feed: &str,
+        price: Option<f64>,
+        direction: &str,
+        event_type: &str,
+        client_order_id: &str,
+        side: &str,
+        size: Option<f64>,
+        reference_source: Option<&str>,
+        reference_ts_ns: Option<u64>,
+        reference_price: Option<f64>,
+        quote_internal_us: Option<i128>,
+        cancel_internal_us: Option<i128>,
+        quote_external_us: Option<i128>,
+        cancel_external_us: Option<i128>,
+        sent_ts_ns: Option<u128>,
+    ) -> Result<()> {
+        writeln!(
+            writer,
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            ts_ns,
+            exchange,
+            feed,
+            format_option_f64(price),
+            direction,
+            event_type,
+            client_order_id,
+            side,
+            format_option_f64(size),
+            reference_source.unwrap_or(""),
+            reference_ts_ns.map_or(String::new(), |v| v.to_string()),
+            reference_price.map_or(String::new(), |v| format_f64(v)),
+            quote_internal_us.map_or(String::new(), |v| v.to_string()),
+            cancel_internal_us.map_or(String::new(), |v| v.to_string()),
+            quote_external_us.map_or(String::new(), |v| v.to_string()),
+            cancel_external_us.map_or(String::new(), |v| v.to_string()),
+            sent_ts_ns.map_or(String::new(), |v| v.to_string()),
+        )?;
+        Ok(())
+    }
+}
+
+fn venue_to_string(venue: Venue) -> &'static str {
+    match venue {
+        Venue::Gate => "gate",
+    }
+}
+
+fn trade_direction_str(dir: Option<TradeDirection>) -> &'static str {
+    dir.map(TradeDirection::as_str).unwrap_or("")
+}
+
+fn side_to_direction(side: Side) -> &'static str {
+    match side {
+        Side::Bid => "buy",
+        Side::Ask => "sell",
+    }
+}
+
+fn side_to_str(side: Side) -> &'static str {
+    match side {
+        Side::Bid => "bid",
+        Side::Ask => "ask",
+    }
+}
+
+fn format_option_f64(value: Option<f64>) -> String {
+    value
+        .filter(|v| v.is_finite())
+        .map(format_f64)
+        .unwrap_or_default()
+}
+
+fn format_f64(value: f64) -> String {
+    format!("{:.8}", value)
+}
+
+fn system_time_to_ns(ts: SystemTime) -> u128 {
+    ts.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos()
+}
+
+fn clamp_u128_to_u64(value: u128) -> u64 {
+    if value > u64::MAX as u128 {
+        u64::MAX
+    } else {
+        value as u64
+    }
+}
+

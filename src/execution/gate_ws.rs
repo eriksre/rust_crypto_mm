@@ -7,10 +7,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::{SinkExt, StreamExt};
-use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sha2::Sha512;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::spawn_blocking;
 use tokio::time::sleep;
@@ -18,8 +16,8 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungsten
 
 use crate::base_classes::state::{TradeDirection, state};
 use crate::base_classes::types::Side;
-use crate::exchanges::endpoints::GateioWs;
 use crate::exchanges::gate_rest;
+use crate::exchanges::{endpoints::GateioWs, gate_sign};
 
 use super::gateway::ExecutionGateway;
 use super::types::{
@@ -1009,27 +1007,13 @@ fn build_api_request(
 }
 
 fn sign_api(secret: &str, channel: &str, req_param: &str, ts: i64) -> String {
-    let mut mac =
-        Hmac::<Sha512>::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
     let payload = format!("{}\n{}\n{}\n{}", "api", channel, req_param, ts);
-    mac.update(payload.as_bytes());
-    let bytes = mac.finalize().into_bytes();
-    bytes
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect::<String>()
+    gate_sign::hmac_sha512_hex(secret, &payload)
 }
 
 fn sign_subscribe(secret: &str, channel: &str, ts: i64) -> String {
-    let mut mac =
-        Hmac::<Sha512>::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
     let payload = format!("channel={channel}&event=subscribe&time={ts}");
-    mac.update(payload.as_bytes());
-    mac.finalize()
-        .into_bytes()
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect()
+    gate_sign::hmac_sha512_hex(secret, &payload)
 }
 
 fn value_to_string(value: &Value) -> Option<String> {
