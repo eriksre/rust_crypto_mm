@@ -10,17 +10,26 @@ pub struct Trade {
     pub ts: Ts,
     pub seq: Seq,
     pub is_buyer_maker: bool, // true if buyer was maker (taker sell)
+    pub system_ts_ns: Option<Ts>,
 }
 
 impl Trade {
     #[inline(always)]
-    pub const fn new(px: Price, qty: Qty, ts: Ts, seq: Seq, is_buyer_maker: bool) -> Self {
+    pub const fn new(
+        px: Price,
+        qty: Qty,
+        ts: Ts,
+        seq: Seq,
+        is_buyer_maker: bool,
+        system_ts_ns: Option<Ts>,
+    ) -> Self {
         Self {
             px,
             qty,
             ts,
             seq,
             is_buyer_maker,
+            system_ts_ns,
         }
     }
 }

@@ -11,16 +11,26 @@ pub struct BboEntry {
     pub ask_px: f64,
     pub ask_qty: f64,
     pub ts: Ts,
+    pub system_ts_ns: Option<Ts>,
 }
 
 impl BboEntry {
     #[inline(always)]
-    fn set(&mut self, bid_px: f64, bid_qty: f64, ask_px: f64, ask_qty: f64, ts: Ts) {
+    fn set(
+        &mut self,
+        bid_px: f64,
+        bid_qty: f64,
+        ask_px: f64,
+        ask_qty: f64,
+        ts: Ts,
+        system_ts_ns: Option<Ts>,
+    ) {
         self.bid_px = bid_px;
         self.bid_qty = bid_qty;
         self.ask_px = ask_px;
         self.ask_qty = ask_qty;
         self.ts = ts;
+        self.system_ts_ns = system_ts_ns;
     }
 
     #[inline(always)]
@@ -54,10 +64,11 @@ impl BboStore {
         ask_px: f64,
         ask_qty: f64,
         ts: Ts,
+        system_ts_ns: Option<Ts>,
     ) {
         let symbol = symbol.into();
         let entry = self.by_symbol.entry(symbol.clone()).or_default();
-        entry.set(bid_px, bid_qty, ask_px, ask_qty, ts);
+        entry.set(bid_px, bid_qty, ask_px, ask_qty, ts, system_ts_ns);
         self.last_symbol = Some(symbol);
     }
 

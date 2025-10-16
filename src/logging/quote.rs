@@ -252,7 +252,7 @@ impl QuoteCsvLogger {
         let mut writer = BufWriter::new(file);
         writeln!(
             writer,
-            "ts_ns,exchange,feed,price,direction,event_type,client_order_id,side,size,reference_source,reference_ts_ns,reference_price,quote_internal_us,cancel_internal_us,quote_external_us,cancel_external_us,sent_ts_ns"
+            "ts_ns,exchange,feed,source_engine_ts_ns,source_system_ts_ns,price,direction,event_type,client_order_id,side,size,reference_source,reference_ts_ns,reference_price,quote_internal_us,cancel_internal_us,quote_external_us,cancel_external_us,sent_ts_ns"
         )?;
         writer.flush()?;
 
@@ -351,6 +351,8 @@ impl QuoteCsvLogger {
                 ts,
                 exchange,
                 feed,
+                snap.source_engine_ts_ns,
+                snap.source_system_ts_ns,
                 Some(price_adj),
                 direction,
                 "market",
@@ -399,6 +401,8 @@ impl QuoteCsvLogger {
                 clamp_u128_to_u64(sent_ns),
                 venue.as_str(),
                 "quote",
+                None,
+                None,
                 Some(intent.price),
                 side_to_direction(intent.side),
                 "quote",
@@ -449,6 +453,8 @@ impl QuoteCsvLogger {
             clamp_u128_to_u64(sent_ns),
             venue.as_str(),
             "cancel",
+            None,
+            None,
             price,
             direction,
             "cancel",
@@ -528,6 +534,8 @@ impl QuoteCsvLogger {
                     clamp_u128_to_u64(ts_ns_u128),
                     &self.venue,
                     "fill",
+                    None,
+                    None,
                     price,
                     direction,
                     "fill",
@@ -565,6 +573,8 @@ impl QuoteCsvLogger {
                 clamp_u128_to_u64(ts_ns_u128),
                 &self.venue,
                 event,
+                None,
+                None,
                 price_for_status,
                 direction,
                 "report",
@@ -630,6 +640,8 @@ fn write_row(
     ts_ns: u64,
     exchange: &str,
     feed: &str,
+    source_engine_ts_ns: Option<u64>,
+    source_system_ts_ns: Option<u64>,
     price: Option<f64>,
     direction: &str,
     event_type: &str,
@@ -647,10 +659,12 @@ fn write_row(
 ) -> Result<()> {
     writeln!(
         writer,
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         ts_ns,
         exchange,
         feed,
+        source_engine_ts_ns.map_or(String::new(), |v| v.to_string()),
+        source_system_ts_ns.map_or(String::new(), |v| v.to_string()),
         format_option_f64(price),
         direction,
         event_type,

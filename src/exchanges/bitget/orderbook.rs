@@ -67,6 +67,8 @@ pub struct BitgetBook<const N: usize> {
     qty_scale: f64,
     pub last_seq: u64,
     initialized: bool,
+    last_system_ts_ns: Option<Ts>,
+    last_bbo_system_ts_ns: Option<Ts>,
 }
 
 impl<const N: usize> BitgetBook<N> {
@@ -81,6 +83,8 @@ impl<const N: usize> BitgetBook<N> {
             qty_scale,
             last_seq: 0,
             initialized: false,
+            last_system_ts_ns: None,
+            last_bbo_system_ts_ns: None,
         }
     }
 
@@ -125,6 +129,7 @@ impl<const N: usize> BitgetBook<N> {
         let prev_seq = Self::extract_prev_seq(d);
         let ts_ms = d.ts.or(msg.ts).unwrap_or(0);
         let ts: Ts = ms_to_ns(ts_ms);
+        self.last_system_ts_ns = msg.ts.map(ms_to_ns);
         let seq: Seq = seq_val as Seq;
         if msg.action == "snapshot" {
             let bids = self.convert_levels(&d.bids);
@@ -181,6 +186,7 @@ impl<const N: usize> BitgetBook<N> {
         }
         let ts_ms = d.ts.or(msg.ts).unwrap_or(0);
         let ts: Ts = ms_to_ns(ts_ms);
+        self.last_bbo_system_ts_ns = msg.ts.map(ms_to_ns);
         let seq: Seq = seq_val as Seq;
 
         let mut bids_iter = d.bids.iter();
@@ -233,6 +239,16 @@ impl<const N: usize> BitgetBook<N> {
         let b = self.book.best_bid()?;
         let a = self.book.best_ask()?;
         Some(((b.px + a.px) as f64) / (2.0 * self.price_scale))
+    }
+
+    #[inline(always)]
+    pub fn last_system_ts_ns(&self) -> Option<Ts> {
+        self.last_system_ts_ns
+    }
+
+    #[inline(always)]
+    pub fn last_bbo_system_ts_ns(&self) -> Option<Ts> {
+        self.last_bbo_system_ts_ns
     }
 
     #[inline(always)]
@@ -309,5 +325,7 @@ impl<const N: usize> OrderBookOps for BitgetBook<N> {
         self.book.clear();
         self.initialized = false;
         self.last_seq = 0;
+        self.last_system_ts_ns = None;
+        self.last_bbo_system_ts_ns = None;
     }
 }

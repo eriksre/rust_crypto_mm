@@ -2,7 +2,7 @@ use crate::base_classes::bbo_store::BboStore;
 use crate::base_classes::tickers::{TickerSnapshot, TickerStore};
 use crate::base_classes::trades::{FixedTrades, Trade};
 use crate::base_classes::types::{Price, Qty};
-use crate::collectors::helpers::{find_first_bool, find_first_number, find_json_string};
+use crate::collectors::helpers::{find_first_bool, find_json_string};
 use crate::exchanges::bybit_book::{
     BybitBook, BybitData, BybitDataCont, BybitMsg, PRICE_SCALE, QTY_SCALE,
 };
@@ -24,14 +24,23 @@ pub fn events_for<const N: usize>(s: &str, book: &mut BybitBook<N>) -> Vec<(&'st
                     if let Some(d) = dopt {
                         if let (Some(b), Some(a)) = (d.b.get(0), d.a.get(0)) {
                             if let (Ok(bid), Ok(ask)) = (b[0].parse::<f64>(), a[0].parse::<f64>()) {
-                                let ts = if d.ts != 0 { d.ts } else { msg.ts.unwrap_or(0) };
+                                let cts_ms = d
+                                    .cts
+                                    .or(msg.cts)
+                                    .expect("Bybit BBO message missing engine timestamp (cts)");
+                                let system_ts_ms = msg
+                                    .ts
+                                    .expect(
+                                        "Bybit BBO message missing system timestamp (ts) for skew tracking",
+                                    );
                                 if book.apply_bbo(
                                     bid,
                                     b[1].parse().unwrap_or(0.0),
                                     ask,
                                     a[1].parse().unwrap_or(0.0),
                                     d.seq,
-                                    ts,
+                                    cts_ms,
+                                    system_ts_ms,
                                 ) {
                                     if let Some(mid) = book.mid_price_f64() {
                                         out.push(("bbo", mid));
@@ -68,10 +77,25 @@ pub fn update_bbo_store(s: &str, store: &mut BboStore) -> bool {
                         if let (Ok(bid), Ok(ask)) = (b[0].parse::<f64>(), a[0].parse::<f64>()) {
                             let bid_qty = b[1].parse::<f64>().unwrap_or(0.0);
                             let ask_qty = a[1].parse::<f64>().unwrap_or(0.0);
-                            let raw_ts = if d.ts != 0 { d.ts } else { msg.ts.unwrap_or(0) };
-                            let ts_ns = ms_to_ns(raw_ts);
+                            let cts_ms = d
+                                .cts
+                                .or(msg.cts)
+                                .expect("Bybit BBO message missing engine timestamp (cts)");
+                            let system_ts_ms = msg.ts.expect(
+                                "Bybit BBO message missing system timestamp (ts) for source tracking",
+                            );
+                            let system_ts_ns = ms_to_ns(system_ts_ms);
+                            let ts_ns = ms_to_ns(cts_ms);
                             if let Some(symbol) = topic.rsplit('.').next() {
-                                store.update(symbol, bid, bid_qty, ask, ask_qty, ts_ns);
+                                store.update(
+                                    symbol,
+                                    bid,
+                                    bid_qty,
+                                    ask,
+                                    ask_qty,
+                                    ts_ns,
+                                    Some(system_ts_ns),
+                                );
                                 return true;
                             }
                         }
@@ -96,6 +120,10 @@ pub fn update_trades<const N: usize>(s: &str, trades: &mut FixedTrades<N>) -> us
     let mut inserted = 0usize;
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(s) {
         if let Some(data) = value.get("data").and_then(|d| d.as_array()) {
+            let system_ts_ms = value
+                .get("ts")
+                .and_then(|v| v.as_u64())
+                .expect("Bybit trade message missing system timestamp `ts`");
             for entry in data {
                 let price = entry
                     .get("p")
@@ -113,9 +141,13 @@ pub fn update_trades<const N: usize>(s: &str, trades: &mut FixedTrades<N>) -> us
                 let qty_i = (size.unwrap() * QTY_SCALE).round() as Qty;
                 let ts_ms = entry
                     .get("T")
-                    .and_then(|v| v.as_u64())
-                    .or_else(|| find_first_number(s, &["ts", "T"]).map(|v| v as u64))
-                    .unwrap_or_else(|| value.get("ts").and_then(|v| v.as_u64()).unwrap_or(0));
+                    .and_then(|v| match v {
+                        Value::Number(n) => n.as_u64(),
+                        Value::String(s) => s.parse::<u64>().ok(),
+                        _ => None,
+                    })
+                    .expect("Bybit trade message missing engine timestamp `T`");
+                let system_ts_ns = ms_to_ns(system_ts_ms);
                 let ts = ms_to_ns(ts_ms);
                 // Prefer explicit taker side (`S`/`side`) and fall back to legacy buyer/taker flag.
                 let is_buyer_maker = entry
@@ -143,7 +175,7 @@ pub fn update_trades<const N: usize>(s: &str, trades: &mut FixedTrades<N>) -> us
                     .and_then(|s| s.parse::<u64>().ok())
                     .unwrap_or(0) as u64;
 
-                let trade = Trade::new(px_i, qty_i, ts, seq, is_buyer_maker);
+                let trade = Trade::new(px_i, qty_i, ts, seq, is_buyer_maker, Some(system_ts_ns));
                 trades.push(trade);
                 inserted += 1;
             }
@@ -316,6 +348,7 @@ mod tests {
     fn test_update_trades_uses_exchange_ts_ns() {
         let json = r#"{
             "topic":"publicTrade.BTCUSDT",
+            "ts":1700000000456,
             "data":[{
                 "p":"43000",
                 "v":"0.5",
@@ -333,6 +366,7 @@ mod tests {
         assert_eq!(last.seq, 101);
         assert!(last.is_buyer_maker);
         assert_eq!(last.ts, 1_700_000_000_123_000_000);
+        assert_eq!(last.system_ts_ns, Some(ms_to_ns(1_700_000_000_456)));
         assert_eq!(last.px, (43_000f64 * PRICE_SCALE).round() as Price);
         assert_eq!(last.qty, (0.5f64 * QTY_SCALE).round() as Qty);
     }

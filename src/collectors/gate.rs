@@ -257,6 +257,7 @@ pub fn update_bbo_store(s: &str, store: &mut BboStore) -> bool {
                         .or_else(|| raw.get("time_ms").and_then(as_u64))
                         .unwrap_or(0);
                     let ts_ns = ms_to_ns(ts_ms);
+                    let system_ts_ns = raw.get("time_ms").and_then(as_u64).map(ms_to_ns);
                     let symbol = obj
                         .get("contract")
                         .or_else(|| obj.get("symbol"))
@@ -267,7 +268,7 @@ pub fn update_bbo_store(s: &str, store: &mut BboStore) -> bool {
                         .or_else(|| find_json_string(s, "symbol"))
                         .or_else(|| find_json_string(s, "s"));
                     if let Some(symbol) = symbol {
-                        store.update(symbol, b, bid_qty, a, ask_qty, ts_ns);
+                        store.update(symbol, b, bid_qty, a, ask_qty, ts_ns, system_ts_ns);
                         return true;
                     }
                 }
@@ -312,13 +313,21 @@ pub fn update_trades<const N: usize>(s: &str, trades: &mut FixedTrades<N>) -> us
                             .or_else(|| raw.get("time_ms").and_then(as_u64))
                             .unwrap_or(0);
                         let ts_ns = ms_to_ns(ts_ms);
+                        let system_ts_ns = raw.get("time_ms").and_then(as_u64).map(ms_to_ns);
                         let seq = entry
                             .get("id")
                             .or_else(|| entry.get("trade_id"))
                             .and_then(as_u64)
                             .unwrap_or(0) as Seq;
                         let is_buyer_maker = size < 0.0;
-                        trades.push(Trade::new(px_i, qty_i, ts_ns, seq, is_buyer_maker));
+                        trades.push(Trade::new(
+                            px_i,
+                            qty_i,
+                            ts_ns,
+                            seq,
+                            is_buyer_maker,
+                            system_ts_ns,
+                        ));
                         inserted += 1;
                     }
                 }

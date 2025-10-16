@@ -19,6 +19,8 @@ pub struct BybitData {
     #[serde(default)]
     pub ts: u64,
     #[serde(default)]
+    pub cts: Option<u64>,
+    #[serde(default)]
     pub s: Option<String>,
 }
 
@@ -37,6 +39,8 @@ pub struct BybitMsg {
     pub data: BybitDataCont,
     #[serde(default)]
     pub ts: Option<u64>,
+    #[serde(default)]
+    pub cts: Option<u64>,
 }
 
 pub const PRICE_SCALE: f64 = 100_000.0; // preserve up to 1e-5 price precision
@@ -49,6 +53,8 @@ pub struct BybitBook<const N: usize> {
     qty_scale: f64,
     last_seq: u64,
     initialized: bool,
+    last_orderbook_system_ts_ns: Option<Ts>,
+    last_bbo_system_ts_ns: Option<Ts>,
 }
 
 impl<const N: usize> BybitBook<N> {
@@ -60,6 +66,8 @@ impl<const N: usize> BybitBook<N> {
             qty_scale,
             last_seq: 0,
             initialized: false,
+            last_orderbook_system_ts_ns: None,
+            last_bbo_system_ts_ns: None,
         }
     }
 
@@ -80,12 +88,15 @@ impl<const N: usize> BybitBook<N> {
                 }
             },
         };
-        let ts_ms = if dref.ts != 0 {
-            dref.ts
-        } else {
-            msg.ts.unwrap_or(0)
-        };
-        let ts: Ts = ms_to_ns(ts_ms);
+        let cts_ms = dref
+            .cts
+            .or(msg.cts)
+            .expect("Bybit orderbook message missing engine timestamp (cts)");
+        let system_ts_ms = msg
+            .ts
+            .expect("Bybit orderbook message missing system timestamp (ts) for source tracking");
+        let ts: Ts = ms_to_ns(cts_ms);
+        self.last_orderbook_system_ts_ns = Some(ms_to_ns(system_ts_ms));
         let seq_val: u64 = dref.seq;
         let seq: Seq = seq_val as Seq;
         if msg.kind == "snapshot" {
@@ -159,6 +170,16 @@ impl<const N: usize> BybitBook<N> {
     }
 
     #[inline(always)]
+    pub fn last_orderbook_system_ts_ns(&self) -> Option<Ts> {
+        self.last_orderbook_system_ts_ns
+    }
+
+    #[inline(always)]
+    pub fn last_bbo_system_ts_ns(&self) -> Option<Ts> {
+        self.last_bbo_system_ts_ns
+    }
+
+    #[inline(always)]
     pub fn top_levels_f64(&self, depth: usize) -> (Vec<(f64, f64)>, Vec<(f64, f64)>) {
         let mut bids = Vec::with_capacity(depth.min(self.book.len_bids()));
         let mut asks = Vec::with_capacity(depth.min(self.book.len_asks()));
@@ -190,7 +211,8 @@ impl<const N: usize> BybitBook<N> {
         ask_px: f64,
         ask_sz: f64,
         seq: u64,
-        ts_ms: u64,
+        cts_ms: u64,
+        system_ts_ms: u64,
     ) -> bool {
         if !self.initialized {
             return false;
@@ -198,7 +220,8 @@ impl<const N: usize> BybitBook<N> {
         if seq <= self.last_seq {
             return false;
         }
-        let ts: Ts = ms_to_ns(ts_ms);
+        let ts: Ts = ms_to_ns(cts_ms);
+        self.last_bbo_system_ts_ns = Some(ms_to_ns(system_ts_ms));
         let seqn: Seq = seq as Seq;
         let (bpx, bqty) = self.conv(bid_px, bid_sz);
         let (apx, aqty) = self.conv(ask_px, ask_sz);
@@ -278,6 +301,8 @@ impl<const N: usize> OrderBookOps for BybitBook<N> {
         self.book.clear();
         self.initialized = false;
         self.last_seq = 0;
+        self.last_orderbook_system_ts_ns = None;
+        self.last_bbo_system_ts_ns = None;
     }
 }
 
@@ -290,6 +315,7 @@ mod tests {
     fn snapshot_updates_timestamp_in_ns() {
         let mut book = BybitBook::<8>::new("BTCUSDT", PRICE_SCALE, QTY_SCALE);
         let ts_ms = 1_700_000_000_123u64;
+        let system_ts_ms = ts_ms + 2;
         let msg = BybitMsg {
             topic: "orderbook.50.BTCUSDT".to_string(),
             kind: "snapshot".to_string(),
@@ -299,12 +325,18 @@ mod tests {
                 u: 0,
                 seq: 42,
                 ts: ts_ms,
+                cts: Some(ts_ms),
                 s: Some("BTCUSDT".to_string()),
             }),
-            ts: None,
+            ts: Some(system_ts_ms),
+            cts: Some(ts_ms),
         };
 
         assert!(book.apply(&msg));
         assert_eq!(book.last_ts(), ms_to_ns(ts_ms));
+        assert_eq!(
+            book.last_orderbook_system_ts_ns(),
+            Some(ms_to_ns(system_ts_ms))
+        );
     }
 }

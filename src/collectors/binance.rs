@@ -101,12 +101,13 @@ pub fn update_bbo_store(s: &str, store: &mut BboStore) -> bool {
                 .or_else(|| payload.get("E").and_then(|v| v.as_u64()))
                 .unwrap_or(0);
             let ts_ns = ms_to_ns(ts_ms);
+            let system_ts_ns = payload.get("E").and_then(|v| v.as_u64()).map(ms_to_ns);
             if let Some(symbol) = payload
                 .get("s")
                 .and_then(|v| v.as_str())
                 .or_else(|| find_json_string(s, "s"))
             {
-                store.update(symbol, bid, bid_qty, ask, ask_qty, ts_ns);
+                store.update(symbol, bid, bid_qty, ask, ask_qty, ts_ns, system_ts_ns);
                 return true;
             }
         }
@@ -153,7 +154,8 @@ pub fn update_trades<const N: usize>(s: &str, trades: &mut FixedTrades<N>) -> us
                 let ts_ns = ms_to_ns(ts_ms);
                 let agg_id = payload.get("a").and_then(|v| v.as_u64()).unwrap_or(0) as Seq;
                 let is_buyer_maker = payload.get("m").and_then(|v| v.as_bool()).unwrap_or(false);
-                let trade = Trade::new(px_i, qty_i, ts_ns, agg_id, is_buyer_maker);
+                let system_ts_ns = payload.get("E").and_then(|v| v.as_u64()).map(ms_to_ns);
+                let trade = Trade::new(px_i, qty_i, ts_ns, agg_id, is_buyer_maker, system_ts_ns);
                 trades.push(trade);
                 return 1;
             }

@@ -27,6 +27,8 @@ pub struct FeedSnap {
     pub price: Option<f64>,
     pub seq: u64,
     pub ts_ns: Option<Ts>,
+    pub source_engine_ts_ns: Option<Ts>,
+    pub source_system_ts_ns: Option<Ts>,
     pub direction: Option<TradeDirection>,
     pub bid_levels: [Option<(f64, f64)>; 3],
     pub ask_levels: [Option<(f64, f64)>; 3],

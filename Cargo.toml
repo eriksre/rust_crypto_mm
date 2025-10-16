@@ -124,3 +124,23 @@ features = ["sink", "std"]
 [dependencies.dotenvy]
 version = "0.15"
 optional = true
+
+[[bin]]
+name = "gate_cancel_text"
+path = "src/bin/gate_cancel_text.rs"
+required-features = ["gate_exec"]
+
+[[bin]]
+name = "gate_runner"
+path = "src/bin/gate_runner.rs"
+required-features = ["gate_exec"]
+
+[[bin]]
+name = "gate_test_buy"
+path = "src/bin/gate_test_buy.rs"
+required-features = ["gate_exec"]
+
+[[bin]]
+name = "gate_risk_probe"
+path = "src/bin/gate_risk_probe.rs"
+required-features = ["gate_exec"]

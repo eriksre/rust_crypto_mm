@@ -7,6 +7,7 @@ use crate::base_classes::demean::{DemeanTracker, ExchangeKind};
 use crate::base_classes::feed_gate::{ExchangeFeed, FeedKind, FeedTimestampGate, GateDecision};
 use crate::base_classes::reference::ReferenceEvent;
 use crate::base_classes::reference_publisher::ReferencePublisher;
+use crate::base_classes::ring_buffer::Consumer;
 use crate::base_classes::state::{ExchangeAdjustment, TradeDirection, TradeEvent, state};
 use crate::base_classes::tickers::TickerStore;
 use crate::base_classes::types::Ts;
@@ -15,10 +16,11 @@ use crate::collectors::{binance, bitget, bybit, gate};
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::exchanges::binance::BinanceHandler;
-use crate::exchanges::bitget::BitgetHandler;
-use crate::exchanges::bybit::BybitHandler;
-use crate::exchanges::gate::{GateHandler, canonical_contract_symbol};
+use crate::exchanges::binance::{BinanceFrame, BinanceHandler};
+use crate::exchanges::bitget::{BitgetFrame, BitgetHandler};
+use crate::exchanges::bybit::{BybitFrame, BybitHandler};
+use crate::exchanges::endpoints::{BitgetWs, GateioWs};
+use crate::exchanges::gate::{GateFrame, GateHandler, canonical_contract_symbol};
 use crate::exchanges::gate_rest;
 
 #[cfg(feature = "gate_exec")]
@@ -44,6 +46,53 @@ fn level_from_option(level: Option<(f64, f64)>) -> [Option<(f64, f64)>; 3] {
         out[0] = Some(lvl);
     }
     out
+}
+
+#[inline(always)]
+fn is_bybit_bbo_frame(frame: &BybitFrame) -> bool {
+    frame
+        .topic()
+        .map_or(false, |topic| topic.starts_with("orderbook.1."))
+}
+
+#[inline(always)]
+fn is_binance_bbo_frame(frame: &BinanceFrame) -> bool {
+    frame.topic() == "bookTicker"
+}
+
+#[inline(always)]
+fn is_gate_bbo_frame(frame: &GateFrame) -> bool {
+    frame.channel() == GateioWs::BBO && frame.event() == "update"
+}
+
+#[inline(always)]
+fn is_bitget_bbo_frame(frame: &BitgetFrame) -> bool {
+    if frame.channel() != BitgetWs::BBO {
+        return false;
+    }
+    matches!(frame.action(), "update" | "snapshot")
+}
+
+#[inline(always)]
+fn drain_latest_bbo<F, const N: usize, P>(
+    frame: &mut F,
+    consumer: &Consumer<F, N>,
+    pending: &mut Option<F>,
+    mut is_bbo: P,
+) where
+    P: FnMut(&F) -> bool,
+{
+    if !is_bbo(frame) {
+        return;
+    }
+    while let Ok(next) = consumer.try_pop() {
+        if is_bbo(&next) {
+            *frame = next;
+        } else {
+            *pending = Some(next);
+            break;
+        }
+    }
 }
 
 #[inline(always)]
@@ -259,12 +308,18 @@ pub fn spawn_state_engine(
             }
         };
 
+        let mut bybit_pending: Option<BybitFrame> = None;
+        let mut binance_pending: Option<BinanceFrame> = None;
+        let mut gate_pending: Option<GateFrame> = None;
+        let mut bitget_pending: Option<BitgetFrame> = None;
+
         loop {
             let mut progressed = false;
 
             // Bybit
-            if let Ok(f) = bybit_c.try_pop() {
+            if let Some(mut f) = bybit_pending.take().or_else(|| bybit_c.try_pop().ok()) {
                 progressed = true;
+                drain_latest_bbo(&mut f, &bybit_c, &mut bybit_pending, is_bybit_bbo_frame);
                 let ts = f.ts;
                 if let Ok(s) = core::str::from_utf8(&f.raw) {
                     for (feed, _) in bybit::events_for(s, &mut bybit_book) {
@@ -291,7 +346,10 @@ pub fn spawn_state_engine(
                                                 let snap = &mut st.bybit.orderbook;
                                                 snap.price = Some(mid);
                                                 snap.seq = snap.seq.wrapping_add(1);
-                                                snap.ts_ns = Some(ob_ts);
+                                                snap.ts_ns = Some(ts);
+                                                snap.source_engine_ts_ns = Some(ob_ts);
+                                                snap.source_system_ts_ns =
+                                                    bybit_book.last_orderbook_system_ts_ns();
                                                 snap.bid_levels = bid_levels;
                                                 snap.ask_levels = ask_levels;
                                                 snap.direction = None;
@@ -326,9 +384,14 @@ pub fn spawn_state_engine(
                                                     bybit_bbo.get(symbol).copied()
                                                 })
                                             });
-                                        let bbo_ts = entry
-                                            .map(|e| e.ts)
-                                            .unwrap_or_else(|| bybit_book.last_ts());
+                                        let (bbo_ts, source_system_ts_ns) = entry
+                                            .map(|e| (e.ts, e.system_ts_ns))
+                                            .unwrap_or_else(|| {
+                                                (
+                                                    bybit_book.last_ts(),
+                                                    bybit_book.last_bbo_system_ts_ns(),
+                                                )
+                                            });
                                         match feed_gate.evaluate(
                                             ExchangeFeed::Bybit,
                                             FeedKind::Bbo,
@@ -363,7 +426,9 @@ pub fn spawn_state_engine(
                                                     let snap = &mut st.bybit.bbo;
                                                     snap.price = Some(mid);
                                                     snap.seq = snap.seq.wrapping_add(1);
-                                                    snap.ts_ns = Some(bbo_ts);
+                                                    snap.ts_ns = Some(ts);
+                                                    snap.source_engine_ts_ns = Some(bbo_ts);
+                                                    snap.source_system_ts_ns = source_system_ts_ns;
                                                     snap.bid_levels = bid_levels;
                                                     snap.ask_levels = ask_levels;
                                                     snap.direction = None;
@@ -406,7 +471,10 @@ pub fn spawn_state_engine(
                                                 let snap = &mut st.bybit.bbo;
                                                 snap.price = Some(mid);
                                                 snap.seq = snap.seq.wrapping_add(1);
-                                                snap.ts_ns = Some(bbo_ts);
+                                                snap.ts_ns = Some(ts);
+                                                snap.source_engine_ts_ns = Some(bbo_ts);
+                                                snap.source_system_ts_ns =
+                                                    bybit_book.last_bbo_system_ts_ns();
                                                 snap.bid_levels = bid_levels;
                                                 snap.ask_levels = ask_levels;
                                                 snap.direction = None;
@@ -459,7 +527,9 @@ pub fn spawn_state_engine(
                                         let snap = &mut st.bybit;
                                         snap.trade.price = Some(px);
                                         snap.trade.seq = snap.trade.seq.wrapping_add(1);
-                                        snap.trade.ts_ns = Some(trade_ts);
+                                        snap.trade.ts_ns = Some(ts);
+                                        snap.trade.source_engine_ts_ns = Some(trade_ts);
+                                        snap.trade.source_system_ts_ns = trade.system_ts_ns;
                                         snap.trade.direction = Some(direction);
                                         snap.trade.bid_levels = [None; 3];
                                         snap.trade.ask_levels = [None; 3];
@@ -552,8 +622,14 @@ pub fn spawn_state_engine(
             }
 
             // Binance
-            if let Ok(f) = binance_c.try_pop() {
+            if let Some(mut f) = binance_pending.take().or_else(|| binance_c.try_pop().ok()) {
                 progressed = true;
+                drain_latest_bbo(
+                    &mut f,
+                    &binance_c,
+                    &mut binance_pending,
+                    is_binance_bbo_frame,
+                );
                 let ts = f.ts;
                 if let Ok(s) = core::str::from_utf8(&f.raw) {
                     #[cfg(feature = "binance_book")]
@@ -578,7 +654,9 @@ pub fn spawn_state_engine(
                                     let snap = &mut st.binance.orderbook;
                                     snap.price = Some(mid);
                                     snap.seq = snap.seq.wrapping_add(1);
-                                    snap.ts_ns = Some(ob_ts);
+                                    snap.ts_ns = Some(ts);
+                                    snap.source_engine_ts_ns = Some(ob_ts);
+                                    snap.source_system_ts_ns = None;
                                     snap.bid_levels = bid_levels;
                                     snap.ask_levels = ask_levels;
                                     snap.direction = None;
@@ -614,6 +692,7 @@ pub fn spawn_state_engine(
                             #[cfg(not(feature = "binance_book"))]
                             let fallback_ts = 0;
                             let bbo_ts = entry.map(|e| e.ts).unwrap_or(fallback_ts);
+                            let system_ts_ns = entry.and_then(|e| e.system_ts_ns);
                             match feed_gate.evaluate(ExchangeFeed::Binance, FeedKind::Bbo, bbo_ts) {
                                 GateDecision::Accept => {
                                     demean.record_other(
@@ -645,7 +724,9 @@ pub fn spawn_state_engine(
                                         let snap = &mut st.binance.bbo;
                                         snap.price = Some(mid);
                                         snap.seq = snap.seq.wrapping_add(1);
-                                        snap.ts_ns = Some(bbo_ts);
+                                        snap.ts_ns = Some(ts);
+                                        snap.source_engine_ts_ns = Some(bbo_ts);
+                                        snap.source_system_ts_ns = system_ts_ns;
                                         snap.bid_levels = bid_levels;
                                         snap.ask_levels = ask_levels;
                                         snap.direction = None;
@@ -694,7 +775,9 @@ pub fn spawn_state_engine(
                                         let snap = &mut st.binance;
                                         snap.trade.price = Some(px);
                                         snap.trade.seq = snap.trade.seq.wrapping_add(1);
-                                        snap.trade.ts_ns = Some(trade_ts);
+                                        snap.trade.ts_ns = Some(ts);
+                                        snap.trade.source_engine_ts_ns = Some(trade_ts);
+                                        snap.trade.source_system_ts_ns = trade.system_ts_ns;
                                         snap.trade.direction = Some(direction);
                                         snap.trade.bid_levels = [None; 3];
                                         snap.trade.ask_levels = [None; 3];
@@ -788,8 +871,9 @@ pub fn spawn_state_engine(
             }
 
             // Gate
-            if let Ok(f) = gate_c.try_pop() {
+            if let Some(mut f) = gate_pending.take().or_else(|| gate_c.try_pop().ok()) {
                 progressed = true;
+                drain_latest_bbo(&mut f, &gate_c, &mut gate_pending, is_gate_bbo_frame);
                 let ts = f.ts;
                 if let Ok(s) = core::str::from_utf8(&f.raw) {
                     for (feed, _) in gate::events_for(s, &mut gate_book) {
@@ -816,7 +900,9 @@ pub fn spawn_state_engine(
                                             let snap = &mut st.gate.orderbook;
                                             snap.price = Some(mid);
                                             snap.seq = snap.seq.wrapping_add(1);
-                                            snap.ts_ns = Some(ob_ts);
+                                            snap.ts_ns = Some(ts);
+                                            snap.source_engine_ts_ns = Some(ob_ts);
+                                            snap.source_system_ts_ns = None;
                                             snap.bid_levels = bid_levels;
                                             snap.ask_levels = ask_levels;
                                             snap.direction = None;
@@ -853,6 +939,7 @@ pub fn spawn_state_engine(
                                     .and_then(|symbol| gate_bbo.get(symbol).copied())
                             });
                             let bbo_ts = entry.map(|e| e.ts).unwrap_or_else(|| gate_book.last_ts());
+                            let system_ts_ns = entry.and_then(|e| e.system_ts_ns);
                             match feed_gate.evaluate(ExchangeFeed::Gate, FeedKind::Bbo, bbo_ts) {
                                 GateDecision::Accept => {
                                     send_fast_event(mid, "gate_bbo", Some(bbo_ts), f.recv_instant);
@@ -870,7 +957,9 @@ pub fn spawn_state_engine(
                                         let snap = &mut st.gate.bbo;
                                         snap.price = Some(mid);
                                         snap.seq = snap.seq.wrapping_add(1);
-                                        snap.ts_ns = Some(bbo_ts);
+                                        snap.ts_ns = Some(ts);
+                                        snap.source_engine_ts_ns = Some(bbo_ts);
+                                        snap.source_system_ts_ns = system_ts_ns;
                                         snap.bid_levels = bid_levels;
                                         snap.ask_levels = ask_levels;
                                         snap.direction = None;
@@ -919,7 +1008,9 @@ pub fn spawn_state_engine(
                                         let snap = &mut st.gate;
                                         snap.trade.price = Some(px);
                                         snap.trade.seq = snap.trade.seq.wrapping_add(1);
-                                        snap.trade.ts_ns = Some(trade_ts);
+                                        snap.trade.ts_ns = Some(ts);
+                                        snap.trade.source_engine_ts_ns = Some(trade_ts);
+                                        snap.trade.source_system_ts_ns = trade.system_ts_ns;
                                         snap.trade.direction = Some(direction);
                                         snap.trade.bid_levels = [None; 3];
                                         snap.trade.ask_levels = [None; 3];
@@ -1056,8 +1147,9 @@ pub fn spawn_state_engine(
             }
 
             // Bitget
-            if let Ok(f) = bitget_c.try_pop() {
+            if let Some(mut f) = bitget_pending.take().or_else(|| bitget_c.try_pop().ok()) {
                 progressed = true;
+                drain_latest_bbo(&mut f, &bitget_c, &mut bitget_pending, is_bitget_bbo_frame);
                 let ts = f.ts;
                 if let Ok(s) = core::str::from_utf8(&f.raw) {
                     for (feed, _) in bitget::events_for(s, &mut bitget_book) {
@@ -1082,7 +1174,9 @@ pub fn spawn_state_engine(
                                         let snap = &mut st.bitget.orderbook;
                                         snap.price = Some(mid);
                                         snap.seq = snap.seq.wrapping_add(1);
-                                        snap.ts_ns = Some(ob_ts);
+                                        snap.ts_ns = Some(ts);
+                                        snap.source_engine_ts_ns = Some(ob_ts);
+                                        snap.source_system_ts_ns = bitget_book.last_system_ts_ns();
                                         snap.bid_levels = bid_levels;
                                         snap.ask_levels = ask_levels;
                                         snap.direction = None;
@@ -1116,6 +1210,9 @@ pub fn spawn_state_engine(
                             });
                             let bbo_ts =
                                 entry.map(|e| e.ts).unwrap_or_else(|| bitget_book.last_ts());
+                            let system_ts_ns = entry
+                                .and_then(|e| e.system_ts_ns)
+                                .or_else(|| bitget_book.last_bbo_system_ts_ns());
                             match feed_gate.evaluate(ExchangeFeed::Bitget, FeedKind::Bbo, bbo_ts) {
                                 GateDecision::Accept => {
                                     demean.record_other(
@@ -1137,7 +1234,9 @@ pub fn spawn_state_engine(
                                         let snap = &mut st.bitget.bbo;
                                         snap.price = Some(mid);
                                         snap.seq = snap.seq.wrapping_add(1);
-                                        snap.ts_ns = Some(bbo_ts);
+                                        snap.ts_ns = Some(ts);
+                                        snap.source_engine_ts_ns = Some(bbo_ts);
+                                        snap.source_system_ts_ns = system_ts_ns;
                                         snap.bid_levels = bid_levels;
                                         snap.ask_levels = ask_levels;
                                         snap.direction = None;
@@ -1186,7 +1285,9 @@ pub fn spawn_state_engine(
                                         let snap = &mut st.bitget;
                                         snap.trade.price = Some(px);
                                         snap.trade.seq = snap.trade.seq.wrapping_add(1);
-                                        snap.trade.ts_ns = Some(trade_ts);
+                                        snap.trade.ts_ns = Some(ts);
+                                        snap.trade.source_engine_ts_ns = Some(trade_ts);
+                                        snap.trade.source_system_ts_ns = trade.system_ts_ns;
                                         snap.trade.direction = Some(direction);
                                         snap.trade.bid_levels = [None; 3];
                                         snap.trade.ask_levels = [None; 3];
