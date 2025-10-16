@@ -230,7 +230,7 @@ async fn main() -> Result<()> {
     }
 
     let (reference_tx, mut reference_rx) = mpsc::unbounded_channel();
-    let _engine = spawn_state_engine(config.strategy.symbol.clone(), Some(reference_tx));
+    let _engine = spawn_state_engine(config.strategy.symbol.clone(), Some(reference_tx), None);
     debug.info(|| {
         format!(
             "Gate runner started for {} (dry_run: {})",
@@ -1425,4 +1425,3 @@ fn clamp_u128_to_u64(value: u128) -> u64 {
         value as u64
     }
 }
-

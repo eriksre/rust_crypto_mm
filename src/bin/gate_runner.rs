@@ -19,7 +19,7 @@ use rust_test::execution::{
 };
 use rust_test::logging::quote::{DebugLogger, QuoteLogHandle, format_f64};
 use rust_test::strategy::{ReferenceMeta, SimpleQuoteStrategy};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio::time::{self, MissedTickBehavior, interval};
 
 #[derive(Debug, Parser)]
@@ -45,6 +45,12 @@ fn dur_us(d: Duration) -> u128 {
 
 const REF_WARN: Duration = Duration::from_millis(20);
 const STAGE_WARN: Duration = Duration::from_millis(5);
+const CANCEL_WARN: Duration = Duration::from_micros(500);
+
+struct CancelMessage {
+    reference: ReferenceEvent,
+    dispatched_at: Instant,
+}
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
@@ -102,8 +108,10 @@ async fn main() -> Result<()> {
         )
     });
 
+    let config = Arc::new(config);
+
     let logger = if config.logging.is_enabled() {
-        let handle = QuoteLogHandle::spawn(&config, debug.clone())?;
+        let handle = QuoteLogHandle::spawn(config.as_ref(), debug.clone())?;
         debug.info(|| format!("Activity logging enabled -> {}", handle.path().display()));
         Some(handle)
     } else {
@@ -115,7 +123,7 @@ async fn main() -> Result<()> {
     let credentials = if config.mode.dry_run {
         None
     } else {
-        Some(load_gate_credentials(&config)?)
+        Some(load_gate_credentials(config.as_ref())?)
     };
 
     let rest_client = credentials
@@ -198,7 +206,12 @@ async fn main() -> Result<()> {
     }
 
     let (reference_tx, mut reference_rx) = mpsc::unbounded_channel();
-    let _engine = spawn_state_engine(config.strategy.symbol.clone(), Some(reference_tx));
+    let (fast_ref_tx, mut fast_ref_rx) = mpsc::unbounded_channel();
+    let _engine = spawn_state_engine(
+        config.strategy.symbol.clone(),
+        Some(reference_tx),
+        Some(fast_ref_tx),
+    );
     debug.info(|| {
         format!(
             "Gate runner started for {} (dry_run: {})",
@@ -213,41 +226,108 @@ async fn main() -> Result<()> {
             .as_ref()
             .expect("credentials must exist for live mode")
             .clone();
-        Arc::new(setup_live_gateway(&config, contract_size, &creds).await?)
+        Arc::new(setup_live_gateway(config.as_ref(), contract_size, &creds).await?)
     };
     let order_manager = Arc::new(OrderManager::new(gateway, Duration::from_secs(30)));
-    let mut strategy = SimpleQuoteStrategy::new(config.strategy.clone());
+    let strategy = Arc::new(Mutex::new(SimpleQuoteStrategy::new(
+        config.strategy.clone(),
+    )));
+
+    let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<CancelMessage>();
+    let cancel_strategy = strategy.clone();
+    let cancel_order_manager = order_manager.clone();
+    let cancel_logger = logger.clone();
+    let cancel_debug = debug.clone();
+    let cancel_config = config.clone();
+
+    tokio::spawn(async move {
+        while let Some(msg) = cancel_rx.recv().await {
+            if let Err(err) = handle_market_update(
+                msg,
+                cancel_strategy.clone(),
+                cancel_config.clone(),
+                cancel_order_manager.clone(),
+                cancel_logger.clone(),
+                cancel_debug.clone(),
+            )
+            .await
+            {
+                cancel_debug.error(|| format!("error handling market update: {:#}", err));
+            }
+        }
+    });
+
+    let fast_cancel_tx = cancel_tx.clone();
+    tokio::spawn(async move {
+        while let Some(reference) = fast_ref_rx.recv().await {
+            let msg = CancelMessage {
+                reference,
+                dispatched_at: Instant::now(),
+            };
+            if fast_cancel_tx.send(msg).is_err() {
+                break;
+            }
+        }
+    });
 
     let mut market_timer = interval(Duration::from_millis(20));
-    market_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // Skip missed ticks to avoid backlog delaying market updates
+    market_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut quote_timer = interval(Duration::from_millis(50));
-    quote_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // Skip missed ticks so quoting never starves the cancel hot path
+    quote_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let warmup = Duration::from_secs(25);
     let start_time = Instant::now();
+    let quote_gate = Arc::new(Semaphore::new(1));
 
     tokio::select! {
         _ = ctrl_c_notifier() => {
             debug.info(|| "Received shutdown signal; exiting.".to_string());
         }
         _ = async {
+            use tokio::sync::mpsc::error::TryRecvError;
             loop {
+                // Drain all queued reference updates first (hot path)
+                loop {
+                    match reference_rx.try_recv() {
+                        Ok(reference) => {
+                            if start_time.elapsed() >= warmup {
+                                let msg = CancelMessage {
+                                    reference,
+                                    dispatched_at: Instant::now(),
+                                };
+                                if cancel_tx.send(msg).is_err() {
+                                    debug.error(|| "cancel handler channel closed; exiting.".to_string());
+                                    return;
+                                }
+                            }
+                            continue;
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            debug.error(|| "reference channel closed; exiting.".to_string());
+                            return;
+                        }
+                    }
+                }
+
+                // Await the next event, preferring new references when they arrive
                 tokio::select! {
                     reference = reference_rx.recv() => {
                         match reference {
                             Some(reference) => {
-                                if start_time.elapsed() < warmup {
-                                    continue;
+                                if start_time.elapsed() >= warmup {
+                                    let msg = CancelMessage {
+                                        reference,
+                                        dispatched_at: Instant::now(),
+                                    };
+                                    if cancel_tx.send(msg).is_err() {
+                                        debug.error(|| "cancel handler channel closed; exiting.".to_string());
+                                        break;
+                                    }
                                 }
-                                if let Err(err) = handle_market_update(
-                                    reference,
-                                    &mut strategy,
-                                    &config,
-                                    order_manager.clone(),
-                                    logger.clone(),
-                                    debug.clone(),
-                                ).await {
-                                    debug.error(|| format!("error handling market update: {:#}", err));
-                                }
+                                // loop back and drain more immediately
+                                continue;
                             }
                             None => {
                                 debug.error(|| "reference channel closed; exiting.".to_string());
@@ -266,8 +346,8 @@ async fn main() -> Result<()> {
 
                         if let Err(err) =
                             drain_reports(
-                                &mut strategy,
-                                &config,
+                                strategy.clone(),
+                                config.clone(),
                                 order_manager.clone(),
                                 logger.clone(),
                                 debug.clone(),
@@ -282,17 +362,32 @@ async fn main() -> Result<()> {
                             continue;
                         }
                         let now = Instant::now();
-                        if let Err(err) = handle_quote_tick(
-                            now,
-                            &mut strategy,
-                            &config,
-                            contract_size,
-                            order_manager.clone(),
-                            logger.clone(),
-                            debug.clone(),
-                            inventory.clone(),
-                        ).await {
-                            debug.error(|| format!("error handling quote tick: {:#}", err));
+                        let strategy_clone = strategy.clone();
+                        let config_clone = config.clone();
+                        let order_manager_clone = order_manager.clone();
+                        let logger_clone = logger.clone();
+                        let debug_clone = debug.clone();
+                        let inventory_clone = inventory.clone();
+                        let quote_gate_clone = quote_gate.clone();
+                        if let Ok(permit) = quote_gate_clone.try_acquire_owned() {
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                if let Err(err) = handle_quote_tick(
+                                    now,
+                                    strategy_clone,
+                                    config_clone,
+                                    contract_size,
+                                    order_manager_clone,
+                                    logger_clone,
+                                    debug_clone.clone(),
+                                    inventory_clone,
+                                )
+                                .await
+                                {
+                                    debug_clone
+                                        .error(|| format!("error handling quote tick: {:#}", err));
+                                }
+                            });
                         }
                     }
                 }
@@ -308,13 +403,18 @@ struct FilteredIntents {
     skipped: Vec<(ClientOrderId, String)>,
 }
 async fn handle_market_update(
-    reference: ReferenceEvent,
-    strategy: &mut SimpleQuoteStrategy,
-    config: &RunnerConfig,
+    msg: CancelMessage,
+    strategy: Arc<Mutex<SimpleQuoteStrategy>>,
+    config: Arc<RunnerConfig>,
     order_manager: Arc<OrderManager>,
     logger: Option<QuoteLogHandle>,
     debug: DebugLogger,
 ) -> Result<()> {
+    let config_ref = config.as_ref();
+    let CancelMessage {
+        reference,
+        dispatched_at,
+    } = msg;
     let latency_debug = latency_debug_enabled();
     let now = Instant::now();
     let reference_age = now.saturating_duration_since(reference.received_at);
@@ -323,10 +423,32 @@ async fn handle_market_update(
         ts_ns: reference.ts_ns,
         received_at: reference.received_at,
     };
-    let strat_start = Instant::now();
+    let lock_start = Instant::now();
+    let mut strategy_guard = strategy.lock().await;
+    let lock_wait = lock_start.elapsed();
+    let queue_delay = lock_start.saturating_duration_since(reference.received_at);
+    let dispatch_delay = lock_start.saturating_duration_since(dispatched_at);
     let cancels =
-        strategy.on_market_update(reference.price, Some(meta.clone()), reference.received_at);
-    let strat_dur = strat_start.elapsed();
+        strategy_guard.on_market_update(reference.price, Some(meta.clone()), reference.received_at);
+    let strat_dur = lock_start.elapsed();
+    let send_start_opt = if cancels.is_empty() {
+        None
+    } else {
+        let send_start = Instant::now();
+        strategy_guard.record_cancel_submission(send_start);
+        Some(send_start)
+    };
+    drop(strategy_guard);
+
+    if latency_debug && lock_wait > Duration::from_micros(200) {
+        debug.latency(|| {
+            format!(
+                "latency-debug::market strategy_lock_wait={}us cancels={}",
+                dur_us(lock_wait),
+                cancels.len()
+            )
+        });
+    }
 
     if latency_debug && (reference_age > REF_WARN || strat_dur > STAGE_WARN) {
         debug.latency(|| {
@@ -340,49 +462,66 @@ async fn handle_market_update(
         });
     }
 
-    if !cancels.is_empty() {
-        debug.info(|| {
+    if cancels.is_empty() {
+        return Ok(());
+    }
+
+    let send_start = send_start_opt.expect("send_start missing with cancels");
+    let cancel_internal = send_start.saturating_duration_since(reference.received_at);
+    let compute_delay = send_start.saturating_duration_since(lock_start);
+    let sent_ts = SystemTime::now();
+
+    let cancels_to_send = cancels.clone();
+    let order_manager_clone = order_manager.clone();
+    let debug_clone = debug.clone();
+    tokio::spawn(async move {
+        let call_start = Instant::now();
+        if let Err(err) = order_manager_clone.cancel_many(&cancels_to_send).await {
+            let ids = cancels_to_send.clone();
+            let err_msg = format!("{:#}", err);
+            debug_clone.error(move || format!("cancel {:?} failed: {}", ids, err_msg));
+        }
+        if latency_debug_enabled() {
+            let call_elapsed = call_start.elapsed();
+            let cancel_count = cancels_to_send.len();
+            debug_clone.latency(|| {
+                format!(
+                    "latency-debug::cancel ref_age={}us call={}us ids={}",
+                    dur_us(cancel_internal),
+                    dur_us(call_elapsed),
+                    cancel_count
+                )
+            });
+        }
+    });
+
+    if latency_debug || cancel_internal > CANCEL_WARN {
+        debug.latency(|| {
             format!(
-                "repricing {} on {} (ts={:?}); cancelling {} orders",
-                config.strategy.symbol,
-                reference.source,
-                reference.ts_ns,
+                "latency-debug::cancel summary queue={}us dispatch={}us compute={}us total={}us cancels={}",
+                dur_us(queue_delay),
+                dur_us(dispatch_delay),
+                dur_us(compute_delay),
+                dur_us(cancel_internal),
                 cancels.len()
             )
         });
-        let send_start = Instant::now();
-        strategy.record_cancel_submission(send_start);
-        let cancel_internal = send_start.saturating_duration_since(reference.received_at);
-        let sent_ts = SystemTime::now();
-        if let Some(logger) = logger.as_ref() {
-            for id in &cancels {
-                logger.log_cancel(id, &reference, cancel_internal, send_start, sent_ts);
-            }
-        }
+    }
 
-        let cancels_to_send = cancels.clone();
-        let order_manager_clone = order_manager.clone();
-        let debug_clone = debug.clone();
-        tokio::spawn(async move {
-            let call_start = Instant::now();
-            if let Err(err) = order_manager_clone.cancel_many(&cancels_to_send).await {
-                let ids = cancels_to_send.clone();
-                let err_msg = format!("{:#}", err);
-                debug_clone.error(move || format!("cancel {:?} failed: {}", ids, err_msg));
-            }
-            if latency_debug_enabled() {
-                let call_elapsed = call_start.elapsed();
-                let cancel_count = cancels_to_send.len();
-                debug_clone.latency(|| {
-                    format!(
-                        "latency-debug::cancel ref_age={}us call={}us ids={}",
-                        dur_us(cancel_internal),
-                        dur_us(call_elapsed),
-                        cancel_count
-                    )
-                });
-            }
-        });
+    // Logging after dispatch so we don't delay the cancel send
+    debug.info(|| {
+        format!(
+            "repricing {} on {} (ts={:?}); cancelling {} orders",
+            config_ref.strategy.symbol,
+            reference.source,
+            reference.ts_ns,
+            cancels.len()
+        )
+    });
+    if let Some(logger) = logger.as_ref() {
+        for id in &cancels {
+            logger.log_cancel(id, &reference, cancel_internal, send_start, sent_ts);
+        }
     }
 
     Ok(())
@@ -390,8 +529,8 @@ async fn handle_market_update(
 
 async fn handle_quote_tick(
     now: Instant,
-    strategy: &mut SimpleQuoteStrategy,
-    config: &RunnerConfig,
+    strategy: Arc<Mutex<SimpleQuoteStrategy>>,
+    config: Arc<RunnerConfig>,
     contract_size: f64,
     order_manager: Arc<OrderManager>,
     logger: Option<QuoteLogHandle>,
@@ -399,8 +538,8 @@ async fn handle_quote_tick(
     inventory: Arc<Mutex<InventoryTracker>>,
 ) -> Result<()> {
     drain_reports(
-        strategy,
-        config,
+        strategy.clone(),
+        config.clone(),
         order_manager.clone(),
         logger.clone(),
         debug.clone(),
@@ -408,7 +547,19 @@ async fn handle_quote_tick(
     )
     .await?;
 
-    if let Some(mut plan) = strategy.plan_quotes(now) {
+    let config_ref = config.as_ref();
+
+    let plan_opt = match strategy.try_lock() {
+        Ok(mut guard) => guard.plan_quotes(now),
+        Err(_) => {
+            if latency_debug_enabled() {
+                debug.latency(|| "latency-debug::quote skipped (strategy busy)".to_string());
+            }
+            return Ok(());
+        }
+    };
+
+    if let Some(mut plan) = plan_opt {
         let reference_price = plan.reference_price;
         let net_contracts = {
             let guard = inventory.lock().await;
@@ -416,7 +567,7 @@ async fn handle_quote_tick(
         };
         let filter = filter_intents(
             &plan.intents,
-            &config.risk,
+            &config_ref.risk,
             contract_size,
             net_contracts,
             reference_price,
@@ -436,7 +587,7 @@ async fn handle_quote_tick(
             debug.info(|| {
                 format!(
                     "quoting {} on {} (ts={:?}) latency={}µs",
-                    config.strategy.symbol,
+                    config_ref.strategy.symbol,
                     meta.source,
                     meta.ts_ns,
                     now.checked_duration_since(plan.planned_at)
@@ -449,7 +600,7 @@ async fn handle_quote_tick(
             debug.info(|| {
                 format!(
                     "quoting {} with latest price {:.4}",
-                    config.strategy.symbol, plan.reference_price
+                    config_ref.strategy.symbol, plan.reference_price
                 )
             });
             None
@@ -458,7 +609,7 @@ async fn handle_quote_tick(
         let intents = plan.intents.clone();
         let send_start = Instant::now();
         let sent_ts = SystemTime::now();
-        let debounce_budget = Duration::from_millis(config.strategy.debounce_ms.max(1));
+        let debounce_budget = Duration::from_millis(config_ref.strategy.debounce_ms.max(1));
         let (reference_instant, timer_wait) = if let Some(meta) = ref_meta.as_ref() {
             let age = plan.planned_at.saturating_duration_since(meta.received_at);
             if age <= debounce_budget {
@@ -498,7 +649,18 @@ async fn handle_quote_tick(
                 sent_ts,
             );
         }
-        strategy.commit_plan(&plan);
+        {
+            let commit_lock_start = Instant::now();
+            let mut strategy_guard = strategy.lock().await;
+            if latency_debug_enabled() {
+                let wait = commit_lock_start.elapsed();
+                if wait > Duration::from_micros(200) {
+                    debug
+                        .latency(|| format!("latency-debug::quote commit_wait={}us", dur_us(wait)));
+                }
+            }
+            strategy_guard.commit_plan(&plan);
+        }
         {
             let added_ids = {
                 let mut guard = inventory.lock().await;
@@ -545,7 +707,7 @@ async fn handle_quote_tick(
                         ref_meta_for_send.as_ref(),
                         reference_price,
                         Some(quote_internal_for_send),
-                        &config_clone,
+                        config_clone.as_ref(),
                         &debug_clone,
                     );
                 }
@@ -562,8 +724,8 @@ async fn handle_quote_tick(
 }
 
 async fn drain_reports(
-    strategy: &mut SimpleQuoteStrategy,
-    config: &RunnerConfig,
+    strategy: Arc<Mutex<SimpleQuoteStrategy>>,
+    config: Arc<RunnerConfig>,
     order_manager: Arc<OrderManager>,
     logger: Option<QuoteLogHandle>,
     debug: DebugLogger,
@@ -575,7 +737,10 @@ async fn drain_reports(
     }
 
     for report in &reports {
-        strategy.handle_report(report);
+        {
+            let mut strategy = strategy.lock().await;
+            strategy.handle_report(report);
+        }
         let outcome = {
             let mut guard = inventory.lock().await;
             guard.apply_report(report)
@@ -622,7 +787,7 @@ async fn drain_reports(
         logger.log_reports(&reports);
     }
 
-    log_reports(&reports, config, &debug);
+    log_reports(&reports, config.as_ref(), &debug);
     Ok(())
 }
 

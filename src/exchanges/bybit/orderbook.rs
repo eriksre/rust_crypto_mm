@@ -3,6 +3,7 @@
 use crate::base_classes::order_book::ArrayOrderBook;
 use crate::base_classes::orderbook_trait::OrderBookOps;
 use crate::base_classes::types::*;
+use crate::utils::time::ms_to_ns;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -79,11 +80,12 @@ impl<const N: usize> BybitBook<N> {
                 }
             },
         };
-        let ts: Ts = if dref.ts != 0 {
-            dref.ts as Ts
+        let ts_ms = if dref.ts != 0 {
+            dref.ts
         } else {
-            msg.ts.unwrap_or(0) as Ts
+            msg.ts.unwrap_or(0)
         };
+        let ts: Ts = ms_to_ns(ts_ms);
         let seq_val: u64 = dref.seq;
         let seq: Seq = seq_val as Seq;
         if msg.kind == "snapshot" {
@@ -152,6 +154,11 @@ impl<const N: usize> BybitBook<N> {
     }
 
     #[inline(always)]
+    pub fn last_ts(&self) -> Ts {
+        self.book.ts
+    }
+
+    #[inline(always)]
     pub fn top_levels_f64(&self, depth: usize) -> (Vec<(f64, f64)>, Vec<(f64, f64)>) {
         let mut bids = Vec::with_capacity(depth.min(self.book.len_bids()));
         let mut asks = Vec::with_capacity(depth.min(self.book.len_asks()));
@@ -191,7 +198,7 @@ impl<const N: usize> BybitBook<N> {
         if seq <= self.last_seq {
             return false;
         }
-        let ts: Ts = ts_ms as Ts;
+        let ts: Ts = ms_to_ns(ts_ms);
         let seqn: Seq = seq as Seq;
         let (bpx, bqty) = self.conv(bid_px, bid_sz);
         let (apx, aqty) = self.conv(ask_px, ask_sz);
@@ -271,5 +278,33 @@ impl<const N: usize> OrderBookOps for BybitBook<N> {
         self.book.clear();
         self.initialized = false;
         self.last_seq = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::time::ms_to_ns;
+
+    #[test]
+    fn snapshot_updates_timestamp_in_ns() {
+        let mut book = BybitBook::<8>::new("BTCUSDT", PRICE_SCALE, QTY_SCALE);
+        let ts_ms = 1_700_000_000_123u64;
+        let msg = BybitMsg {
+            topic: "orderbook.50.BTCUSDT".to_string(),
+            kind: "snapshot".to_string(),
+            data: BybitDataCont::Obj(BybitData {
+                b: vec![["43000.0".to_string(), "1.0".to_string()]],
+                a: vec![["43010.0".to_string(), "2.0".to_string()]],
+                u: 0,
+                seq: 42,
+                ts: ts_ms,
+                s: Some("BTCUSDT".to_string()),
+            }),
+            ts: None,
+        };
+
+        assert!(book.apply(&msg));
+        assert_eq!(book.last_ts(), ms_to_ns(ts_ms));
     }
 }

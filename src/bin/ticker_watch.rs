@@ -9,7 +9,7 @@ fn main() {
         .nth(1)
         .unwrap_or_else(|| "BTCUSDT".to_string());
 
-    let _engine = spawn_state_engine(symbol.clone(), None);
+    let _engine = spawn_state_engine(symbol.clone(), None, None);
     println!("Watching ticker updates for {symbol}. Ctrl-C to exit.\n");
 
     let mut last_seq = ExchangeSeqs::default();

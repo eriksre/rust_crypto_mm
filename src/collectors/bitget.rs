@@ -1,11 +1,12 @@
 use crate::base_classes::bbo_store::BboStore;
 use crate::base_classes::tickers::{TickerSnapshot, TickerStore};
 use crate::base_classes::trades::{FixedTrades, Trade};
-use crate::base_classes::types::{Price, Qty, Seq, Ts};
+use crate::base_classes::types::{Price, Qty, Seq};
 use crate::collectors::helpers::{
     extract_first_price_in_array, find_first_string_number, find_json_string,
 };
 use crate::exchanges::bitget_book::{BitgetBook, BitgetMsg};
+use crate::utils::time::ms_to_ns;
 use serde_json::{self, Value};
 
 pub fn events_for<const N: usize>(s: &str, book: &mut BitgetBook<N>) -> Vec<(&'static str, f64)> {
@@ -151,7 +152,7 @@ pub fn update_tickers(s: &str, store: &mut TickerStore) -> Option<(String, Ticke
     }
 
     if let Some(ts_ms) = first_u64(data, &["ts"]).or_else(|| raw.get("ts").and_then(as_u64)) {
-        snapshot.ticker.ts = (ts_ms as u128 * 1_000_000) as Ts;
+        snapshot.ticker.ts = ms_to_ns(ts_ms);
     }
 
     let stored = store.update(symbol.clone(), snapshot);
@@ -262,7 +263,7 @@ pub fn update_bbo_store(s: &str, store: &mut BboStore) -> bool {
                         .and_then(as_u64)
                         .or_else(|| raw.get("ts").and_then(as_u64))
                         .unwrap_or(0);
-                    let ts_ns = (ts_ms as u128 * 1_000_000) as Ts;
+                    let ts_ns = ms_to_ns(ts_ms);
                     let symbol = raw
                         .get("arg")
                         .and_then(|arg| {
@@ -319,7 +320,7 @@ pub fn update_trades<const N: usize>(s: &str, trades: &mut FixedTrades<N>) -> us
                             .and_then(as_u64)
                             .or_else(|| raw.get("ts").and_then(as_u64))
                             .unwrap_or(0);
-                        let ts_ns = (ts_ms as u128 * 1_000_000) as Ts;
+                        let ts_ns = ms_to_ns(ts_ms);
                         let seq = entry
                             .get("tradeId")
                             .or_else(|| entry.get("id"))

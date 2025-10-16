@@ -96,7 +96,10 @@ impl QuoteLogHandle {
 
     pub fn log_market_snapshot(&self) {
         if let Err(err) = self.tx.send(LogEvent::MarketSnapshot) {
-            eprintln!("ERROR: Failed to log market snapshot (logger channel closed): {}", err);
+            eprintln!(
+                "ERROR: Failed to log market snapshot (logger channel closed): {}",
+                err
+            );
         }
     }
 
@@ -120,7 +123,10 @@ impl QuoteLogHandle {
             send_instant,
             sent_ts,
         }) {
-            eprintln!("ERROR: Failed to log quote submission (logger channel closed): {}", err);
+            eprintln!(
+                "ERROR: Failed to log quote submission (logger channel closed): {}",
+                err
+            );
         }
     }
 
@@ -139,7 +145,10 @@ impl QuoteLogHandle {
             send_instant,
             sent_ts,
         }) {
-            eprintln!("ERROR: Failed to log cancel (logger channel closed): {}", err);
+            eprintln!(
+                "ERROR: Failed to log cancel (logger channel closed): {}",
+                err
+            );
         }
     }
 
@@ -148,7 +157,10 @@ impl QuoteLogHandle {
             return;
         }
         if let Err(err) = self.tx.send(LogEvent::Reports(reports.to_vec())) {
-            eprintln!("ERROR: Failed to log reports (logger channel closed): {}", err);
+            eprintln!(
+                "ERROR: Failed to log reports (logger channel closed): {}",
+                err
+            );
         }
     }
 }

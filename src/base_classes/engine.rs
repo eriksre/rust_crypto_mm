@@ -1,13 +1,15 @@
 #![allow(dead_code)]
 
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::base_classes::demean::{DemeanTracker, ExchangeKind};
+use crate::base_classes::feed_gate::{ExchangeFeed, FeedKind, FeedTimestampGate, GateDecision};
 use crate::base_classes::reference::ReferenceEvent;
 use crate::base_classes::reference_publisher::ReferencePublisher;
 use crate::base_classes::state::{ExchangeAdjustment, TradeDirection, TradeEvent, state};
 use crate::base_classes::tickers::TickerStore;
+use crate::base_classes::types::Ts;
 use crate::base_classes::ws::{FeedSignal, spawn_ws_worker};
 use crate::collectors::{binance, bitget, bybit, gate};
 
@@ -44,6 +46,20 @@ fn level_from_option(level: Option<(f64, f64)>) -> [Option<(f64, f64)>; 3] {
     out
 }
 
+#[inline(always)]
+fn log_stale_update(exchange: ExchangeFeed, feed: FeedKind, ts: Ts, last_ts: Ts, count: u64) {
+    if count <= 3 || count % 100 == 0 {
+        eprintln!(
+            "dropping stale {} {} update: ts={} < last={} ({} drops)",
+            exchange.as_str(),
+            feed.as_str(),
+            ts,
+            last_ts,
+            count
+        );
+    }
+}
+
 /// LOUD state lock helper - panics immediately if lock is poisoned.
 /// This is intentional - a poisoned lock means the system is in an undefined state.
 #[inline(always)]
@@ -51,7 +67,10 @@ fn lock_state() -> std::sync::MutexGuard<'static, crate::base_classes::state::Gl
     match state().lock() {
         Ok(guard) => guard,
         Err(poisoned) => {
-            eprintln!("FATAL: State lock poisoned in engine main loop: {}", poisoned);
+            eprintln!(
+                "FATAL: State lock poisoned in engine main loop: {}",
+                poisoned
+            );
             eprintln!("This indicates a panic occurred while holding the state lock.");
             eprintln!("The system cannot continue safely - terminating immediately.");
             panic!("State lock poisoned - unrecoverable error");
@@ -105,9 +124,24 @@ fn spawn_gate_user_trades_listener(
 pub fn spawn_state_engine(
     symbol: String,
     reference_tx: Option<UnboundedSender<ReferenceEvent>>,
+    fast_tx: Option<UnboundedSender<ReferenceEvent>>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut publisher = ReferencePublisher::new(reference_tx);
+        let fast_tx = fast_tx;
+        let send_fast_event =
+            |price: f64, source: &'static str, ts: Option<u64>, recv_at: Instant| {
+                if let Some(tx) = fast_tx.as_ref() {
+                    if price.is_finite() && price > 0.0 {
+                        let _ = tx.send(ReferenceEvent {
+                            price,
+                            ts_ns: ts,
+                            source: source.to_string(),
+                            received_at: recv_at,
+                        });
+                    }
+                }
+            };
         const N: usize = 1 << 15;
         let wake_signal = FeedSignal::new();
         let (bybit_c, _jh1) = spawn_ws_worker::<BybitHandler, N>(
@@ -208,6 +242,7 @@ pub fn spawn_state_engine(
         let mut binance_tickers = TickerStore::default();
 
         let mut demean = DemeanTracker::new(Duration::from_secs(8));
+        let mut feed_gate = FeedTimestampGate::new();
 
         let apply_demean = |updates: &[(ExchangeKind, ExchangeAdjustment)]| {
             if updates.is_empty() {
@@ -236,22 +271,47 @@ pub fn spawn_state_engine(
                         match feed {
                             "orderbook" => {
                                 if let Some(mid) = bybit_book.mid_price_f64() {
-                                    demean.record_other(ExchangeKind::Bybit, Some(ts), Some(mid));
-                                    let (bid_vec, ask_vec) = bybit_book.top_levels_f64(3);
-                                    let bid_levels = levels_to_array(&bid_vec);
-                                    let ask_levels = levels_to_array(&ask_vec);
-                                    {
-                                        let mut st = lock_state();
-                                        let snap = &mut st.bybit.orderbook;
-                                        snap.price = Some(mid);
-                                        snap.seq = snap.seq.wrapping_add(1);
-                                        snap.ts_ns = Some(ts);
-                                        snap.bid_levels = bid_levels;
-                                        snap.ask_levels = ask_levels;
-                                        snap.direction = None;
-                                        snap.received_at = Some(f.recv_instant);
+                                    let ob_ts = bybit_book.last_ts();
+                                    match feed_gate.evaluate(
+                                        ExchangeFeed::Bybit,
+                                        FeedKind::OrderBook,
+                                        ob_ts,
+                                    ) {
+                                        GateDecision::Accept => {
+                                            demean.record_other(
+                                                ExchangeKind::Bybit,
+                                                Some(ob_ts),
+                                                Some(mid),
+                                            );
+                                            let (bid_vec, ask_vec) = bybit_book.top_levels_f64(3);
+                                            let bid_levels = levels_to_array(&bid_vec);
+                                            let ask_levels = levels_to_array(&ask_vec);
+                                            {
+                                                let mut st = lock_state();
+                                                let snap = &mut st.bybit.orderbook;
+                                                snap.price = Some(mid);
+                                                snap.seq = snap.seq.wrapping_add(1);
+                                                snap.ts_ns = Some(ob_ts);
+                                                snap.bid_levels = bid_levels;
+                                                snap.ask_levels = ask_levels;
+                                                snap.direction = None;
+                                                snap.received_at = Some(f.recv_instant);
+                                            }
+                                            publisher.publish();
+                                        }
+                                        GateDecision::Reject {
+                                            last_ts,
+                                            reject_count,
+                                        } => {
+                                            log_stale_update(
+                                                ExchangeFeed::Bybit,
+                                                FeedKind::OrderBook,
+                                                ob_ts,
+                                                last_ts,
+                                                reject_count,
+                                            );
+                                        }
                                     }
-                                    publisher.publish();
                                 }
                             }
                             "bbo" => {
@@ -266,50 +326,107 @@ pub fn spawn_state_engine(
                                                     bybit_bbo.get(symbol).copied()
                                                 })
                                             });
-                                        let (bid_levels, ask_levels) = if let Some(e) = entry {
-                                            (
-                                                level_from_option(Some((e.bid_px, e.bid_qty))),
-                                                level_from_option(Some((e.ask_px, e.ask_qty))),
-                                            )
-                                        } else {
-                                            let (bid_vec, ask_vec) = bybit_book.top_levels_f64(1);
-                                            (levels_to_array(&bid_vec), levels_to_array(&ask_vec))
-                                        };
-                                        demean.record_other(
-                                            ExchangeKind::Bybit,
-                                            Some(ts),
-                                            Some(mid),
-                                        );
-                                        {
-                                            let mut st = lock_state();
-                                            let snap = &mut st.bybit.bbo;
-                                            snap.price = Some(mid);
-                                            snap.seq = snap.seq.wrapping_add(1);
-                                            snap.ts_ns = Some(ts);
-                                            snap.bid_levels = bid_levels;
-                                            snap.ask_levels = ask_levels;
-                                            snap.direction = None;
-                                            snap.received_at = Some(f.recv_instant);
+                                        let bbo_ts = entry
+                                            .map(|e| e.ts)
+                                            .unwrap_or_else(|| bybit_book.last_ts());
+                                        match feed_gate.evaluate(
+                                            ExchangeFeed::Bybit,
+                                            FeedKind::Bbo,
+                                            bbo_ts,
+                                        ) {
+                                            GateDecision::Accept => {
+                                                demean.record_other(
+                                                    ExchangeKind::Bybit,
+                                                    Some(bbo_ts),
+                                                    Some(mid),
+                                                );
+                                                let (bid_levels, ask_levels) =
+                                                    if let Some(e) = entry {
+                                                        (
+                                                            level_from_option(Some((
+                                                                e.bid_px, e.bid_qty,
+                                                            ))),
+                                                            level_from_option(Some((
+                                                                e.ask_px, e.ask_qty,
+                                                            ))),
+                                                        )
+                                                    } else {
+                                                        let (bid_vec, ask_vec) =
+                                                            bybit_book.top_levels_f64(1);
+                                                        (
+                                                            levels_to_array(&bid_vec),
+                                                            levels_to_array(&ask_vec),
+                                                        )
+                                                    };
+                                                {
+                                                    let mut st = lock_state();
+                                                    let snap = &mut st.bybit.bbo;
+                                                    snap.price = Some(mid);
+                                                    snap.seq = snap.seq.wrapping_add(1);
+                                                    snap.ts_ns = Some(bbo_ts);
+                                                    snap.bid_levels = bid_levels;
+                                                    snap.ask_levels = ask_levels;
+                                                    snap.direction = None;
+                                                    snap.received_at = Some(f.recv_instant);
+                                                }
+                                                publisher.publish();
+                                            }
+                                            GateDecision::Reject {
+                                                last_ts,
+                                                reject_count,
+                                            } => {
+                                                log_stale_update(
+                                                    ExchangeFeed::Bybit,
+                                                    FeedKind::Bbo,
+                                                    bbo_ts,
+                                                    last_ts,
+                                                    reject_count,
+                                                );
+                                            }
                                         }
-                                        publisher.publish();
                                     }
                                 } else if let Some(mid) = bybit_book.mid_price_f64() {
-                                    demean.record_other(ExchangeKind::Bybit, Some(ts), Some(mid));
-                                    let (bid_vec, ask_vec) = bybit_book.top_levels_f64(1);
-                                    let bid_levels = levels_to_array(&bid_vec);
-                                    let ask_levels = levels_to_array(&ask_vec);
-                                    {
-                                        let mut st = lock_state();
-                                        let snap = &mut st.bybit.bbo;
-                                        snap.price = Some(mid);
-                                        snap.seq = snap.seq.wrapping_add(1);
-                                        snap.ts_ns = Some(ts);
-                                        snap.bid_levels = bid_levels;
-                                        snap.ask_levels = ask_levels;
-                                        snap.direction = None;
-                                        snap.received_at = Some(f.recv_instant);
+                                    let bbo_ts = bybit_book.last_ts();
+                                    match feed_gate.evaluate(
+                                        ExchangeFeed::Bybit,
+                                        FeedKind::Bbo,
+                                        bbo_ts,
+                                    ) {
+                                        GateDecision::Accept => {
+                                            demean.record_other(
+                                                ExchangeKind::Bybit,
+                                                Some(bbo_ts),
+                                                Some(mid),
+                                            );
+                                            let (bid_vec, ask_vec) = bybit_book.top_levels_f64(1);
+                                            let bid_levels = levels_to_array(&bid_vec);
+                                            let ask_levels = levels_to_array(&ask_vec);
+                                            {
+                                                let mut st = lock_state();
+                                                let snap = &mut st.bybit.bbo;
+                                                snap.price = Some(mid);
+                                                snap.seq = snap.seq.wrapping_add(1);
+                                                snap.ts_ns = Some(bbo_ts);
+                                                snap.bid_levels = bid_levels;
+                                                snap.ask_levels = ask_levels;
+                                                snap.direction = None;
+                                                snap.received_at = Some(f.recv_instant);
+                                            }
+                                            publisher.publish();
+                                        }
+                                        GateDecision::Reject {
+                                            last_ts,
+                                            reject_count,
+                                        } => {
+                                            log_stale_update(
+                                                ExchangeFeed::Bybit,
+                                                FeedKind::Bbo,
+                                                bbo_ts,
+                                                last_ts,
+                                                reject_count,
+                                            );
+                                        }
                                     }
-                                    publisher.publish();
                                 }
                             }
                             _ => {}
@@ -318,37 +435,63 @@ pub fn spawn_state_engine(
                     let new_trades = bybit::update_trades(s, &mut bybit_trades);
                     if new_trades > 0 {
                         for trade in bybit_trades.iter_last(new_trades) {
-                            let px = (trade.px as f64) / crate::exchanges::bybit_book::PRICE_SCALE;
-                            demean.record_other(ExchangeKind::Bybit, Some(ts), Some(px));
-                            let direction = if trade.is_buyer_maker {
-                                TradeDirection::Sell
-                            } else {
-                                TradeDirection::Buy
-                            };
-                            {
-                                let mut st = lock_state();
-                                let snap = &mut st.bybit;
-                                snap.trade.price = Some(px);
-                                snap.trade.seq = snap.trade.seq.wrapping_add(1);
-                                snap.trade.ts_ns = Some(ts);
-                                snap.trade.direction = Some(direction);
-                                snap.trade.bid_levels = [None; 3];
-                                snap.trade.ask_levels = [None; 3];
-                                snap.trade.received_at = Some(f.recv_instant);
+                            let trade_ts = trade.ts;
+                            match feed_gate.evaluate(
+                                ExchangeFeed::Bybit,
+                                FeedKind::Trades,
+                                trade_ts,
+                            ) {
+                                GateDecision::Accept => {
+                                    let px = (trade.px as f64)
+                                        / crate::exchanges::bybit_book::PRICE_SCALE;
+                                    demean.record_other(
+                                        ExchangeKind::Bybit,
+                                        Some(trade_ts),
+                                        Some(px),
+                                    );
+                                    let direction = if trade.is_buyer_maker {
+                                        TradeDirection::Sell
+                                    } else {
+                                        TradeDirection::Buy
+                                    };
+                                    {
+                                        let mut st = lock_state();
+                                        let snap = &mut st.bybit;
+                                        snap.trade.price = Some(px);
+                                        snap.trade.seq = snap.trade.seq.wrapping_add(1);
+                                        snap.trade.ts_ns = Some(trade_ts);
+                                        snap.trade.direction = Some(direction);
+                                        snap.trade.bid_levels = [None; 3];
+                                        snap.trade.ask_levels = [None; 3];
+                                        snap.trade.received_at = Some(f.recv_instant);
 
-                                let qty = (trade.qty as f64).abs()
-                                    / crate::exchanges::bybit_book::QTY_SCALE;
-                                snap.trade_events.push_back(TradeEvent {
-                                    ts_ns: ts,
-                                    price: px,
-                                    direction: Some(direction),
-                                    quantity: Some(qty),
-                                });
-                                if snap.trade_events.len() > 256 {
-                                    snap.trade_events.pop_front();
+                                        let qty = (trade.qty as f64).abs()
+                                            / crate::exchanges::bybit_book::QTY_SCALE;
+                                        snap.trade_events.push_back(TradeEvent {
+                                            ts_ns: trade_ts,
+                                            price: px,
+                                            direction: Some(direction),
+                                            quantity: Some(qty),
+                                        });
+                                        if snap.trade_events.len() > 256 {
+                                            snap.trade_events.pop_front();
+                                        }
+                                    }
+                                    publisher.publish();
+                                }
+                                GateDecision::Reject {
+                                    last_ts,
+                                    reject_count,
+                                } => {
+                                    log_stale_update(
+                                        ExchangeFeed::Bybit,
+                                        FeedKind::Trades,
+                                        trade_ts,
+                                        last_ts,
+                                        reject_count,
+                                    );
                                 }
                             }
-                            publisher.publish();
                         }
                     }
                     if let Some((_, ticker)) = bybit::update_tickers(s, &mut bybit_tickers) {
@@ -416,19 +559,44 @@ pub fn spawn_state_engine(
                     #[cfg(feature = "binance_book")]
                     if let Some((_feed, _)) = binance::events_for_book(s, &mut binance_book) {
                         if let Some(mid) = binance_book.mid_price_f64() {
-                            demean.record_other(ExchangeKind::Binance, Some(ts), Some(mid));
-                            let (bid_vec, ask_vec) = binance_book.top_levels_f64(3);
-                            let bid_levels = levels_to_array(&bid_vec);
-                            let ask_levels = levels_to_array(&ask_vec);
-                            let mut st = lock_state();
-                            let snap = &mut st.binance.orderbook;
-                            snap.price = Some(mid);
-                            snap.seq = snap.seq.wrapping_add(1);
-                            snap.ts_ns = Some(ts);
-                            snap.bid_levels = bid_levels;
-                            snap.ask_levels = ask_levels;
-                            snap.direction = None;
-                            snap.received_at = Some(f.recv_instant);
+                            let ob_ts = binance_book.last_ts();
+                            match feed_gate.evaluate(
+                                ExchangeFeed::Binance,
+                                FeedKind::OrderBook,
+                                ob_ts,
+                            ) {
+                                GateDecision::Accept => {
+                                    demean.record_other(
+                                        ExchangeKind::Binance,
+                                        Some(ob_ts),
+                                        Some(mid),
+                                    );
+                                    let (bid_vec, ask_vec) = binance_book.top_levels_f64(3);
+                                    let bid_levels = levels_to_array(&bid_vec);
+                                    let ask_levels = levels_to_array(&ask_vec);
+                                    let mut st = lock_state();
+                                    let snap = &mut st.binance.orderbook;
+                                    snap.price = Some(mid);
+                                    snap.seq = snap.seq.wrapping_add(1);
+                                    snap.ts_ns = Some(ob_ts);
+                                    snap.bid_levels = bid_levels;
+                                    snap.ask_levels = ask_levels;
+                                    snap.direction = None;
+                                    snap.received_at = Some(f.recv_instant);
+                                }
+                                GateDecision::Reject {
+                                    last_ts,
+                                    reject_count,
+                                } => {
+                                    log_stale_update(
+                                        ExchangeFeed::Binance,
+                                        FeedKind::OrderBook,
+                                        ob_ts,
+                                        last_ts,
+                                        reject_count,
+                                    );
+                                }
+                            }
                         }
                     }
                     if binance::update_bbo_store(s, &mut binance_bbo) {
@@ -442,72 +610,122 @@ pub fn spawn_state_engine(
                                     .and_then(|symbol| binance_bbo.get(symbol).copied())
                             });
                             #[cfg(feature = "binance_book")]
-                            let (bid_levels, ask_levels) = if let Some(e) = entry {
-                                (
-                                    level_from_option(Some((e.bid_px, e.bid_qty))),
-                                    level_from_option(Some((e.ask_px, e.ask_qty))),
-                                )
-                            } else {
-                                let (bid_vec, ask_vec) = binance_book.top_levels_f64(1);
-                                (levels_to_array(&bid_vec), levels_to_array(&ask_vec))
-                            };
+                            let fallback_ts = binance_book.last_ts();
                             #[cfg(not(feature = "binance_book"))]
-                            let (bid_levels, ask_levels) = if let Some(e) = entry {
-                                (
-                                    level_from_option(Some((e.bid_px, e.bid_qty))),
-                                    level_from_option(Some((e.ask_px, e.ask_qty))),
-                                )
-                            } else {
-                                ([None; 3], [None; 3])
-                            };
-                            demean.record_other(ExchangeKind::Binance, Some(ts), Some(mid));
-                            {
-                                let mut st = lock_state();
-                                let snap = &mut st.binance.bbo;
-                                snap.price = Some(mid);
-                                snap.seq = snap.seq.wrapping_add(1);
-                                snap.ts_ns = Some(ts);
-                                snap.bid_levels = bid_levels;
-                                snap.ask_levels = ask_levels;
-                                snap.direction = None;
-                                snap.received_at = Some(f.recv_instant);
+                            let fallback_ts = 0;
+                            let bbo_ts = entry.map(|e| e.ts).unwrap_or(fallback_ts);
+                            match feed_gate.evaluate(ExchangeFeed::Binance, FeedKind::Bbo, bbo_ts) {
+                                GateDecision::Accept => {
+                                    demean.record_other(
+                                        ExchangeKind::Binance,
+                                        Some(bbo_ts),
+                                        Some(mid),
+                                    );
+                                    #[cfg(feature = "binance_book")]
+                                    let (bid_levels, ask_levels) = if let Some(e) = entry {
+                                        (
+                                            level_from_option(Some((e.bid_px, e.bid_qty))),
+                                            level_from_option(Some((e.ask_px, e.ask_qty))),
+                                        )
+                                    } else {
+                                        let (bid_vec, ask_vec) = binance_book.top_levels_f64(1);
+                                        (levels_to_array(&bid_vec), levels_to_array(&ask_vec))
+                                    };
+                                    #[cfg(not(feature = "binance_book"))]
+                                    let (bid_levels, ask_levels) = if let Some(e) = entry {
+                                        (
+                                            level_from_option(Some((e.bid_px, e.bid_qty))),
+                                            level_from_option(Some((e.ask_px, e.ask_qty))),
+                                        )
+                                    } else {
+                                        ([None; 3], [None; 3])
+                                    };
+                                    {
+                                        let mut st = lock_state();
+                                        let snap = &mut st.binance.bbo;
+                                        snap.price = Some(mid);
+                                        snap.seq = snap.seq.wrapping_add(1);
+                                        snap.ts_ns = Some(bbo_ts);
+                                        snap.bid_levels = bid_levels;
+                                        snap.ask_levels = ask_levels;
+                                        snap.direction = None;
+                                        snap.received_at = Some(f.recv_instant);
+                                    }
+                                    publisher.publish();
+                                }
+                                GateDecision::Reject {
+                                    last_ts,
+                                    reject_count,
+                                } => {
+                                    log_stale_update(
+                                        ExchangeFeed::Binance,
+                                        FeedKind::Bbo,
+                                        bbo_ts,
+                                        last_ts,
+                                        reject_count,
+                                    );
+                                }
                             }
-                            publisher.publish();
                         }
                     }
                     let new_trades = binance::update_trades(s, &mut binance_trades);
                     if new_trades > 0 {
                         for trade in binance_trades.iter_last(new_trades) {
-                            let px = (trade.px as f64) / binance::PRICE_SCALE;
-                            demean.record_other(ExchangeKind::Binance, Some(ts), Some(px));
-                            let direction = if trade.is_buyer_maker {
-                                TradeDirection::Sell
-                            } else {
-                                TradeDirection::Buy
-                            };
-                            {
-                                let mut st = lock_state();
-                                let snap = &mut st.binance;
-                                snap.trade.price = Some(px);
-                                snap.trade.seq = snap.trade.seq.wrapping_add(1);
-                                snap.trade.ts_ns = Some(ts);
-                                snap.trade.direction = Some(direction);
-                                snap.trade.bid_levels = [None; 3];
-                                snap.trade.ask_levels = [None; 3];
-                                snap.trade.received_at = Some(f.recv_instant);
+                            let trade_ts = trade.ts;
+                            match feed_gate.evaluate(
+                                ExchangeFeed::Binance,
+                                FeedKind::Trades,
+                                trade_ts,
+                            ) {
+                                GateDecision::Accept => {
+                                    let px = (trade.px as f64) / binance::PRICE_SCALE;
+                                    demean.record_other(
+                                        ExchangeKind::Binance,
+                                        Some(trade_ts),
+                                        Some(px),
+                                    );
+                                    let direction = if trade.is_buyer_maker {
+                                        TradeDirection::Sell
+                                    } else {
+                                        TradeDirection::Buy
+                                    };
+                                    {
+                                        let mut st = lock_state();
+                                        let snap = &mut st.binance;
+                                        snap.trade.price = Some(px);
+                                        snap.trade.seq = snap.trade.seq.wrapping_add(1);
+                                        snap.trade.ts_ns = Some(trade_ts);
+                                        snap.trade.direction = Some(direction);
+                                        snap.trade.bid_levels = [None; 3];
+                                        snap.trade.ask_levels = [None; 3];
+                                        snap.trade.received_at = Some(f.recv_instant);
 
-                                let qty = (trade.qty as f64).abs() / binance::QTY_SCALE;
-                                snap.trade_events.push_back(TradeEvent {
-                                    ts_ns: ts,
-                                    price: px,
-                                    direction: Some(direction),
-                                    quantity: Some(qty),
-                                });
-                                if snap.trade_events.len() > 256 {
-                                    snap.trade_events.pop_front();
+                                        let qty = (trade.qty as f64).abs() / binance::QTY_SCALE;
+                                        snap.trade_events.push_back(TradeEvent {
+                                            ts_ns: trade_ts,
+                                            price: px,
+                                            direction: Some(direction),
+                                            quantity: Some(qty),
+                                        });
+                                        if snap.trade_events.len() > 256 {
+                                            snap.trade_events.pop_front();
+                                        }
+                                    }
+                                    publisher.publish();
+                                }
+                                GateDecision::Reject {
+                                    last_ts,
+                                    reject_count,
+                                } => {
+                                    log_stale_update(
+                                        ExchangeFeed::Binance,
+                                        FeedKind::Trades,
+                                        trade_ts,
+                                        last_ts,
+                                        reject_count,
+                                    );
                                 }
                             }
-                            publisher.publish();
                         }
                     }
                     if let Some((_, ticker)) = binance::update_tickers(s, &mut binance_tickers) {
@@ -577,23 +795,50 @@ pub fn spawn_state_engine(
                     for (feed, _) in gate::events_for(s, &mut gate_book) {
                         if feed == "orderbook" {
                             if let Some(mid) = gate_book.mid_price_f64() {
-                                let (bid_vec, ask_vec) = gate_book.top_levels_f64(3);
-                                let bid_levels = levels_to_array(&bid_vec);
-                                let ask_levels = levels_to_array(&ask_vec);
-                                {
-                                    let mut st = lock_state();
-                                    let snap = &mut st.gate.orderbook;
-                                    snap.price = Some(mid);
-                                    snap.seq = snap.seq.wrapping_add(1);
-                                    snap.ts_ns = Some(ts);
-                                    snap.bid_levels = bid_levels;
-                                    snap.ask_levels = ask_levels;
-                                    snap.direction = None;
-                                    snap.received_at = Some(f.recv_instant);
+                                let ob_ts = gate_book.last_ts();
+                                match feed_gate.evaluate(
+                                    ExchangeFeed::Gate,
+                                    FeedKind::OrderBook,
+                                    ob_ts,
+                                ) {
+                                    GateDecision::Accept => {
+                                        send_fast_event(
+                                            mid,
+                                            "gate_orderbook",
+                                            Some(ob_ts),
+                                            f.recv_instant,
+                                        );
+                                        let (bid_vec, ask_vec) = gate_book.top_levels_f64(3);
+                                        let bid_levels = levels_to_array(&bid_vec);
+                                        let ask_levels = levels_to_array(&ask_vec);
+                                        {
+                                            let mut st = lock_state();
+                                            let snap = &mut st.gate.orderbook;
+                                            snap.price = Some(mid);
+                                            snap.seq = snap.seq.wrapping_add(1);
+                                            snap.ts_ns = Some(ob_ts);
+                                            snap.bid_levels = bid_levels;
+                                            snap.ask_levels = ask_levels;
+                                            snap.direction = None;
+                                            snap.received_at = Some(f.recv_instant);
+                                        }
+                                        let updates = demean.on_gate_event(Some(ob_ts), Some(mid));
+                                        apply_demean(&updates);
+                                        publisher.publish();
+                                    }
+                                    GateDecision::Reject {
+                                        last_ts,
+                                        reject_count,
+                                    } => {
+                                        log_stale_update(
+                                            ExchangeFeed::Gate,
+                                            FeedKind::OrderBook,
+                                            ob_ts,
+                                            last_ts,
+                                            reject_count,
+                                        );
+                                    }
                                 }
-                                let updates = demean.on_gate_event(Some(ts), Some(mid));
-                                apply_demean(&updates);
-                                publisher.publish();
                             }
                         }
                     }
@@ -607,65 +852,107 @@ pub fn spawn_state_engine(
                                     .last_symbol()
                                     .and_then(|symbol| gate_bbo.get(symbol).copied())
                             });
-                            let (bid_levels, ask_levels) = if let Some(e) = entry {
-                                (
-                                    level_from_option(Some((e.bid_px, e.bid_qty))),
-                                    level_from_option(Some((e.ask_px, e.ask_qty))),
-                                )
-                            } else {
-                                let (bid_vec, ask_vec) = gate_book.top_levels_f64(1);
-                                (levels_to_array(&bid_vec), levels_to_array(&ask_vec))
-                            };
-                            {
-                                let mut st = lock_state();
-                                let snap = &mut st.gate.bbo;
-                                snap.price = Some(mid);
-                                snap.seq = snap.seq.wrapping_add(1);
-                                snap.ts_ns = Some(ts);
-                                snap.bid_levels = bid_levels;
-                                snap.ask_levels = ask_levels;
-                                snap.direction = None;
-                                snap.received_at = Some(f.recv_instant);
+                            let bbo_ts = entry.map(|e| e.ts).unwrap_or_else(|| gate_book.last_ts());
+                            match feed_gate.evaluate(ExchangeFeed::Gate, FeedKind::Bbo, bbo_ts) {
+                                GateDecision::Accept => {
+                                    send_fast_event(mid, "gate_bbo", Some(bbo_ts), f.recv_instant);
+                                    let (bid_levels, ask_levels) = if let Some(e) = entry {
+                                        (
+                                            level_from_option(Some((e.bid_px, e.bid_qty))),
+                                            level_from_option(Some((e.ask_px, e.ask_qty))),
+                                        )
+                                    } else {
+                                        let (bid_vec, ask_vec) = gate_book.top_levels_f64(1);
+                                        (levels_to_array(&bid_vec), levels_to_array(&ask_vec))
+                                    };
+                                    {
+                                        let mut st = lock_state();
+                                        let snap = &mut st.gate.bbo;
+                                        snap.price = Some(mid);
+                                        snap.seq = snap.seq.wrapping_add(1);
+                                        snap.ts_ns = Some(bbo_ts);
+                                        snap.bid_levels = bid_levels;
+                                        snap.ask_levels = ask_levels;
+                                        snap.direction = None;
+                                        snap.received_at = Some(f.recv_instant);
+                                    }
+                                    let updates = demean.on_gate_event(Some(bbo_ts), Some(mid));
+                                    apply_demean(&updates);
+                                    publisher.publish();
+                                }
+                                GateDecision::Reject {
+                                    last_ts,
+                                    reject_count,
+                                } => {
+                                    log_stale_update(
+                                        ExchangeFeed::Gate,
+                                        FeedKind::Bbo,
+                                        bbo_ts,
+                                        last_ts,
+                                        reject_count,
+                                    );
+                                }
                             }
-                            let updates = demean.on_gate_event(Some(ts), Some(mid));
-                            apply_demean(&updates);
-                            publisher.publish();
                         }
                     }
                     let new_trades = gate::update_trades(s, &mut gate_trades);
                     if new_trades > 0 {
                         for trade in gate_trades.iter_last(new_trades) {
-                            let px = (trade.px as f64) / gate::PRICE_SCALE;
-                            let direction = if trade.is_buyer_maker {
-                                TradeDirection::Sell
-                            } else {
-                                TradeDirection::Buy
-                            };
+                            let trade_ts = trade.ts;
+                            match feed_gate.evaluate(ExchangeFeed::Gate, FeedKind::Trades, trade_ts)
                             {
-                                let mut st = lock_state();
-                                let snap = &mut st.gate;
-                                snap.trade.price = Some(px);
-                                snap.trade.seq = snap.trade.seq.wrapping_add(1);
-                                snap.trade.ts_ns = Some(ts);
-                                snap.trade.direction = Some(direction);
-                                snap.trade.bid_levels = [None; 3];
-                                snap.trade.ask_levels = [None; 3];
-                                snap.trade.received_at = Some(f.recv_instant);
+                                GateDecision::Accept => {
+                                    let px = (trade.px as f64) / gate::PRICE_SCALE;
+                                    send_fast_event(
+                                        px,
+                                        "gate_trade",
+                                        Some(trade_ts),
+                                        f.recv_instant,
+                                    );
+                                    let direction = if trade.is_buyer_maker {
+                                        TradeDirection::Sell
+                                    } else {
+                                        TradeDirection::Buy
+                                    };
+                                    {
+                                        let mut st = lock_state();
+                                        let snap = &mut st.gate;
+                                        snap.trade.price = Some(px);
+                                        snap.trade.seq = snap.trade.seq.wrapping_add(1);
+                                        snap.trade.ts_ns = Some(trade_ts);
+                                        snap.trade.direction = Some(direction);
+                                        snap.trade.bid_levels = [None; 3];
+                                        snap.trade.ask_levels = [None; 3];
+                                        snap.trade.received_at = Some(f.recv_instant);
 
-                                let qty = (trade.qty as f64).abs() / gate::QTY_SCALE;
-                                snap.trade_events.push_back(TradeEvent {
-                                    ts_ns: ts,
-                                    price: px,
-                                    direction: Some(direction),
-                                    quantity: Some(qty),
-                                });
-                                if snap.trade_events.len() > 256 {
-                                    snap.trade_events.pop_front();
+                                        let qty = (trade.qty as f64).abs() / gate::QTY_SCALE;
+                                        snap.trade_events.push_back(TradeEvent {
+                                            ts_ns: trade_ts,
+                                            price: px,
+                                            direction: Some(direction),
+                                            quantity: Some(qty),
+                                        });
+                                        if snap.trade_events.len() > 256 {
+                                            snap.trade_events.pop_front();
+                                        }
+                                    }
+                                    let updates = demean.on_gate_event(Some(trade_ts), Some(px));
+                                    apply_demean(&updates);
+                                    publisher.publish();
+                                }
+                                GateDecision::Reject {
+                                    last_ts,
+                                    reject_count,
+                                } => {
+                                    log_stale_update(
+                                        ExchangeFeed::Gate,
+                                        FeedKind::Trades,
+                                        trade_ts,
+                                        last_ts,
+                                        reject_count,
+                                    );
                                 }
                             }
-                            let updates = demean.on_gate_event(Some(ts), Some(px));
-                            apply_demean(&updates);
-                            publisher.publish();
                         }
                     }
                     if let Some((symbol, mut ticker)) = gate::update_tickers(s, &mut gate_tickers) {
@@ -776,19 +1063,44 @@ pub fn spawn_state_engine(
                     for (feed, _) in bitget::events_for(s, &mut bitget_book) {
                         if feed == "orderbook" {
                             if let Some(mid) = bitget_book.mid_price_f64() {
-                                demean.record_other(ExchangeKind::Bitget, Some(ts), Some(mid));
-                                let (bid_vec, ask_vec) = bitget_book.top_levels_f64(3);
-                                let bid_levels = levels_to_array(&bid_vec);
-                                let ask_levels = levels_to_array(&ask_vec);
-                                let mut st = lock_state();
-                                let snap = &mut st.bitget.orderbook;
-                                snap.price = Some(mid);
-                                snap.seq = snap.seq.wrapping_add(1);
-                                snap.ts_ns = Some(ts);
-                                snap.bid_levels = bid_levels;
-                                snap.ask_levels = ask_levels;
-                                snap.direction = None;
-                                snap.received_at = Some(f.recv_instant);
+                                let ob_ts = bitget_book.last_ts();
+                                match feed_gate.evaluate(
+                                    ExchangeFeed::Bitget,
+                                    FeedKind::OrderBook,
+                                    ob_ts,
+                                ) {
+                                    GateDecision::Accept => {
+                                        demean.record_other(
+                                            ExchangeKind::Bitget,
+                                            Some(ob_ts),
+                                            Some(mid),
+                                        );
+                                        let (bid_vec, ask_vec) = bitget_book.top_levels_f64(3);
+                                        let bid_levels = levels_to_array(&bid_vec);
+                                        let ask_levels = levels_to_array(&ask_vec);
+                                        let mut st = lock_state();
+                                        let snap = &mut st.bitget.orderbook;
+                                        snap.price = Some(mid);
+                                        snap.seq = snap.seq.wrapping_add(1);
+                                        snap.ts_ns = Some(ob_ts);
+                                        snap.bid_levels = bid_levels;
+                                        snap.ask_levels = ask_levels;
+                                        snap.direction = None;
+                                        snap.received_at = Some(f.recv_instant);
+                                    }
+                                    GateDecision::Reject {
+                                        last_ts,
+                                        reject_count,
+                                    } => {
+                                        log_stale_update(
+                                            ExchangeFeed::Bitget,
+                                            FeedKind::OrderBook,
+                                            ob_ts,
+                                            last_ts,
+                                            reject_count,
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -802,63 +1114,110 @@ pub fn spawn_state_engine(
                                     .last_symbol()
                                     .and_then(|symbol| bitget_bbo.get(symbol).copied())
                             });
-                            let (bid_levels, ask_levels) = if let Some(e) = entry {
-                                (
-                                    level_from_option(Some((e.bid_px, e.bid_qty))),
-                                    level_from_option(Some((e.ask_px, e.ask_qty))),
-                                )
-                            } else {
-                                let (bid_vec, ask_vec) = bitget_book.top_levels_f64(1);
-                                (levels_to_array(&bid_vec), levels_to_array(&ask_vec))
-                            };
-                            demean.record_other(ExchangeKind::Bitget, Some(ts), Some(mid));
-                            {
-                                let mut st = lock_state();
-                                let snap = &mut st.bitget.bbo;
-                                snap.price = Some(mid);
-                                snap.seq = snap.seq.wrapping_add(1);
-                                snap.ts_ns = Some(ts);
-                                snap.bid_levels = bid_levels;
-                                snap.ask_levels = ask_levels;
-                                snap.direction = None;
-                                snap.received_at = Some(f.recv_instant);
+                            let bbo_ts =
+                                entry.map(|e| e.ts).unwrap_or_else(|| bitget_book.last_ts());
+                            match feed_gate.evaluate(ExchangeFeed::Bitget, FeedKind::Bbo, bbo_ts) {
+                                GateDecision::Accept => {
+                                    demean.record_other(
+                                        ExchangeKind::Bitget,
+                                        Some(bbo_ts),
+                                        Some(mid),
+                                    );
+                                    let (bid_levels, ask_levels) = if let Some(e) = entry {
+                                        (
+                                            level_from_option(Some((e.bid_px, e.bid_qty))),
+                                            level_from_option(Some((e.ask_px, e.ask_qty))),
+                                        )
+                                    } else {
+                                        let (bid_vec, ask_vec) = bitget_book.top_levels_f64(1);
+                                        (levels_to_array(&bid_vec), levels_to_array(&ask_vec))
+                                    };
+                                    {
+                                        let mut st = lock_state();
+                                        let snap = &mut st.bitget.bbo;
+                                        snap.price = Some(mid);
+                                        snap.seq = snap.seq.wrapping_add(1);
+                                        snap.ts_ns = Some(bbo_ts);
+                                        snap.bid_levels = bid_levels;
+                                        snap.ask_levels = ask_levels;
+                                        snap.direction = None;
+                                        snap.received_at = Some(f.recv_instant);
+                                    }
+                                    publisher.publish();
+                                }
+                                GateDecision::Reject {
+                                    last_ts,
+                                    reject_count,
+                                } => {
+                                    log_stale_update(
+                                        ExchangeFeed::Bitget,
+                                        FeedKind::Bbo,
+                                        bbo_ts,
+                                        last_ts,
+                                        reject_count,
+                                    );
+                                }
                             }
-                            publisher.publish();
                         }
                     }
                     let new_trades = bitget::update_trades(s, &mut bitget_trades);
                     if new_trades > 0 {
                         for trade in bitget_trades.iter_last(new_trades) {
-                            let px = (trade.px as f64) / bitget::PRICE_SCALE;
-                            demean.record_other(ExchangeKind::Bitget, Some(ts), Some(px));
-                            let direction = if trade.is_buyer_maker {
-                                TradeDirection::Sell
-                            } else {
-                                TradeDirection::Buy
-                            };
-                            {
-                                let mut st = lock_state();
-                                let snap = &mut st.bitget;
-                                snap.trade.price = Some(px);
-                                snap.trade.seq = snap.trade.seq.wrapping_add(1);
-                                snap.trade.ts_ns = Some(ts);
-                                snap.trade.direction = Some(direction);
-                                snap.trade.bid_levels = [None; 3];
-                                snap.trade.ask_levels = [None; 3];
-                                snap.trade.received_at = Some(f.recv_instant);
+                            let trade_ts = trade.ts;
+                            match feed_gate.evaluate(
+                                ExchangeFeed::Bitget,
+                                FeedKind::Trades,
+                                trade_ts,
+                            ) {
+                                GateDecision::Accept => {
+                                    let px = (trade.px as f64) / bitget::PRICE_SCALE;
+                                    demean.record_other(
+                                        ExchangeKind::Bitget,
+                                        Some(trade_ts),
+                                        Some(px),
+                                    );
+                                    let direction = if trade.is_buyer_maker {
+                                        TradeDirection::Sell
+                                    } else {
+                                        TradeDirection::Buy
+                                    };
+                                    {
+                                        let mut st = lock_state();
+                                        let snap = &mut st.bitget;
+                                        snap.trade.price = Some(px);
+                                        snap.trade.seq = snap.trade.seq.wrapping_add(1);
+                                        snap.trade.ts_ns = Some(trade_ts);
+                                        snap.trade.direction = Some(direction);
+                                        snap.trade.bid_levels = [None; 3];
+                                        snap.trade.ask_levels = [None; 3];
+                                        snap.trade.received_at = Some(f.recv_instant);
 
-                                let qty = (trade.qty as f64).abs() / bitget::QTY_SCALE;
-                                snap.trade_events.push_back(TradeEvent {
-                                    ts_ns: ts,
-                                    price: px,
-                                    direction: Some(direction),
-                                    quantity: Some(qty),
-                                });
-                                if snap.trade_events.len() > 256 {
-                                    snap.trade_events.pop_front();
+                                        let qty = (trade.qty as f64).abs() / bitget::QTY_SCALE;
+                                        snap.trade_events.push_back(TradeEvent {
+                                            ts_ns: trade_ts,
+                                            price: px,
+                                            direction: Some(direction),
+                                            quantity: Some(qty),
+                                        });
+                                        if snap.trade_events.len() > 256 {
+                                            snap.trade_events.pop_front();
+                                        }
+                                    }
+                                    publisher.publish();
+                                }
+                                GateDecision::Reject {
+                                    last_ts,
+                                    reject_count,
+                                } => {
+                                    log_stale_update(
+                                        ExchangeFeed::Bitget,
+                                        FeedKind::Trades,
+                                        trade_ts,
+                                        last_ts,
+                                        reject_count,
+                                    );
                                 }
                             }
-                            publisher.publish();
                         }
                     }
                     if let Some((_, ticker)) = bitget::update_tickers(s, &mut bitget_tickers) {

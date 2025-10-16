@@ -1,11 +1,12 @@
 use crate::base_classes::bbo_store::BboStore;
 use crate::base_classes::tickers::{TickerSnapshot, TickerStore};
 use crate::base_classes::trades::{FixedTrades, Trade};
-use crate::base_classes::types::{Price, Qty, Ts};
+use crate::base_classes::types::{Price, Qty};
 use crate::collectors::helpers::{find_first_bool, find_first_number, find_json_string};
 use crate::exchanges::bybit_book::{
     BybitBook, BybitData, BybitDataCont, BybitMsg, PRICE_SCALE, QTY_SCALE,
 };
+use crate::utils::time::ms_to_ns;
 use serde_json::{self, Value};
 
 pub fn events_for<const N: usize>(s: &str, book: &mut BybitBook<N>) -> Vec<(&'static str, f64)> {
@@ -68,7 +69,7 @@ pub fn update_bbo_store(s: &str, store: &mut BboStore) -> bool {
                             let bid_qty = b[1].parse::<f64>().unwrap_or(0.0);
                             let ask_qty = a[1].parse::<f64>().unwrap_or(0.0);
                             let raw_ts = if d.ts != 0 { d.ts } else { msg.ts.unwrap_or(0) };
-                            let ts_ns = (raw_ts as u128 * 1_000_000) as Ts;
+                            let ts_ns = ms_to_ns(raw_ts);
                             if let Some(symbol) = topic.rsplit('.').next() {
                                 store.update(symbol, bid, bid_qty, ask, ask_qty, ts_ns);
                                 return true;
@@ -110,12 +111,12 @@ pub fn update_trades<const N: usize>(s: &str, trades: &mut FixedTrades<N>) -> us
 
                 let px_i = (price.unwrap() * PRICE_SCALE).round() as Price;
                 let qty_i = (size.unwrap() * QTY_SCALE).round() as Qty;
-                let ts = entry
+                let ts_ms = entry
                     .get("T")
                     .and_then(|v| v.as_u64())
                     .or_else(|| find_first_number(s, &["ts", "T"]).map(|v| v as u64))
-                    .unwrap_or_else(|| value.get("ts").and_then(|v| v.as_u64()).unwrap_or(0))
-                    as Ts;
+                    .unwrap_or_else(|| value.get("ts").and_then(|v| v.as_u64()).unwrap_or(0));
+                let ts = ms_to_ns(ts_ms);
                 // Prefer explicit taker side (`S`/`side`) and fall back to legacy buyer/taker flag.
                 let is_buyer_maker = entry
                     .get("S")
@@ -212,7 +213,7 @@ pub fn update_tickers(s: &str, store: &mut TickerStore) -> Option<(String, Ticke
     if let Some(ts_ms) =
         value_to_u64(payload, &["ts"]).or_else(|| root.get("ts").and_then(|v| v.as_u64()))
     {
-        snapshot.ticker.ts = (ts_ms as u128 * 1_000_000) as Ts;
+        snapshot.ticker.ts = ms_to_ns(ts_ms);
     }
 
     let stored = store.update(symbol.to_string(), snapshot);
@@ -309,5 +310,30 @@ mod tests {
         assert_eq!(snap.open_interest_value, Some(1234.5));
         assert_ne!(snap.ticker.seq, 0);
         assert_eq!(snap.ticker.ts, 1_700_000_000_000_000_000);
+    }
+
+    #[test]
+    fn test_update_trades_uses_exchange_ts_ns() {
+        let json = r#"{
+            "topic":"publicTrade.BTCUSDT",
+            "data":[{
+                "p":"43000",
+                "v":"0.5",
+                "T":1700000000123,
+                "S":"Sell",
+                "t":"101"
+            }]
+        }"#;
+
+        let mut trades = FixedTrades::<4>::default();
+        let inserted = update_trades(json, &mut trades);
+        assert_eq!(inserted, 1);
+
+        let last = trades.last().expect("trade stored");
+        assert_eq!(last.seq, 101);
+        assert!(last.is_buyer_maker);
+        assert_eq!(last.ts, 1_700_000_000_123_000_000);
+        assert_eq!(last.px, (43_000f64 * PRICE_SCALE).round() as Price);
+        assert_eq!(last.qty, (0.5f64 * QTY_SCALE).round() as Qty);
     }
 }

@@ -64,7 +64,7 @@ fn main() {
         .nth(2)
         .unwrap_or_else(|| "all_exchanges_depth.csv".to_string());
 
-    let _engine = spawn_state_engine(symbol.clone(), None);
+    let _engine = spawn_state_engine(symbol.clone(), None, None);
 
     eprintln!(
         "Collecting orderbook top levels + trades for {symbol} to {out_path}. Ctrl-C to stop.",

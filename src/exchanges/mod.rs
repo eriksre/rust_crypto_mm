@@ -30,10 +30,10 @@ pub mod gate;
 // Backwards compatibility: Re-export for code using old flat structure
 #[cfg(feature = "binance_book")]
 pub use binance::orderbook as binance_book;
-#[cfg(feature = "binance_book")]
-pub use binance::rest as binance_get;
 #[cfg(feature = "parse_binance")]
 pub use binance::parsed as binance_parsed;
+#[cfg(feature = "binance_book")]
+pub use binance::rest as binance_get;
 
 #[cfg(feature = "bitget_book")]
 pub use bitget::orderbook as bitget_book;

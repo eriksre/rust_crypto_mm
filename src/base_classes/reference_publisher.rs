@@ -39,7 +39,10 @@ impl ReferencePublisher {
                 Ok(st) => Self::select_candidate(&st),
                 Err(poisoned) => {
                     // LOUD FAILURE: State lock poisoned - this should never happen
-                    eprintln!("FATAL: State lock poisoned in ReferencePublisher: {}", poisoned);
+                    eprintln!(
+                        "FATAL: State lock poisoned in ReferencePublisher: {}",
+                        poisoned
+                    );
                     panic!("State lock poisoned - cannot continue safely");
                 }
             }

@@ -146,4 +146,3 @@ fn extract_position_contracts(value: &Value) -> Option<f64> {
     }
     None
 }
-

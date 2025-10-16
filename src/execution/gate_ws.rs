@@ -18,9 +18,9 @@ use crate::base_classes::state::{TradeDirection, state};
 use crate::base_classes::types::Side;
 use crate::exchanges::gate_rest;
 use crate::exchanges::{endpoints::GateioWs, gate_sign};
-use crate::utils::parsing::{value_to_f64, value_to_string, value_to_u64, extract_user_id};
-use crate::utils::time::{current_unix_ts, current_unix_ms};
 use crate::utils::math::format_price;
+use crate::utils::parsing::{extract_user_id, value_to_f64, value_to_string, value_to_u64};
+use crate::utils::time::{current_unix_ms, current_unix_ts};
 
 use super::gateway::ExecutionGateway;
 use super::types::{
@@ -285,10 +285,15 @@ impl GateWsWorker {
             let mut st = match state().lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => {
-                    eprintln!("FATAL: State lock poisoned in Gate user trades handler: {}", poisoned);
+                    eprintln!(
+                        "FATAL: State lock poisoned in Gate user trades handler: {}",
+                        poisoned
+                    );
                     eprintln!("This indicates a panic occurred while holding the state lock.");
-                    eprintln!("User trade: price={:?}, contracts={}, order_id={:?}",
-                              price, size_contracts, order_id_for_state);
+                    eprintln!(
+                        "User trade: price={:?}, contracts={}, order_id={:?}",
+                        price, size_contracts, order_id_for_state
+                    );
                     panic!("State lock poisoned - cannot process user trades safely");
                 }
             };
@@ -1027,4 +1032,3 @@ fn sign_subscribe(secret: &str, channel: &str, ts: i64) -> String {
     let payload = format!("channel={channel}&event=subscribe&time={ts}");
     gate_sign::hmac_sha512_hex(secret, &payload)
 }
-

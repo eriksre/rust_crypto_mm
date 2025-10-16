@@ -4,6 +4,7 @@ use crate::base_classes::order_book::ArrayOrderBook;
 use crate::base_classes::orderbook_trait::OrderBookOps;
 use crate::base_classes::types::*;
 use crate::exchanges::binance_get::{BinanceSnapshot, get_orderbook_snapshot};
+use crate::utils::time::ms_to_ns;
 
 #[cfg(feature = "parse_binance")]
 use crate::exchanges::binance_parsed::DepthUpdate;
@@ -85,6 +86,11 @@ impl<const N: usize> BinanceBook<N> {
     }
 
     #[inline(always)]
+    pub fn last_ts(&self) -> Ts {
+        self.book.ts
+    }
+
+    #[inline(always)]
     pub fn top_levels_f64(&self, depth: usize) -> (Vec<(f64, f64)>, Vec<(f64, f64)>) {
         let mut bids = Vec::with_capacity(depth.min(self.book.len_bids()));
         let mut asks = Vec::with_capacity(depth.min(self.book.len_asks()));
@@ -139,7 +145,7 @@ impl<const N: usize> BinanceBook<N> {
 
         self.last_update_id = d.u;
 
-        let ts = (d.E as u128 * 1_000_000) as Ts; // event time in ns
+        let ts = ms_to_ns(d.E); // event time in ns
         let seq = d.u as Seq;
         let bids: Vec<(Price, Qty)> =
             d.b.iter()

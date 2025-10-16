@@ -40,6 +40,12 @@ pub fn current_unix_seconds_string() -> String {
     format!("{}.{:09}", secs, nanos)
 }
 
+/// Converts an exchange-supplied millisecond timestamp to nanoseconds, saturating on overflow.
+#[inline]
+pub fn ms_to_ns(ts_ms: u64) -> u64 {
+    ((ts_ms as u128).saturating_mul(1_000_000)).min(u64::MAX as u128) as u64
+}
+
 /// Converts a Duration to microseconds.
 #[inline]
 pub fn dur_us(d: Duration) -> u128 {
@@ -89,5 +95,17 @@ mod tests {
         let parts: Vec<&str> = s.split('.').collect();
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[1].len(), 9); // 9 nanosecond digits
+    }
+
+    #[test]
+    fn test_ms_to_ns_basic() {
+        assert_eq!(ms_to_ns(0), 0);
+        assert_eq!(ms_to_ns(123), 123_000_000);
+    }
+
+    #[test]
+    fn test_ms_to_ns_saturating() {
+        let big = u64::MAX / 1_000_000 + 1;
+        assert_eq!(ms_to_ns(big), u64::MAX);
     }
 }

@@ -2,6 +2,7 @@ pub mod bbo;
 pub mod bbo_store;
 pub mod demean;
 pub mod engine;
+pub mod feed_gate;
 pub mod order_book;
 pub mod orderbook_trait;
 pub mod reference;

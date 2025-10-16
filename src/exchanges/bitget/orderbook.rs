@@ -6,6 +6,7 @@ use serde::Deserialize;
 use crate::base_classes::order_book::ArrayOrderBook;
 use crate::base_classes::orderbook_trait::OrderBookOps;
 use crate::base_classes::types::*;
+use crate::utils::time::ms_to_ns;
 
 #[cfg(feature = "bitget_book")]
 #[derive(Debug, Clone, Deserialize)]
@@ -123,7 +124,7 @@ impl<const N: usize> BitgetBook<N> {
         let seq_val = Self::extract_seq(d).unwrap_or(0);
         let prev_seq = Self::extract_prev_seq(d);
         let ts_ms = d.ts.or(msg.ts).unwrap_or(0);
-        let ts: Ts = (ts_ms as u128 * 1_000_000) as Ts;
+        let ts: Ts = ms_to_ns(ts_ms);
         let seq: Seq = seq_val as Seq;
         if msg.action == "snapshot" {
             let bids = self.convert_levels(&d.bids);
@@ -179,7 +180,7 @@ impl<const N: usize> BitgetBook<N> {
             }
         }
         let ts_ms = d.ts.or(msg.ts).unwrap_or(0);
-        let ts: Ts = (ts_ms as u128 * 1_000_000) as Ts;
+        let ts: Ts = ms_to_ns(ts_ms);
         let seq: Seq = seq_val as Seq;
 
         let mut bids_iter = d.bids.iter();
@@ -232,6 +233,11 @@ impl<const N: usize> BitgetBook<N> {
         let b = self.book.best_bid()?;
         let a = self.book.best_ask()?;
         Some(((b.px + a.px) as f64) / (2.0 * self.price_scale))
+    }
+
+    #[inline(always)]
+    pub fn last_ts(&self) -> Ts {
+        self.book.ts
     }
 
     #[inline(always)]

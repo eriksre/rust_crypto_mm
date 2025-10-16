@@ -3,6 +3,7 @@
 use crate::base_classes::order_book::ArrayOrderBook;
 use crate::base_classes::orderbook_trait::OrderBookOps;
 use crate::base_classes::types::*;
+use crate::utils::time::ms_to_ns;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -136,7 +137,7 @@ impl<const N: usize> GateBook<N> {
         }
 
         let ts_ms = res.ts(msg.time_ms);
-        let ts = (ts_ms as u128 * 1_000_000) as Ts;
+        let ts = ms_to_ns(ts_ms);
         if ts < self.last_ts {
             return false;
         }
@@ -210,6 +211,11 @@ impl<const N: usize> GateBook<N> {
         let b = self.book.best_bid()?;
         let a = self.book.best_ask()?;
         Some(((b.px + a.px) as f64) / (2.0 * self.price_scale))
+    }
+
+    #[inline(always)]
+    pub fn last_ts(&self) -> Ts {
+        self.book.ts
     }
 
     #[inline(always)]
