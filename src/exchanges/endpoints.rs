@@ -147,3 +147,63 @@ impl GateioWs {
     pub const LOGIN: &str = "futures.login";
     pub const CANCEL_BATCH_ORDER_IDS: &str = "futures.order_cancel_ids";
 }
+
+// ---------------- OKX ----------------
+pub struct OkxWs;
+impl OkxWs {
+    pub const PUBLIC_BASE: &str = "wss://ws.okx.com:8443/ws/v5/public";
+    pub const BUSINESS_BASE: &str = "wss://ws.okx.com:8443/ws/v5/business";
+
+    pub const BOOKS: &str = "books";
+    pub const BOOKS5: &str = "books5";
+    pub const BBO_TBT: &str = "bbo-tbt";
+    pub const TICKERS: &str = "tickers";
+    pub const TRADES: &str = "trades";
+    pub const TRADES_ALL: &str = "trades-all";
+
+    #[inline]
+    pub fn subscribe(inst_id: &str, channel: &str) -> String {
+        Self::subscribe_multi(inst_id, &[channel])
+    }
+
+    #[inline]
+    pub fn subscribe_multi(inst_id: &str, channels: &[&str]) -> String {
+        let mut s = String::with_capacity(64 + channels.len() * 32);
+        s.push_str("{\"op\":\"subscribe\",\"args\":[");
+        for (idx, ch) in channels.iter().enumerate() {
+            if idx > 0 {
+                s.push(',');
+            }
+            s.push_str("{\"channel\":\"");
+            s.push_str(ch);
+            s.push_str("\",\"instId\":\"");
+            s.push_str(inst_id);
+            s.push_str("\"}");
+        }
+        s.push_str("]}");
+        s
+    }
+
+    #[inline]
+    pub fn subscribe_business(inst_id: &str, channel: &str) -> String {
+        Self::subscribe_business_multi(inst_id, &[channel])
+    }
+
+    #[inline]
+    pub fn subscribe_business_multi(inst_id: &str, channels: &[&str]) -> String {
+        let mut s = String::with_capacity(64 + channels.len() * 32);
+        s.push_str("{\"op\":\"subscribe\",\"args\":[");
+        for (idx, ch) in channels.iter().enumerate() {
+            if idx > 0 {
+                s.push(',');
+            }
+            s.push_str("{\"channel\":\"");
+            s.push_str(ch);
+            s.push_str("\",\"instId\":\"");
+            s.push_str(inst_id);
+            s.push_str("\"}");
+        }
+        s.push_str("]}");
+        s
+    }
+}

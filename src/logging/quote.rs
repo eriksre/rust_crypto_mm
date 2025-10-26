@@ -229,6 +229,7 @@ struct QuoteCsvLogger {
     last_binance: (u64, u64, u64),
     last_gate: (u64, u64, u64),
     last_bitget: (u64, u64, u64),
+    last_okx: (u64, u64, u64),
     orders: HashMap<String, QuoteSnapshot>,
     pending_cancels: HashMap<String, CancelSnapshot>,
 }
@@ -238,6 +239,7 @@ enum ExchangeId {
     Binance,
     Gate,
     Bitget,
+    Okx,
 }
 
 impl QuoteCsvLogger {
@@ -264,6 +266,7 @@ impl QuoteCsvLogger {
             last_binance: (0, 0, 0),
             last_gate: (0, 0, 0),
             last_bitget: (0, 0, 0),
+            last_okx: (0, 0, 0),
             orders: HashMap::new(),
             pending_cancels: HashMap::new(),
         })
@@ -293,6 +296,7 @@ impl QuoteCsvLogger {
             &st.bitget,
             Some(&st.demean.bitget),
         )?;
+        self.write_exchange(ExchangeId::Okx, "okx", &st.okx, Some(&st.demean.okx))?;
         Ok(())
     }
 
@@ -308,6 +312,7 @@ impl QuoteCsvLogger {
             ExchangeId::Binance => &mut self.last_binance,
             ExchangeId::Gate => &mut self.last_gate,
             ExchangeId::Bitget => &mut self.last_bitget,
+            ExchangeId::Okx => &mut self.last_okx,
         };
         let (orderbook_seq, bbo_seq, trade_seq) = cache;
         Self::write_feed_entry(
@@ -341,7 +346,11 @@ impl QuoteCsvLogger {
         if snap.seq == *last_seq {
             return Ok(());
         }
-        if let Some(price) = snap.price.filter(|p| p.is_finite()) {
+        let price_opt = snap
+            .price
+            .filter(|p| p.is_finite() && *p > 0.0)
+            .or_else(|| mid_from_levels(snap));
+        if let Some(price) = price_opt {
             *last_seq = snap.seq;
             let ts = snap.ts_ns.unwrap_or(0);
             let direction = trade_direction_str(snap.direction);
@@ -716,4 +725,19 @@ fn apply_demean(price: f64, adj: Option<&ExchangeAdjustment>) -> f64 {
         }
     }
     price
+}
+
+fn mid_from_levels(snap: &FeedSnap) -> Option<f64> {
+    let bid = snap
+        .bid_levels
+        .get(0)
+        .and_then(|lvl| lvl.and_then(|(px, _)| (px.is_finite() && px > 0.0).then_some(px)));
+    let ask = snap
+        .ask_levels
+        .get(0)
+        .and_then(|lvl| lvl.and_then(|(px, _)| (px.is_finite() && px > 0.0).then_some(px)));
+    match (bid, ask) {
+        (Some(b), Some(a)) if a > 0.0 && b > 0.0 => Some(0.5 * (a + b)),
+        _ => None,
+    }
 }

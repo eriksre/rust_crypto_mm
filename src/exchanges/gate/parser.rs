@@ -46,7 +46,7 @@ pub struct GateFrame {
     pub raw: Vec<u8>,
 }
 
-const ENABLE_ORDERBOOK_SUB: bool = false;
+const ENABLE_ORDERBOOK_SUB: bool = true;
 
 pub struct GateHandler {
     // E.g. BTC_USDT

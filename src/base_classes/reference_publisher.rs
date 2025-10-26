@@ -199,6 +199,24 @@ impl ReferencePublisher {
             st.bitget.trade.received_at,
         );
 
+        // OKX sources (adjusted)
+        consider(
+            Self::adjust_price(st.okx.bbo.price, &st.demean.okx),
+            st.okx.bbo.seq,
+            st.okx.bbo.ts_ns,
+            9,
+            Self::label("okx_bbo", &st.demean.okx),
+            st.okx.bbo.received_at,
+        );
+        consider(
+            Self::adjust_price(st.okx.trade.price, &st.demean.okx),
+            st.okx.trade.seq,
+            st.okx.trade.ts_ns,
+            10,
+            Self::label("okx_trade", &st.demean.okx),
+            st.okx.trade.received_at,
+        );
+
         let candidate = best?;
         let key = RevisionKey {
             source_idx: candidate.source_idx,

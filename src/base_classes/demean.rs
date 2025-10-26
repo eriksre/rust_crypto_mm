@@ -9,6 +9,7 @@ pub enum ExchangeKind {
     Bybit,
     Binance,
     Bitget,
+    Okx,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -103,6 +104,7 @@ pub struct DemeanTracker {
     bybit: ExchangeState,
     binance: ExchangeState,
     bitget: ExchangeState,
+    okx: ExchangeState,
 }
 
 impl DemeanTracker {
@@ -113,6 +115,7 @@ impl DemeanTracker {
             bybit: ExchangeState::default(),
             binance: ExchangeState::default(),
             bitget: ExchangeState::default(),
+            okx: ExchangeState::default(),
         }
     }
 
@@ -144,12 +147,13 @@ impl DemeanTracker {
             _ => return Vec::new(),
         };
 
-        let mut out = Vec::with_capacity(3);
+        let mut out = Vec::with_capacity(4);
         let window_ns = self.window_ns;
         for exchange in [
             ExchangeKind::Bybit,
             ExchangeKind::Binance,
             ExchangeKind::Bitget,
+            ExchangeKind::Okx,
         ] {
             let adj = self
                 .state_mut(exchange)
@@ -164,6 +168,7 @@ impl DemeanTracker {
             ExchangeKind::Bybit => &mut self.bybit,
             ExchangeKind::Binance => &mut self.binance,
             ExchangeKind::Bitget => &mut self.bitget,
+            ExchangeKind::Okx => &mut self.okx,
         }
     }
 }

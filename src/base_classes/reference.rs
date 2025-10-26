@@ -19,6 +19,8 @@ pub enum ReferenceSource {
     BinanceTrade = 6,
     BitgetBbo = 7,
     BitgetTrade = 8,
+    OkxBbo = 9,
+    OkxTrade = 10,
 }
 
 impl ReferenceSource {
@@ -37,6 +39,8 @@ impl ReferenceSource {
             ReferenceSource::BinanceTrade => "binance_trade",
             ReferenceSource::BitgetBbo => "bitget_bbo",
             ReferenceSource::BitgetTrade => "bitget_trade",
+            ReferenceSource::OkxBbo => "okx_bbo",
+            ReferenceSource::OkxTrade => "okx_trade",
         }
     }
 }

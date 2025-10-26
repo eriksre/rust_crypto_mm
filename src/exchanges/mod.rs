@@ -12,6 +12,7 @@
 //! - **Bybit**: Market data
 //! - **Binance**: Market data
 //! - **Bitget**: Market data
+//! - **OKX**: Market data (perpetual futures)
 //!
 //! # Adding a New Exchange
 //! 1. Create `src/exchanges/{exchange}/` directory
@@ -26,6 +27,7 @@ pub mod bitget;
 pub mod bybit;
 pub mod endpoints;
 pub mod gate;
+pub mod okx;
 
 // Backwards compatibility: Re-export for code using old flat structure
 #[cfg(feature = "binance_book")]
@@ -44,3 +46,5 @@ pub use gate::orderbook as gate_book;
 pub use gate::rest as gate_rest;
 #[cfg(feature = "gate_exec")]
 pub use gate::signing as gate_sign;
+
+pub use okx::orderbook as okx_book;
