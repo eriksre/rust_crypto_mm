@@ -7,9 +7,9 @@ use crate::utils::time::ms_to_ns;
 use serde_json::{self, Value};
 
 #[cfg(feature = "binance_book")]
-use crate::exchanges::binance_book::BinanceBook;
+use crate::exchanges::binance::orderbook::BinanceBook;
 #[cfg(feature = "parse_binance")]
-use crate::exchanges::binance_parsed::DepthUpdate;
+use crate::exchanges::binance::parsed::DepthUpdate;
 
 pub const PRICE_SCALE: f64 = 100_000.0;
 pub const QTY_SCALE: f64 = 1_000_000.0;

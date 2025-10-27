@@ -3,11 +3,11 @@
 use crate::base_classes::order_book::ArrayOrderBook;
 use crate::base_classes::orderbook_trait::OrderBookOps;
 use crate::base_classes::types::*;
-use crate::exchanges::binance_get::{BinanceSnapshot, get_orderbook_snapshot};
+use crate::exchanges::binance::rest::{BinanceSnapshot, get_orderbook_snapshot};
 use crate::utils::time::ms_to_ns;
 
 #[cfg(feature = "parse_binance")]
-use crate::exchanges::binance_parsed::DepthUpdate;
+use crate::exchanges::binance::parsed::DepthUpdate;
 
 pub struct BinanceBook<const N: usize> {
     pub symbol: String, // lowercase

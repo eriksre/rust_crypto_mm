@@ -5,7 +5,7 @@ use crate::base_classes::types::{Price, Qty, Seq};
 use crate::collectors::helpers::{
     extract_first_price_in_array, find_first_string_number, find_json_string,
 };
-use crate::exchanges::bitget_book::{BitgetBook, BitgetMsg};
+use crate::exchanges::bitget::orderbook::{BitgetBook, BitgetMsg};
 use crate::utils::time::ms_to_ns;
 use serde_json::{self, Value};
 

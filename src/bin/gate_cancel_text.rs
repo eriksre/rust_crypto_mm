@@ -6,7 +6,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
 use rust_test::exchanges::endpoints::GateioWs;
-use rust_test::exchanges::gate_rest;
+use rust_test::exchanges::gate::rest;
 use rust_test::execution::GateWsConfig;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -54,7 +54,7 @@ async fn main() -> Result<()> {
     let api_secret = std::env::var(&cli.api_secret_env)
         .with_context(|| format!("missing env var {}", cli.api_secret_env))?;
 
-    let contract_meta = gate_rest::fetch_contract_meta_async(&cli.symbol)
+    let contract_meta = rest::fetch_contract_meta_async(&cli.symbol)
         .await
         .ok_or_else(|| anyhow!("failed to fetch contract metadata for {}", cli.symbol))?;
     let contract_size = contract_meta

@@ -8,7 +8,7 @@ use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
 use reqwest::{Client, Method};
 use rust_test::exchanges::endpoints::{GateioGet, GateioWs};
-use rust_test::exchanges::gate_rest;
+use rust_test::exchanges::gate::rest;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha512};
@@ -134,7 +134,7 @@ async fn main() -> Result<()> {
     println!("Using contract {contract} (settle: {settle})");
 
     println!("Fetching contract metadata...");
-    let meta = gate_rest::fetch_contract_meta_async(&contract)
+    let meta = rest::fetch_contract_meta_async(&contract)
         .await
         .ok_or_else(|| anyhow!("failed to fetch contract meta for {contract}"))?;
     let contract_size = meta

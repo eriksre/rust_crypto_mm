@@ -4,7 +4,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use reqwest::{Client, Method};
 use serde_json::Value;
 
-use crate::exchanges::{endpoints::GateioGet, gate_sign};
+use crate::exchanges::{endpoints::GateioGet, gate::signing};
 use crate::utils::parsing::value_to_f64;
 use crate::utils::time::current_unix_seconds_string;
 
@@ -95,12 +95,12 @@ impl GateClient {
     ) -> Result<Value> {
         let method_name = method.as_str();
         let ts = current_unix_seconds_string();
-        let payload_hash = gate_sign::sha512_hex(body);
+        let payload_hash = signing::sha512_hex(body);
         let sign_payload = format!(
             "{}\n{}\n{}\n{}\n{}",
             method_name, path, query, payload_hash, ts
         );
-        let signature = gate_sign::hmac_sha512_hex(&self.credentials.api_secret, &sign_payload);
+        let signature = signing::hmac_sha512_hex(&self.credentials.api_secret, &sign_payload);
 
         let url = if query.is_empty() {
             format!("{}{}", GateioGet::BASE, path)

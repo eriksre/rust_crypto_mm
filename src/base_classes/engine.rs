@@ -23,7 +23,6 @@ use crate::exchanges::bitget::{BitgetFrame, BitgetHandler};
 use crate::exchanges::bybit::{BybitFrame, BybitHandler};
 use crate::exchanges::endpoints::{BitgetWs, GateioWs, OkxWs};
 use crate::exchanges::gate::{GateFrame, GateHandler, canonical_contract_symbol};
-use crate::exchanges::gate_rest;
 use crate::exchanges::okx::{OkxFrame, OkxHandler};
 
 #[cfg(feature = "gate_exec")]
@@ -385,7 +384,7 @@ pub fn spawn_state_engine(
         let okx_inst_id = format_okx_inst_id(&symbol);
         let gate_contract = canonical_contract_symbol(&symbol);
         let gate_symbol = gate_contract.clone();
-        let gate_contract_meta = gate_rest::fetch_contract_meta(&gate_contract);
+        let gate_contract_meta = crate::exchanges::gate::fetch_contract_meta(&gate_contract);
 
         let bybit_supported = if bybit_auto {
             let supported = bybit_symbol_supported(&bybit_symbol);
@@ -509,27 +508,27 @@ pub fn spawn_state_engine(
                 }
             }
         }
-        let mut bybit_book = crate::exchanges::bybit_book::BybitBook::<1024>::new(
+        let mut bybit_book = crate::exchanges::bybit::BybitBook::<1024>::new(
             &bybit_symbol,
-            crate::exchanges::bybit_book::PRICE_SCALE,
-            crate::exchanges::bybit_book::QTY_SCALE,
+            crate::exchanges::bybit::PRICE_SCALE,
+            crate::exchanges::bybit::QTY_SCALE,
         );
-        let mut gate_book = crate::exchanges::gate_book::GateBook::<1024>::new(
+        let mut gate_book = crate::exchanges::gate::GateBook::<1024>::new(
             &gate_contract,
-            crate::exchanges::gate_book::GateBook::<1024>::PRICE_SCALE,
-            crate::exchanges::gate_book::GateBook::<1024>::QTY_SCALE,
+            crate::exchanges::gate::GateBook::<1024>::PRICE_SCALE,
+            crate::exchanges::gate::GateBook::<1024>::QTY_SCALE,
         );
         #[cfg(feature = "bitget_book")]
         let mut bitget_book = {
-            crate::exchanges::bitget_book::BitgetBook::<1024>::new(
+            crate::exchanges::bitget::BitgetBook::<1024>::new(
                 &bitget_symbol,
-                crate::exchanges::bitget_book::BitgetBook::<1024>::PRICE_SCALE,
-                crate::exchanges::bitget_book::BitgetBook::<1024>::QTY_SCALE,
+                crate::exchanges::bitget::BitgetBook::<1024>::PRICE_SCALE,
+                crate::exchanges::bitget::BitgetBook::<1024>::QTY_SCALE,
             )
         };
         #[cfg(feature = "binance_book")]
         let mut binance_book = {
-            use crate::exchanges::binance_book::BinanceBook;
+            use crate::exchanges::binance::BinanceBook;
             let rt = tokio::runtime::Runtime::new().expect("tokio rt");
             let mut bk: BinanceBook<1024> = BinanceBook::new(
                 &symbol,
@@ -548,10 +547,10 @@ pub fn spawn_state_engine(
             }
             bk
         };
-        let mut okx_book = crate::exchanges::okx_book::OkxBook::<1024>::new(
+        let mut okx_book = crate::exchanges::okx::OkxBook::<1024>::new(
             &okx_inst_id,
-            crate::exchanges::okx_book::OkxBook::<1024>::PRICE_SCALE,
-            crate::exchanges::okx_book::OkxBook::<1024>::QTY_SCALE,
+            crate::exchanges::okx::OkxBook::<1024>::PRICE_SCALE,
+            crate::exchanges::okx::OkxBook::<1024>::QTY_SCALE,
         );
 
         // Per-exchange BBO/trades stores
@@ -809,8 +808,8 @@ pub fn spawn_state_engine(
                                     trade_ts,
                                 ) {
                                     GateDecision::Accept => {
-                                        let px = (trade.px as f64)
-                                            / crate::exchanges::bybit_book::PRICE_SCALE;
+                                        let px =
+                                            (trade.px as f64) / crate::exchanges::bybit::PRICE_SCALE;
                                         demean.record_other(
                                             ExchangeKind::Bybit,
                                             Some(trade_ts),
@@ -835,7 +834,7 @@ pub fn spawn_state_engine(
                                             snap.trade.received_at = Some(f.recv_instant);
 
                                             let qty = (trade.qty as f64).abs()
-                                                / crate::exchanges::bybit_book::QTY_SCALE;
+                                                / crate::exchanges::bybit::QTY_SCALE;
                                             snap.trade_events.push_back(TradeEvent {
                                                 ts_ns: trade_ts,
                                                 price: px,
@@ -866,8 +865,8 @@ pub fn spawn_state_engine(
                         if let Some((_, ticker)) = bybit::update_tickers(s, &mut bybit_tickers) {
                             let mut st = lock_state();
                             let entry = &mut st.bybit.ticker;
-                            let price_scale = crate::exchanges::bybit_book::PRICE_SCALE;
-                            let qty_scale = crate::exchanges::bybit_book::QTY_SCALE;
+                            let price_scale = crate::exchanges::bybit::PRICE_SCALE;
+                            let qty_scale = crate::exchanges::bybit::QTY_SCALE;
 
                             if ticker.ticker.last_px != 0 {
                                 entry.last_price =

@@ -3,7 +3,7 @@ use crate::base_classes::tickers::{TickerSnapshot, TickerStore};
 use crate::base_classes::trades::{FixedTrades, Trade};
 use crate::base_classes::types::{Price, Qty, Seq};
 use crate::collectors::helpers::{find_first_string_number, find_json_string};
-use crate::exchanges::gate_book::{GateBook, GateMsg};
+use crate::exchanges::gate::orderbook::{GateBook, GateMsg};
 use crate::utils::time::ms_to_ns;
 use serde_json::{self, Value};
 

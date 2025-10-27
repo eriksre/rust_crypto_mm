@@ -3,7 +3,7 @@ use crate::base_classes::tickers::{TickerSnapshot, TickerStore};
 use crate::base_classes::trades::{FixedTrades, Trade};
 use crate::base_classes::types::{Price, Qty};
 use crate::collectors::helpers::{find_first_bool, find_json_string};
-use crate::exchanges::bybit_book::{
+use crate::exchanges::bybit::orderbook::{
     BybitBook, BybitData, BybitDataCont, BybitMsg, PRICE_SCALE, QTY_SCALE,
 };
 use crate::utils::time::ms_to_ns;

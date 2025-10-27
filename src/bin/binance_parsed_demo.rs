@@ -1,7 +1,7 @@
 #[cfg(feature = "parse_binance")]
 fn main() {
     use rust_test::base_classes::ws::spawn_ws_worker;
-    use rust_test::exchanges::binance_parsed::{BinanceEvent, BinanceParsedHandler};
+    use rust_test::exchanges::binance::parsed::{BinanceEvent, BinanceParsedHandler};
 
     let symbol = std::env::args()
         .nth(1)

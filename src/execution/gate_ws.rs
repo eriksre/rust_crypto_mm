@@ -16,8 +16,8 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungsten
 
 use crate::base_classes::state::{TradeDirection, state};
 use crate::base_classes::types::Side;
-use crate::exchanges::gate_rest;
-use crate::exchanges::{endpoints::GateioWs, gate_sign};
+use crate::exchanges::gate::rest;
+use crate::exchanges::{endpoints::GateioWs, gate::signing};
 use crate::utils::math::format_price;
 use crate::utils::parsing::{extract_user_id, value_to_f64, value_to_string, value_to_u64};
 use crate::utils::time::{current_unix_ms, current_unix_ts};
@@ -66,7 +66,7 @@ impl GateWsGateway {
         let contract_size = if let Some(size) = contract_size {
             size
         } else {
-            let meta = gate_rest::fetch_contract_meta_async(&symbol)
+            let meta = rest::fetch_contract_meta_async(&symbol)
                 .await
                 .ok_or_else(|| anyhow!("failed to fetch Gate contract metadata"))?;
             meta.quanto_multiplier
@@ -1025,10 +1025,10 @@ fn build_api_request(
 
 fn sign_api(secret: &str, channel: &str, req_param: &str, ts: i64) -> String {
     let payload = format!("{}\n{}\n{}\n{}", "api", channel, req_param, ts);
-    gate_sign::hmac_sha512_hex(secret, &payload)
+    signing::hmac_sha512_hex(secret, &payload)
 }
 
 fn sign_subscribe(secret: &str, channel: &str, ts: i64) -> String {
     let payload = format!("channel={channel}&event=subscribe&time={ts}");
-    gate_sign::hmac_sha512_hex(secret, &payload)
+    signing::hmac_sha512_hex(secret, &payload)
 }
