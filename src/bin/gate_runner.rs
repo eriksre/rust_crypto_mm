@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Result, anyhow, bail};
 use clap::Parser;
-use rust_test::base_classes::engine::spawn_state_engine;
+use rust_test::base_classes::engine::{configure_feed_overrides, spawn_state_engine};
 use rust_test::base_classes::reference::ReferenceEvent;
 use rust_test::base_classes::types::Side;
 use rust_test::config::runner::{
@@ -57,6 +57,7 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     let cli = Cli::parse();
     let mut config = load_runner_config(&cli.config)?;
+    configure_feed_overrides(config.feeds);
     let debug = DebugLogger::new(config.mode.debug_prints);
 
     let contract_meta = gate_rest::fetch_contract_meta_async(&config.strategy.symbol)

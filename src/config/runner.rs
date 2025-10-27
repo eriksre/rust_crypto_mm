@@ -4,6 +4,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use crate::base_classes::feed_config::FeedToggles;
 use crate::execution::GateCredentials;
 use crate::strategy::QuoteConfig;
 
@@ -77,6 +78,8 @@ pub struct RunnerConfig {
     pub credentials: Option<CredentialsConfig>,
     #[serde(default)]
     pub settle: Option<String>,
+    #[serde(default)]
+    pub feeds: FeedToggles,
 }
 
 pub fn load_runner_config(path: &str) -> Result<RunnerConfig> {

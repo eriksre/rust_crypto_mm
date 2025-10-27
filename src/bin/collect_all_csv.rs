@@ -3,7 +3,8 @@ use std::io::{BufWriter, Write};
 use std::thread;
 use std::time::Duration;
 
-use rust_test::base_classes::engine::spawn_state_engine;
+use rust_test::base_classes::engine::{configure_feed_overrides, spawn_state_engine};
+use rust_test::base_classes::feed_config::FeedToggles;
 use rust_test::base_classes::state::{ExchangeAdjustment, TradeDirection, state};
 
 #[path = "../bin_utils/symbol_config.rs"]
@@ -64,6 +65,9 @@ fn main() {
     let out_path = std::env::args()
         .nth(2)
         .unwrap_or_else(|| "all_exchanges.csv".to_string());
+
+    // Ensure feed toggles start with defaults (all primary feeds enabled/auto).
+    configure_feed_overrides(FeedToggles::default());
 
     // Spawn background engine: producers + processors maintain state. This process only writes snapshots.
     let _engine = spawn_state_engine(symbol.clone(), None, None);

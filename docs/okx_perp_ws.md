@@ -144,3 +144,9 @@ Example:
 - Order book updates include `seqId`/`prevSeqId` monotonic pairing; expect reset after maintenance.
 - When no depth change for ~60s, a heartbeat update is sent with empty `asks`/`bids` but identical `seqId`.
 
+## Integration Notes & Quirks
+- **Sequence handling:** `prevSeqId` is `-1` on snapshots and can arrive as a signed string. Deserialize using a signed type, treat negative values as “no previous sequence,” and maintain separate counters for `books` and `bbo-tbt` since each channel has its own monotonic stream.
+- **BBO + depth reconciliation:** We subscribe to both `books` (snapshot + deltas) and `bbo-tbt`. `books` drives the main depth state, while `bbo-tbt` lets us tighten top-of-book between depth pushes. Both feeds update the same `OkxBook`, so the mid and top levels stay aligned regardless of which channel fired last.
+- **Signed checksums:** The CRC32 checksum is published as a signed 32-bit integer. Negative values are expected—they’re simply the raw CRC interpreted as `i32`. We log the value but do not yet hard-fail on mismatch.
+- **Heartbeat keep-alives:** Expect keep-alive updates with empty `asks`/`bids` but unchanged `seqId`. Treat them as connection health signals and leave the book untouched.
+- **Pipeline wiring:** OKX events now flow through the engine, feed gate, demean tracker, reference publisher, and CSV logger. Running `gate_runner` with logging enabled will emit OKX rows alongside Gate/Bybit/Binance/Bitget without extra configuration.

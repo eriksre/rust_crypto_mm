@@ -201,6 +201,58 @@ fn now_ts_ns() -> Ts {
         .as_nanos() as Ts
 }
 
+#[inline(always)]
+fn now_secs() -> u64 {
+    now_ts_ns() / 1_000_000_000
+}
+
+fn gate_ping_reply(text: &str) -> Option<String> {
+    if !text.contains("\"channel\":\"futures.ping\"") {
+        return None;
+    }
+    match find_json_string(text, "event") {
+        Some(ev) if ev == "ping" => {}
+        _ => return None,
+    }
+    let time = find_json_u64(text, "time").unwrap_or_else(now_secs);
+    Some(format!(
+        "{{\"time\":{time},\"channel\":\"futures.pong\",\"event\":\"pong\"}}"
+    ))
+}
+
+fn find_json_string<'a>(s: &'a str, key: &str) -> Option<&'a str> {
+    let k = format!("\"{}\"", key);
+    let pos = s.find(&k)?;
+    let rest = &s[pos + k.len()..];
+    let colon = rest.find(':')?;
+    let rest = &rest[colon + 1..];
+    let q = rest.find('"')?;
+    let rest2 = &rest[q + 1..];
+    let end = rest2.find('"')?;
+    Some(&rest2[..end])
+}
+
+fn find_json_u64(s: &str, key: &str) -> Option<u64> {
+    let k = format!("\"{}\":", key);
+    let pos = s.find(&k)?;
+    let rest = &s[pos + k.len()..];
+    let mut v: u64 = 0;
+    let mut f = false;
+    for ch in rest.bytes() {
+        if ch.is_ascii_digit() {
+            f = true;
+            v = v.saturating_mul(10).saturating_add((ch - b'0') as u64);
+        } else if f {
+            break;
+        } else if ch == b' ' {
+            continue;
+        } else {
+            return None;
+        }
+    }
+    if f { Some(v) } else { None }
+}
+
 // Linux-only core pin; no-op elsewhere.
 #[allow(unused_variables)]
 #[cfg(all(target_os = "linux", feature = "affinity"))]
@@ -336,6 +388,10 @@ fn run_ws_tungstenite<E, const N: usize>(
                     let ts = now_ts_ns();
                     match msg {
                         Message::Text(txt) => {
+                            if let Some(reply) = gate_ping_reply(&txt) {
+                                let _ = socket.send(Message::Text(reply));
+                                continue;
+                            }
                             if let Some((k, s)) = handler.sequence_key_text(&txt) {
                                 if !seq_gate.accept(k, s) {
                                     continue;
@@ -508,6 +564,12 @@ where
                                 match frame.opcode {
                                     OpCode::Text => {
                                         if let Ok(s) = std::str::from_utf8(&frame.payload) {
+                                            if let Some(reply) = gate_ping_reply(s) {
+                                                if ws.write_text(reply).await.is_err() {
+                                                    break;
+                                                }
+                                                continue;
+                                            }
                                             if let Some((k, seq)) = handler.sequence_key_text(s) { if !seq_gate.accept(k, seq) { continue; } }
                                             let recv_instant = Instant::now();
                                             if let Some(out) = handler.parse_text(s, ts, recv_instant) {

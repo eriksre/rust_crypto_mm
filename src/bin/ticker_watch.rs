@@ -1,7 +1,8 @@
 use std::thread;
 use std::time::Duration;
 
-use rust_test::base_classes::engine::spawn_state_engine;
+use rust_test::base_classes::engine::{configure_feed_overrides, spawn_state_engine};
+use rust_test::base_classes::feed_config::FeedToggles;
 use rust_test::base_classes::state::{TickerSnap, state};
 
 fn main() {
@@ -9,6 +10,7 @@ fn main() {
         .nth(1)
         .unwrap_or_else(|| "BTCUSDT".to_string());
 
+    configure_feed_overrides(FeedToggles::default());
     let _engine = spawn_state_engine(symbol.clone(), None, None);
     println!("Watching ticker updates for {symbol}. Ctrl-C to exit.\n");
 
