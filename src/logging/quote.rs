@@ -12,7 +12,8 @@ use tokio::time::MissedTickBehavior;
 
 use crate::base_classes::reference::ReferenceEvent;
 use crate::base_classes::state::{
-    ExchangeAdjustment, ExchangeSnap, FeedSnap, TradeDirection, state as global_state,
+    ExchangeAdjustment, ExchangeSnap, FeedSnap, SNAPSHOT_DEPTH, TradeDirection,
+    state as global_state,
 };
 use crate::base_classes::types::Side;
 use crate::config::runner::RunnerConfig;
@@ -242,6 +243,8 @@ enum ExchangeId {
     Okx,
 }
 
+const EMPTY_LEVELS: [Option<(f64, f64)>; SNAPSHOT_DEPTH] = [None; SNAPSHOT_DEPTH];
+
 impl QuoteCsvLogger {
     fn new(config: &RunnerConfig) -> Result<Self> {
         let path = config.logging.resolve_path();
@@ -254,7 +257,7 @@ impl QuoteCsvLogger {
         let mut writer = BufWriter::new(file);
         writeln!(
             writer,
-            "ts_ns,exchange,feed,source_engine_ts_ns,source_system_ts_ns,price,direction,event_type,client_order_id,side,size,reference_source,reference_ts_ns,reference_price,quote_internal_us,cancel_internal_us,quote_external_us,cancel_external_us,sent_ts_ns"
+            "ts_ns,exchange,feed,source_engine_ts_ns,source_system_ts_ns,price,direction,event_type,client_order_id,side,size,reference_source,reference_ts_ns,reference_price,quote_internal_us,cancel_internal_us,quote_external_us,cancel_external_us,sent_ts_ns,bid_px_1,bid_sz_1,bid_px_2,bid_sz_2,bid_px_3,bid_sz_3,bid_px_4,bid_sz_4,bid_px_5,bid_sz_5,ask_px_1,ask_sz_1,ask_px_2,ask_sz_2,ask_px_3,ask_sz_3,ask_px_4,ask_sz_4,ask_px_5,ask_sz_5,bid_depth,ask_depth"
         )?;
         writer.flush()?;
 
@@ -355,6 +358,29 @@ impl QuoteCsvLogger {
             let ts = snap.ts_ns.unwrap_or(0);
             let direction = trade_direction_str(snap.direction);
             let price_adj = apply_demean(price, adj);
+            let bid_levels_adj = adjusted_levels(&snap.bid_levels, adj);
+            let ask_levels_adj = adjusted_levels(&snap.ask_levels, adj);
+            let is_book_feed = matches!(feed, "orderbook" | "bbo");
+            let bid_depth = if is_book_feed {
+                depth_from_levels(&snap.bid_levels)
+            } else {
+                None
+            };
+            let ask_depth = if is_book_feed {
+                depth_from_levels(&snap.ask_levels)
+            } else {
+                None
+            };
+            let bid_levels_ref = if is_book_feed {
+                &bid_levels_adj
+            } else {
+                &EMPTY_LEVELS
+            };
+            let ask_levels_ref = if is_book_feed {
+                &ask_levels_adj
+            } else {
+                &EMPTY_LEVELS
+            };
             write_row(
                 writer,
                 ts,
@@ -367,6 +393,7 @@ impl QuoteCsvLogger {
                 "market",
                 "",
                 "",
+                snap.size,
                 None,
                 None,
                 None,
@@ -375,7 +402,10 @@ impl QuoteCsvLogger {
                 None,
                 None,
                 None,
-                None,
+                bid_levels_ref,
+                ask_levels_ref,
+                bid_depth,
+                ask_depth,
             )?;
         }
         Ok(())
@@ -426,6 +456,10 @@ impl QuoteCsvLogger {
                 None,
                 None,
                 Some(sent_ns),
+                &EMPTY_LEVELS,
+                &EMPTY_LEVELS,
+                None,
+                None,
             )?;
         }
         Ok(())
@@ -478,6 +512,10 @@ impl QuoteCsvLogger {
             None,
             None,
             Some(sent_ns),
+            &EMPTY_LEVELS,
+            &EMPTY_LEVELS,
+            None,
+            None,
         )
     }
 
@@ -559,6 +597,10 @@ impl QuoteCsvLogger {
                     quote_external_us,
                     cancel_external_us,
                     sent_ns,
+                    &EMPTY_LEVELS,
+                    &EMPTY_LEVELS,
+                    None,
+                    None,
                 )?;
             }
         }
@@ -598,6 +640,10 @@ impl QuoteCsvLogger {
                 quote_external_us,
                 cancel_external_us,
                 sent_ns_for_status,
+                &EMPTY_LEVELS,
+                &EMPTY_LEVELS,
+                None,
+                None,
             )?;
         }
 
@@ -665,8 +711,12 @@ fn write_row(
     quote_external_us: Option<i128>,
     cancel_external_us: Option<i128>,
     sent_ts_ns: Option<u128>,
+    bid_levels: &[Option<(f64, f64)>; SNAPSHOT_DEPTH],
+    ask_levels: &[Option<(f64, f64)>; SNAPSHOT_DEPTH],
+    bid_depth: Option<f64>,
+    ask_depth: Option<f64>,
 ) -> Result<()> {
-    writeln!(
+    write!(
         writer,
         "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         ts_ns,
@@ -689,7 +739,64 @@ fn write_row(
         cancel_external_us.map_or(String::new(), |v| v.to_string()),
         sent_ts_ns.map_or(String::new(), |v| v.to_string()),
     )?;
+    for level in bid_levels.iter() {
+        match level {
+            Some((px, qty)) => write!(
+                writer,
+                ",{},{}",
+                format_option_f64(Some(*px)),
+                format_option_f64(Some(*qty))
+            )?,
+            None => write!(writer, ",,")?,
+        }
+    }
+    for level in ask_levels.iter() {
+        match level {
+            Some((px, qty)) => write!(
+                writer,
+                ",{},{}",
+                format_option_f64(Some(*px)),
+                format_option_f64(Some(*qty))
+            )?,
+            None => write!(writer, ",,")?,
+        }
+    }
+    writeln!(
+        writer,
+        ",{},{}",
+        format_option_f64(bid_depth),
+        format_option_f64(ask_depth)
+    )?;
     Ok(())
+}
+
+fn adjusted_levels(
+    levels: &[Option<(f64, f64)>; SNAPSHOT_DEPTH],
+    adj: Option<&ExchangeAdjustment>,
+) -> [Option<(f64, f64)>; SNAPSHOT_DEPTH] {
+    let mut out = [None; SNAPSHOT_DEPTH];
+    for (idx, level) in levels.iter().enumerate() {
+        if let Some((px, qty)) = level {
+            if px.is_finite() && *px > 0.0 && qty.is_finite() {
+                let adj_px = apply_demean(*px, adj);
+                out[idx] = Some((adj_px, *qty));
+            }
+        }
+    }
+    out
+}
+
+fn depth_from_levels(levels: &[Option<(f64, f64)>; SNAPSHOT_DEPTH]) -> Option<f64> {
+    let mut total = 0.0;
+    let mut seen = false;
+    for level in levels.iter().flatten() {
+        let qty = level.1;
+        if qty.is_finite() && qty > 0.0 {
+            total += qty;
+            seen = true;
+        }
+    }
+    if seen { Some(total) } else { None }
 }
 
 fn format_option_f64(value: Option<f64>) -> String {

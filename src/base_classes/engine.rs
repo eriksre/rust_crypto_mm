@@ -10,7 +10,9 @@ use crate::base_classes::feed_gate::{ExchangeFeed, FeedKind, FeedTimestampGate, 
 use crate::base_classes::reference::ReferenceEvent;
 use crate::base_classes::reference_publisher::ReferencePublisher;
 use crate::base_classes::ring_buffer::Consumer;
-use crate::base_classes::state::{ExchangeAdjustment, TradeDirection, TradeEvent, state};
+use crate::base_classes::state::{
+    ExchangeAdjustment, SNAPSHOT_DEPTH, TradeDirection, TradeEvent, state,
+};
 use crate::base_classes::tickers::TickerStore;
 use crate::base_classes::types::Ts;
 use crate::base_classes::ws::{FeedSignal, spawn_ws_worker};
@@ -33,17 +35,17 @@ use futures_util::future::pending;
 use std::env;
 
 #[inline(always)]
-fn levels_to_array(levels: &[(f64, f64)]) -> [Option<(f64, f64)>; 3] {
-    let mut out = [None; 3];
-    for (idx, &(px, qty)) in levels.iter().take(3).enumerate() {
+fn levels_to_array(levels: &[(f64, f64)]) -> [Option<(f64, f64)>; SNAPSHOT_DEPTH] {
+    let mut out = [None; SNAPSHOT_DEPTH];
+    for (idx, &(px, qty)) in levels.iter().take(SNAPSHOT_DEPTH).enumerate() {
         out[idx] = Some((px, qty));
     }
     out
 }
 
 #[inline(always)]
-fn level_from_option(level: Option<(f64, f64)>) -> [Option<(f64, f64)>; 3] {
-    let mut out = [None; 3];
+fn level_from_option(level: Option<(f64, f64)>) -> [Option<(f64, f64)>; SNAPSHOT_DEPTH] {
+    let mut out = [None; SNAPSHOT_DEPTH];
     if let Some(lvl) = level {
         out[0] = Some(lvl);
     }
@@ -632,7 +634,7 @@ pub fn spawn_state_engine(
                                                     Some(mid),
                                                 );
                                                 let (bid_vec, ask_vec) =
-                                                    bybit_book.top_levels_f64(3);
+                                                    bybit_book.top_levels_f64(SNAPSHOT_DEPTH);
                                                 let bid_levels = levels_to_array(&bid_vec);
                                                 let ask_levels = levels_to_array(&ask_vec);
                                                 {
@@ -808,8 +810,8 @@ pub fn spawn_state_engine(
                                     trade_ts,
                                 ) {
                                     GateDecision::Accept => {
-                                        let px =
-                                            (trade.px as f64) / crate::exchanges::bybit::PRICE_SCALE;
+                                        let px = (trade.px as f64)
+                                            / crate::exchanges::bybit::PRICE_SCALE;
                                         demean.record_other(
                                             ExchangeKind::Bybit,
                                             Some(trade_ts),
@@ -829,12 +831,13 @@ pub fn spawn_state_engine(
                                             snap.trade.source_engine_ts_ns = Some(trade_ts);
                                             snap.trade.source_system_ts_ns = trade.system_ts_ns;
                                             snap.trade.direction = Some(direction);
-                                            snap.trade.bid_levels = [None; 3];
-                                            snap.trade.ask_levels = [None; 3];
+                                            snap.trade.bid_levels = [None; SNAPSHOT_DEPTH];
+                                            snap.trade.ask_levels = [None; SNAPSHOT_DEPTH];
                                             snap.trade.received_at = Some(f.recv_instant);
 
                                             let qty = (trade.qty as f64).abs()
                                                 / crate::exchanges::bybit::QTY_SCALE;
+                                            snap.trade.size = Some(qty);
                                             snap.trade_events.push_back(TradeEvent {
                                                 ts_ns: trade_ts,
                                                 price: px,
@@ -953,7 +956,8 @@ pub fn spawn_state_engine(
                                             Some(ob_ts),
                                             Some(mid),
                                         );
-                                        let (bid_vec, ask_vec) = binance_book.top_levels_f64(3);
+                                        let (bid_vec, ask_vec) =
+                                            binance_book.top_levels_f64(SNAPSHOT_DEPTH);
                                         let bid_levels = levels_to_array(&bid_vec);
                                         let ask_levels = levels_to_array(&ask_vec);
                                         let mut st = lock_state();
@@ -1028,7 +1032,7 @@ pub fn spawn_state_engine(
                                                 level_from_option(Some((e.ask_px, e.ask_qty))),
                                             )
                                         } else {
-                                            ([None; 3], [None; 3])
+                                            ([None; SNAPSHOT_DEPTH], [None; SNAPSHOT_DEPTH])
                                         };
                                         {
                                             let mut st = lock_state();
@@ -1090,11 +1094,12 @@ pub fn spawn_state_engine(
                                             snap.trade.source_engine_ts_ns = Some(trade_ts);
                                             snap.trade.source_system_ts_ns = trade.system_ts_ns;
                                             snap.trade.direction = Some(direction);
-                                            snap.trade.bid_levels = [None; 3];
-                                            snap.trade.ask_levels = [None; 3];
+                                            snap.trade.bid_levels = [None; SNAPSHOT_DEPTH];
+                                            snap.trade.ask_levels = [None; SNAPSHOT_DEPTH];
                                             snap.trade.received_at = Some(f.recv_instant);
 
                                             let qty = (trade.qty as f64).abs() / binance::QTY_SCALE;
+                                            snap.trade.size = Some(qty);
                                             snap.trade_events.push_back(TradeEvent {
                                                 ts_ns: trade_ts,
                                                 price: px,
@@ -1211,7 +1216,8 @@ pub fn spawn_state_engine(
                                                 Some(ob_ts),
                                                 f.recv_instant,
                                             );
-                                            let (bid_vec, ask_vec) = gate_book.top_levels_f64(3);
+                                            let (bid_vec, ask_vec) =
+                                                gate_book.top_levels_f64(SNAPSHOT_DEPTH);
                                             let bid_levels = levels_to_array(&bid_vec);
                                             let ask_levels = levels_to_array(&ask_vec);
                                             {
@@ -1342,11 +1348,12 @@ pub fn spawn_state_engine(
                                             snap.trade.source_engine_ts_ns = Some(trade_ts);
                                             snap.trade.source_system_ts_ns = trade.system_ts_ns;
                                             snap.trade.direction = Some(direction);
-                                            snap.trade.bid_levels = [None; 3];
-                                            snap.trade.ask_levels = [None; 3];
+                                            snap.trade.bid_levels = [None; SNAPSHOT_DEPTH];
+                                            snap.trade.ask_levels = [None; SNAPSHOT_DEPTH];
                                             snap.trade.received_at = Some(f.recv_instant);
 
                                             let qty = (trade.qty as f64).abs() / gate::QTY_SCALE;
+                                            snap.trade.size = Some(qty);
                                             snap.trade_events.push_back(TradeEvent {
                                                 ts_ns: trade_ts,
                                                 price: px,
@@ -1512,7 +1519,8 @@ pub fn spawn_state_engine(
                                                 Some(ob_ts),
                                                 Some(mid),
                                             );
-                                            let (bid_vec, ask_vec) = bitget_book.top_levels_f64(3);
+                                            let (bid_vec, ask_vec) =
+                                                bitget_book.top_levels_f64(SNAPSHOT_DEPTH);
                                             let bid_levels = levels_to_array(&bid_vec);
                                             let ask_levels = levels_to_array(&ask_vec);
                                             let mut st = lock_state();
@@ -1639,11 +1647,12 @@ pub fn spawn_state_engine(
                                             snap.trade.source_engine_ts_ns = Some(trade_ts);
                                             snap.trade.source_system_ts_ns = trade.system_ts_ns;
                                             snap.trade.direction = Some(direction);
-                                            snap.trade.bid_levels = [None; 3];
-                                            snap.trade.ask_levels = [None; 3];
+                                            snap.trade.bid_levels = [None; SNAPSHOT_DEPTH];
+                                            snap.trade.ask_levels = [None; SNAPSHOT_DEPTH];
                                             snap.trade.received_at = Some(f.recv_instant);
 
                                             let qty = (trade.qty as f64).abs() / bitget::QTY_SCALE;
+                                            snap.trade.size = Some(qty);
                                             snap.trade_events.push_back(TradeEvent {
                                                 ts_ns: trade_ts,
                                                 price: px,
@@ -1757,7 +1766,8 @@ pub fn spawn_state_engine(
                                                     Some(ob_ts),
                                                     Some(mid),
                                                 );
-                                                let (bid_vec, ask_vec) = okx_book.top_levels_f64(3);
+                                                let (bid_vec, ask_vec) =
+                                                    okx_book.top_levels_f64(SNAPSHOT_DEPTH);
                                                 let bid_levels = levels_to_array(&bid_vec);
                                                 let ask_levels = levels_to_array(&ask_vec);
                                                 {
@@ -1885,11 +1895,12 @@ pub fn spawn_state_engine(
                                             snap.trade.source_engine_ts_ns = Some(trade_ts);
                                             snap.trade.source_system_ts_ns = trade.system_ts_ns;
                                             snap.trade.direction = Some(direction);
-                                            snap.trade.bid_levels = [None; 3];
-                                            snap.trade.ask_levels = [None; 3];
+                                            snap.trade.bid_levels = [None; SNAPSHOT_DEPTH];
+                                            snap.trade.ask_levels = [None; SNAPSHOT_DEPTH];
                                             snap.trade.received_at = Some(f.recv_instant);
 
                                             let qty = (trade.qty as f64).abs() / okx::QTY_SCALE;
+                                            snap.trade.size = Some(qty);
                                             snap.trade_events.push_back(TradeEvent {
                                                 ts_ns: trade_ts,
                                                 price: px,

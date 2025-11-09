@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use rust_test::base_classes::engine::{configure_feed_overrides, spawn_state_engine};
 use rust_test::base_classes::feed_config::FeedToggles;
-use rust_test::base_classes::state::{ExchangeAdjustment, FeedSnap, TradeDirection, state};
+use rust_test::base_classes::state::{
+    ExchangeAdjustment, FeedSnap, SNAPSHOT_DEPTH, TradeDirection, state,
+};
 
 #[path = "../bin_utils/symbol_config.rs"]
 mod symbol_config;
@@ -15,7 +17,10 @@ fn direction_str(dir: Option<TradeDirection>) -> &'static str {
     dir.map_or("", |d| d.as_str())
 }
 
-fn write_levels<W: Write>(writer: &mut W, levels: &[Option<(f64, f64)>; 3]) -> std::io::Result<()> {
+fn write_levels<W: Write>(
+    writer: &mut W,
+    levels: &[Option<(f64, f64)>; SNAPSHOT_DEPTH],
+) -> std::io::Result<()> {
     for level in levels.iter() {
         if let Some((px, qty)) = level {
             write!(writer, ",{},{}", px, qty)?;
@@ -77,7 +82,7 @@ fn main() {
     let mut writer = BufWriter::new(file);
     writeln!(
         writer,
-        "ts_ns,exchange,feed,price,direction,bid_px_1,bid_qty_1,bid_px_2,bid_qty_2,bid_px_3,bid_qty_3,ask_px_1,ask_qty_1,ask_px_2,ask_qty_2,ask_px_3,ask_qty_3"
+        "ts_ns,exchange,feed,price,direction,bid_px_1,bid_qty_1,bid_px_2,bid_qty_2,bid_px_3,bid_qty_3,bid_px_4,bid_qty_4,bid_px_5,bid_qty_5,ask_px_1,ask_qty_1,ask_px_2,ask_qty_2,ask_px_3,ask_qty_3,ask_px_4,ask_qty_4,ask_px_5,ask_qty_5"
     )
     .unwrap();
 
@@ -104,6 +109,7 @@ fn main() {
                     snap.price = Some(price);
                     snap.ts_ns = Some(event.ts_ns);
                     snap.direction = event.direction;
+                    snap.size = event.quantity;
                     write_feed_line(&mut writer, "bybit", "trade", &snap).ok();
                 }
             }
@@ -123,6 +129,7 @@ fn main() {
                     snap.price = Some(price);
                     snap.ts_ns = Some(event.ts_ns);
                     snap.direction = event.direction;
+                    snap.size = event.quantity;
                     write_feed_line(&mut writer, "binance", "trade", &snap).ok();
                 }
             }
@@ -141,6 +148,7 @@ fn main() {
                 snap.price = Some(event.price);
                 snap.ts_ns = Some(event.ts_ns);
                 snap.direction = event.direction;
+                snap.size = event.quantity;
                 write_feed_line(&mut writer, "gate", "trade", &snap).ok();
             }
             last_gate.2 = st.gate.trade.seq;
@@ -159,6 +167,7 @@ fn main() {
                     snap.price = Some(price);
                     snap.ts_ns = Some(event.ts_ns);
                     snap.direction = event.direction;
+                    snap.size = event.quantity;
                     write_feed_line(&mut writer, "bitget", "trade", &snap).ok();
                 }
             }

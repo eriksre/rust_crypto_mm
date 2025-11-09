@@ -6,6 +6,8 @@ use std::time::Instant;
 
 use crate::base_classes::types::Ts;
 
+pub const SNAPSHOT_DEPTH: usize = 5;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TradeDirection {
     Buy,
@@ -30,8 +32,9 @@ pub struct FeedSnap {
     pub source_engine_ts_ns: Option<Ts>,
     pub source_system_ts_ns: Option<Ts>,
     pub direction: Option<TradeDirection>,
-    pub bid_levels: [Option<(f64, f64)>; 3],
-    pub ask_levels: [Option<(f64, f64)>; 3],
+    pub bid_levels: [Option<(f64, f64)>; SNAPSHOT_DEPTH],
+    pub ask_levels: [Option<(f64, f64)>; SNAPSHOT_DEPTH],
+    pub size: Option<f64>,
     pub received_at: Option<Instant>,
 }
 
