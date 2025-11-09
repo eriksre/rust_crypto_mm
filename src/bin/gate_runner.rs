@@ -5,7 +5,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Result, anyhow, bail};
 use clap::Parser;
-use rust_test::base_classes::engine::{configure_feed_overrides, spawn_state_engine};
+use rust_test::base_classes::engine::{
+    configure_demean_enabled, configure_feed_overrides, spawn_state_engine,
+};
 use rust_test::base_classes::reference::ReferenceEvent;
 use rust_test::base_classes::types::Side;
 use rust_test::config::runner::{
@@ -19,7 +21,8 @@ use rust_test::execution::{
 };
 use rust_test::logging::quote::{DebugLogger, QuoteLogHandle, format_f64};
 use rust_test::strategy::{ReferenceMeta, SimpleQuoteStrategy};
-use tokio::sync::{Mutex, Semaphore, mpsc};
+use parking_lot::Mutex;
+use tokio::sync::{Semaphore, mpsc};
 use tokio::time::{self, MissedTickBehavior, interval};
 
 #[derive(Debug, Parser)]
@@ -58,6 +61,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let mut config = load_runner_config(&cli.config)?;
     configure_feed_overrides(config.feeds);
+    configure_demean_enabled(config.mode.demean_prices);
     let debug = DebugLogger::new(config.mode.debug_prints);
 
     let contract_meta = rest::fetch_contract_meta_async(&config.strategy.symbol)
@@ -177,7 +181,7 @@ async fn main() -> Result<()> {
                         debug_clone
                             .info(|| format!("REST refresh: {} contracts", format_f64(contracts)));
                         let change = {
-                            let mut guard = inventory_clone.lock().await;
+                            let mut guard = inventory_clone.lock();
                             guard.replace_from_rest(contracts)
                         };
                         if let Some((prev, new)) = change {
@@ -189,7 +193,7 @@ async fn main() -> Result<()> {
                     Ok(None) => {
                         debug_clone.info(|| "REST refresh: no position reported".to_string());
                         let change = {
-                            let mut guard = inventory_clone.lock().await;
+                            let mut guard = inventory_clone.lock();
                             guard.replace_from_rest(0.0)
                         };
                         if let Some((prev, new)) = change {
@@ -425,7 +429,7 @@ async fn handle_market_update(
         received_at: reference.received_at,
     };
     let lock_start = Instant::now();
-    let mut strategy_guard = strategy.lock().await;
+    let mut strategy_guard = strategy.lock();
     let lock_wait = lock_start.elapsed();
     let queue_delay = lock_start.saturating_duration_since(reference.received_at);
     let dispatch_delay = lock_start.saturating_duration_since(dispatched_at);
@@ -551,8 +555,8 @@ async fn handle_quote_tick(
     let config_ref = config.as_ref();
 
     let plan_opt = match strategy.try_lock() {
-        Ok(mut guard) => guard.plan_quotes(now),
-        Err(_) => {
+        Some(mut guard) => guard.plan_quotes(now),
+        None => {
             if latency_debug_enabled() {
                 debug.latency(|| "latency-debug::quote skipped (strategy busy)".to_string());
             }
@@ -563,7 +567,7 @@ async fn handle_quote_tick(
     if let Some(mut plan) = plan_opt {
         let reference_price = plan.reference_price;
         let net_contracts = {
-            let guard = inventory.lock().await;
+            let guard = inventory.lock();
             guard.net_contracts()
         };
         let filter = filter_intents(
@@ -652,7 +656,7 @@ async fn handle_quote_tick(
         }
         {
             let commit_lock_start = Instant::now();
-            let mut strategy_guard = strategy.lock().await;
+            let mut strategy_guard = strategy.lock();
             if latency_debug_enabled() {
                 let wait = commit_lock_start.elapsed();
                 if wait > Duration::from_micros(200) {
@@ -664,7 +668,7 @@ async fn handle_quote_tick(
         }
         {
             let added_ids = {
-                let mut guard = inventory.lock().await;
+                let mut guard = inventory.lock();
                 guard.record_orders(&intents)
             };
             if !added_ids.is_empty() {
@@ -739,11 +743,11 @@ async fn drain_reports(
 
     for report in &reports {
         {
-            let mut strategy = strategy.lock().await;
+            let mut strategy = strategy.lock();
             strategy.handle_report(report);
         }
         let outcome = {
-            let mut guard = inventory.lock().await;
+            let mut guard = inventory.lock();
             guard.apply_report(report)
         };
 

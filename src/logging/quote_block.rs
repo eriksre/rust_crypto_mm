@@ -84,6 +84,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let mut config = load_runner_config(&cli.config)?;
     crate::base_classes::engine::configure_feed_overrides(config.feeds);
+    crate::base_classes::engine::configure_demean_enabled(config.mode.demean_prices);
     let debug = DebugLogger::new(config.mode.debug_prints);
 
     let contract_meta = gate_rest::fetch_contract_meta_async(&config.strategy.symbol)

@@ -66,10 +66,22 @@ impl BboStore {
         ts: Ts,
         system_ts_ns: Option<Ts>,
     ) {
+        use std::collections::hash_map::Entry;
         let symbol = symbol.into();
-        let entry = self.by_symbol.entry(symbol.clone()).or_default();
-        entry.set(bid_px, bid_qty, ask_px, ask_qty, ts, system_ts_ns);
-        self.last_symbol = Some(symbol);
+        match self.by_symbol.entry(symbol) {
+            Entry::Occupied(mut e) => {
+                e.get_mut().set(bid_px, bid_qty, ask_px, ask_qty, ts, system_ts_ns);
+                // Symbol already exists, update last_symbol if needed
+                if self.last_symbol.as_deref() != Some(e.key()) {
+                    self.last_symbol = Some(e.key().clone());
+                }
+            }
+            Entry::Vacant(e) => {
+                let key = e.key().clone();
+                e.insert(BboEntry::default()).set(bid_px, bid_qty, ask_px, ask_qty, ts, system_ts_ns);
+                self.last_symbol = Some(key);
+            }
+        }
     }
 
     #[inline(always)]

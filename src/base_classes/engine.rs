@@ -286,6 +286,7 @@ fn lock_state() -> std::sync::MutexGuard<'static, crate::base_classes::state::Gl
 }
 
 static FEED_OVERRIDES: OnceLock<FeedToggles> = OnceLock::new();
+static DEMEAN_ENABLED: OnceLock<bool> = OnceLock::new();
 
 /// Configure feed overrides before spawning the state engine.
 pub fn configure_feed_overrides(feeds: FeedToggles) {
@@ -303,6 +304,24 @@ pub fn configure_feed_overrides(feeds: FeedToggles) {
 
 fn current_feeds() -> FeedToggles {
     FEED_OVERRIDES.get().copied().unwrap_or_default()
+}
+
+/// Configure whether per-feed de-meaning should be applied when updating state.
+pub fn configure_demean_enabled(enabled: bool) {
+    if DEMEAN_ENABLED.set(enabled).is_err() {
+        if let Some(existing) = DEMEAN_ENABLED.get().copied() {
+            if existing != enabled {
+                eprintln!(
+                    "demean toggle already configured; keeping existing value {}",
+                    existing
+                );
+            }
+        }
+    }
+}
+
+fn demean_enabled() -> bool {
+    *DEMEAN_ENABLED.get_or_init(|| true)
 }
 
 #[cfg(feature = "gate_exec")]
@@ -346,6 +365,42 @@ fn spawn_gate_user_trades_listener(
                 }
             }
         });
+}
+
+struct DemeanController {
+    enabled: bool,
+    tracker: DemeanTracker,
+}
+
+impl DemeanController {
+    fn new(enabled: bool, window: Duration) -> Self {
+        Self {
+            enabled,
+            tracker: DemeanTracker::new(window),
+        }
+    }
+
+    fn record_other(&mut self, exchange: ExchangeKind, ts: Option<Ts>, price: Option<f64>) {
+        if self.enabled {
+            self.tracker.record_other(exchange, ts, price);
+        }
+    }
+
+    fn on_gate_event(
+        &mut self,
+        ts: Option<Ts>,
+        price: Option<f64>,
+    ) -> Vec<(ExchangeKind, ExchangeAdjustment)> {
+        if self.enabled {
+            self.tracker.on_gate_event(ts, price)
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
 }
 
 pub fn spawn_state_engine(
@@ -574,11 +629,12 @@ pub fn spawn_state_engine(
         let mut binance_tickers = TickerStore::default();
         let mut okx_tickers = TickerStore::default();
 
-        let mut demean = DemeanTracker::new(Duration::from_secs(8));
+        let mut demean = DemeanController::new(demean_enabled(), Duration::from_secs(8));
         let mut feed_gate = FeedTimestampGate::new();
 
+        let demean_active = demean.enabled();
         let apply_demean = |updates: &[(ExchangeKind, ExchangeAdjustment)]| {
-            if updates.is_empty() {
+            if !demean_active || updates.is_empty() {
                 return;
             }
             let mut st = lock_state();
@@ -633,10 +689,15 @@ pub fn spawn_state_engine(
                                                     Some(ob_ts),
                                                     Some(mid),
                                                 );
+                                                // Compute outside lock
                                                 let (bid_vec, ask_vec) =
                                                     bybit_book.top_levels_f64(SNAPSHOT_DEPTH);
                                                 let bid_levels = levels_to_array(&bid_vec);
                                                 let ask_levels = levels_to_array(&ask_vec);
+                                                let system_ts_ns =
+                                                    bybit_book.last_orderbook_system_ts_ns();
+                                                let recv_instant = f.recv_instant;
+                                                // Lock only for assignment
                                                 {
                                                     let mut st = lock_state();
                                                     let snap = &mut st.bybit.orderbook;
@@ -644,12 +705,11 @@ pub fn spawn_state_engine(
                                                     snap.seq = snap.seq.wrapping_add(1);
                                                     snap.ts_ns = Some(ts);
                                                     snap.source_engine_ts_ns = Some(ob_ts);
-                                                    snap.source_system_ts_ns =
-                                                        bybit_book.last_orderbook_system_ts_ns();
+                                                    snap.source_system_ts_ns = system_ts_ns;
                                                     snap.bid_levels = bid_levels;
                                                     snap.ask_levels = ask_levels;
                                                     snap.direction = None;
-                                                    snap.received_at = Some(f.recv_instant);
+                                                    snap.received_at = Some(recv_instant);
                                                 }
                                                 publisher.publish();
                                             }
@@ -701,6 +761,7 @@ pub fn spawn_state_engine(
                                                         Some(bbo_ts),
                                                         Some(mid),
                                                     );
+                                                    // Compute outside lock
                                                     let (bid_levels, ask_levels) =
                                                         if let Some(e) = entry {
                                                             (
@@ -719,6 +780,8 @@ pub fn spawn_state_engine(
                                                                 levels_to_array(&ask_vec),
                                                             )
                                                         };
+                                                    let recv_instant = f.recv_instant;
+                                                    // Lock only for assignment
                                                     {
                                                         let mut st = lock_state();
                                                         let snap = &mut st.bybit.bbo;
@@ -731,7 +794,7 @@ pub fn spawn_state_engine(
                                                         snap.bid_levels = bid_levels;
                                                         snap.ask_levels = ask_levels;
                                                         snap.direction = None;
-                                                        snap.received_at = Some(f.recv_instant);
+                                                        snap.received_at = Some(recv_instant);
                                                     }
                                                     publisher.publish();
                                                 }
@@ -1034,6 +1097,8 @@ pub fn spawn_state_engine(
                                         } else {
                                             ([None; SNAPSHOT_DEPTH], [None; SNAPSHOT_DEPTH])
                                         };
+                                        let recv_instant = f.recv_instant;
+                                        // Lock only for assignment
                                         {
                                             let mut st = lock_state();
                                             let snap = &mut st.binance.bbo;
@@ -1045,7 +1110,7 @@ pub fn spawn_state_engine(
                                             snap.bid_levels = bid_levels;
                                             snap.ask_levels = ask_levels;
                                             snap.direction = None;
-                                            snap.received_at = Some(f.recv_instant);
+                                            snap.received_at = Some(recv_instant);
                                         }
                                         publisher.publish();
                                     }
@@ -1276,6 +1341,7 @@ pub fn spawn_state_engine(
                                             Some(bbo_ts),
                                             f.recv_instant,
                                         );
+                                        // Compute outside lock
                                         let (bid_levels, ask_levels) = if let Some(e) = entry {
                                             (
                                                 level_from_option(Some((e.bid_px, e.bid_qty))),
@@ -1285,6 +1351,8 @@ pub fn spawn_state_engine(
                                             let (bid_vec, ask_vec) = gate_book.top_levels_f64(1);
                                             (levels_to_array(&bid_vec), levels_to_array(&ask_vec))
                                         };
+                                        let recv_instant = f.recv_instant;
+                                        // Lock only for assignment
                                         {
                                             let mut st = lock_state();
                                             let snap = &mut st.gate.bbo;
@@ -1296,7 +1364,7 @@ pub fn spawn_state_engine(
                                             snap.bid_levels = bid_levels;
                                             snap.ask_levels = ask_levels;
                                             snap.direction = None;
-                                            snap.received_at = Some(f.recv_instant);
+                                            snap.received_at = Some(recv_instant);
                                         }
                                         let updates = demean.on_gate_event(Some(bbo_ts), Some(mid));
                                         apply_demean(&updates);

@@ -19,6 +19,7 @@ mode:
   dry_run: true #switch for live vs dry run
   log_fills: false
   debug_prints: false
+  demean_prices: true #toggle to subtract per-feed bias before quoting/logging
 logging:
   enabled: true
   path: logs/gate_activity.csv

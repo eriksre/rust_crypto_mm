@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -68,7 +69,7 @@ pub struct SimpleQuoteStrategy {
     last_reference: Option<f64>,
     last_refresh_at: Option<Instant>,
     active_orders: Vec<ClientOrderId>,
-    pending_cancels: Vec<ClientOrderId>,
+    pending_cancels: HashSet<ClientOrderId>,
     latest_price: Option<f64>,
     latest_meta: Option<ReferenceMeta>,
     needs_requote: bool,
@@ -83,7 +84,7 @@ impl SimpleQuoteStrategy {
             last_reference: None,
             last_refresh_at: None,
             active_orders: Vec::new(),
-            pending_cancels: Vec::new(),
+            pending_cancels: HashSet::new(),
             latest_price: None,
             latest_meta: None,
             needs_requote: true,
@@ -140,7 +141,7 @@ impl SimpleQuoteStrategy {
         let has_uncancelled_live_orders = self
             .active_orders
             .iter()
-            .any(|id| !self.pending_cancels.iter().any(|pending| pending == id));
+            .any(|id| !self.pending_cancels.contains(id));
         if has_uncancelled_live_orders {
             return None;
         }
@@ -178,15 +179,13 @@ impl SimpleQuoteStrategy {
     pub fn handle_report(&mut self, report: &ExecutionReport) {
         match report.status {
             OrderStatus::Filled | OrderStatus::Canceled | OrderStatus::Rejected => {
-                self.pending_cancels
-                    .retain(|id| id != &report.client_order_id);
+                self.pending_cancels.remove(&report.client_order_id);
                 self.active_orders
                     .retain(|id| id != &report.client_order_id);
                 self.needs_requote = true;
             }
             OrderStatus::PartiallyFilled => {
-                self.pending_cancels
-                    .retain(|id| id != &report.client_order_id);
+                self.pending_cancels.remove(&report.client_order_id);
                 if !self
                     .active_orders
                     .iter()
@@ -197,13 +196,9 @@ impl SimpleQuoteStrategy {
                 self.needs_requote = true;
             }
             OrderStatus::New | OrderStatus::Unknown => {
-                let was_pending_cancel = self
-                    .pending_cancels
-                    .iter()
-                    .any(|id| id == &report.client_order_id);
+                let was_pending_cancel = self.pending_cancels.contains(&report.client_order_id);
                 if was_pending_cancel {
-                    self.pending_cancels
-                        .retain(|id| id != &report.client_order_id);
+                    self.pending_cancels.remove(&report.client_order_id);
                     self.needs_requote = true;
                 }
                 if !self
@@ -298,15 +293,12 @@ impl SimpleQuoteStrategy {
             return Vec::new();
         }
 
-        let mut newly_requested = Vec::new();
+        let mut newly_requested = Vec::with_capacity(self.active_orders.len());
         for id in &self.active_orders {
-            if !self.pending_cancels.iter().any(|pending| pending == id) {
+            if !self.pending_cancels.contains(id) {
                 newly_requested.push(id.clone());
+                self.pending_cancels.insert(id.clone());
             }
-        }
-
-        if !newly_requested.is_empty() {
-            self.pending_cancels.extend(newly_requested.iter().cloned());
         }
 
         newly_requested
