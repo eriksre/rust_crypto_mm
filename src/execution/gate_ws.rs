@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::spawn_blocking;
-use tokio::time::sleep;
+use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
 use crate::base_classes::state::{TradeDirection, state};
@@ -346,8 +346,19 @@ impl GateWsWorker {
                     backoff = initial_backoff;
                     let mut pending: HashMap<String, PendingRequest> = HashMap::new();
                     let mut should_exit = false;
+                    let heartbeat_period = Duration::from_secs(25);
+                    let mut heartbeat =
+                        interval_at(Instant::now() + heartbeat_period, heartbeat_period);
+                    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
                     while !should_exit {
                         tokio::select! {
+                            _ = heartbeat.tick() => {
+                                if let Err(err) = self.send_heartbeat_ping(&mut sink).await {
+                                    eprintln!("Gate WS heartbeat send failed: {:#}", err);
+                                    self.fail_pending(&mut pending, anyhow!("heartbeat send failed: {err}"));
+                                    break;
+                                }
+                            }
                             Some(cmd) = self.command_rx.recv() => {
                                 should_exit = self.handle_command(cmd, &mut sink, &mut pending).await?;
                             }
@@ -907,6 +918,22 @@ impl GateWsWorker {
         }
         let signed = if intent.side == Side::Bid { raw } else { -raw };
         Ok(signed)
+    }
+
+    async fn send_heartbeat_ping(
+        &self,
+        sink: &mut futures_util::stream::SplitSink<
+            WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+            Message,
+        >,
+    ) -> Result<()> {
+        let ping = json!({
+            "time": current_unix_ts(),
+            "channel": GateioWs::PING,
+            "event": "ping",
+        });
+        sink.send(Message::Text(ping.to_string())).await?;
+        Ok(())
     }
 
     fn fail_pending(&mut self, pending: &mut HashMap<String, PendingRequest>, err: anyhow::Error) {
