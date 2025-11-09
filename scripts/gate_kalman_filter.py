@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
 """
-Multi-venue pricing framework for Gate quoting overlays.
+Anchor-biased pricing helper.
 
-The previous version of this module only exposed CSV loading helpers.  It now
-builds a latency-aware, depth-weighted consensus from every venue in the activity
-log, blends it with the live Gate mid (only when Gate is trustworthy), applies a
-mean-reversion guardrail to damp flash-move thrash, and finally runs a 1-D
-Kalman filter so plotting utilities can visualise an efficient price together
-with its confidence band.
+Uses a single anchor venue to define the fair price F_t, learns a slow-moving
+structural bias b[v] for every other venue (aligned via the anchor slope), and
+exposes the same `run_analysis` API that the plotting scripts expect.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import argparse
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
@@ -26,49 +24,28 @@ import pandas as pd
 
 
 @dataclass
-class BasicSettings:
-    """Configuration driving the consensus + Kalman pipeline."""
-
+class Settings:
     input_path: Path = Path("logs/gate_activity.csv")
     row_limit: Optional[int] = None
-    exchange_filter: Optional[str] = None  # When provided, becomes the target venue.
 
-    # Market data selection / normalisation.
-    target_exchange: str = "gate"
-    target_aliases: Tuple[str, ...] = ("gate", "gateio")
-    market_feeds: Tuple[str, ...] = ("orderbook", "bbo", "trade")
+    anchor_exchange: str = "gate"
+    target_aliases: tuple[str, ...] = ("gate", "gateio")
 
-    # Resampling parameters.
-    resample_ms: int = 50
-    max_staleness_ms: int = 600
+    bias_alpha: float = 0.004
+    rejection_threshold_bp: float = 40.0
+    max_alignment_gap_ns: int = 100_000_000  # 250 ms
+    slope_cap_abs: float = 100.0  # $/s
 
-    # Weighting heuristics.
-    consensus_half_life_ms: int = 350
-    latency_half_life_ms: int = 150
-    outlier_threshold_bp: float = 35.0
-    gate_outlier_bp: float = 80.0
-    gate_base_weight: float = 0.78
-    lead_time_ms: float = 80.0
-    lead_bonus: float = 0.2
-
-    # Mean reversion guardrail.
-    mean_reversion_threshold_pct: float = 0.004  # 40 bps
-    mean_reversion_shrink: float = 0.15
-    mean_reversion_span: int = 80
-
-    # Kalman tuning.
-    process_noise: float = 2e-5
-    measurement_noise: float = 8e-4
-    dispersion_ref: float = 0.0015
+    volatility_alpha: float = 0.25
+    min_state_variance: float = 1e-4
 
 
-DEFAULT_SETTINGS = BasicSettings()
+DEFAULT_SETTINGS = Settings()
+DEFAULT_SIGMA = 2.0
 
 
 @dataclass
 class RegressionSummary:
-    """Regression diagnostics for consensus -> Gate prediction."""
-
     coefficients: pd.Series
     rmse: float
     mae: float
@@ -84,362 +61,246 @@ EMPTY_SUMMARY = RegressionSummary(
 
 
 # --------------------------------------------------------------------------- #
-# Loading & preparation                                                       #
+# Loading & bias learning                                                     #
 # --------------------------------------------------------------------------- #
 
 
-def load_events(settings: BasicSettings = DEFAULT_SETTINGS) -> pd.DataFrame:
-    """Load the activity CSV and apply very light normalisation."""
+def load_ticks(settings: Settings = DEFAULT_SETTINGS) -> pd.DataFrame:
+    """Load CSV, keep market rows, derive mid, normalise venues."""
 
     path = settings.input_path.expanduser()
     if not path.exists():
-        raise FileNotFoundError(f"Input file does not exist: {path}")
+        raise FileNotFoundError(f"CSV not found: {path}")
 
     df = pd.read_csv(path, nrows=settings.row_limit, low_memory=False)
     if "ts_ns" not in df.columns:
-        raise ValueError("CSV is missing 'ts_ns'; cannot build a timeline.")
+        raise ValueError("CSV missing 'ts_ns'")
 
     df["ts_ns"] = pd.to_numeric(df["ts_ns"], errors="coerce")
     df = df.dropna(subset=["ts_ns"]).copy()
 
-    categorical = ("exchange", "feed", "event_type", "direction")
-    for col in categorical:
+    for col in ("exchange", "feed", "event_type"):
         if col in df.columns:
             df[col] = df[col].astype(str).str.lower().str.strip()
 
-    return df.reset_index(drop=True)
-
-
-def _normalise_exchange(value: str, alias_map: Dict[str, str]) -> str:
-    key = str(value).lower().strip()
-    return alias_map.get(key, key)
-
-
-def prepare_market_events(df: pd.DataFrame, settings: BasicSettings) -> pd.DataFrame:
-    """Filter to market data rows and derive per-feed metrics."""
-
-    if df.empty:
-        return df
-
-    target_override = (settings.exchange_filter or settings.target_exchange).lower()
-    alias_map = {alias.lower(): target_override for alias in settings.target_aliases}
-    alias_map[target_override] = target_override
-
-    numeric_cols = [
-        "price",
-        "bid_px_1",
-        "ask_px_1",
-        "bid_sz_1",
-        "ask_sz_1",
-        "bid_depth",
-        "ask_depth",
-        "source_engine_ts_ns",
-        "source_system_ts_ns",
-        "size",
-    ]
-    for col in numeric_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
     market = df[df["event_type"] == "market"].copy()
-    market = market[market["feed"].isin(settings.market_feeds)]
     if market.empty:
         return market
 
-    bid = market.get("bid_px_1")
-    ask = market.get("ask_px_1")
-    has_book = bid.notna() & ask.notna() if bid is not None and ask is not None else pd.Series(False, index=market.index)
-    market["mid_price"] = np.where(
-        has_book,
-        (bid + ask) / 2.0,
-        market["price"],
-    )
-    market["mid_price"] = market["mid_price"].astype(float)
-
-    market["liquidity_score"] = (
-        market.get("bid_depth", 0.0).fillna(0.0)
-        + market.get("ask_depth", 0.0).fillna(0.0)
-    )
-    if "bid_sz_1" in market.columns and "ask_sz_1" in market.columns:
-        top_depth = market["bid_sz_1"].fillna(0.0) + market["ask_sz_1"].fillna(0.0)
-        market["liquidity_score"] = market["liquidity_score"].where(
-            market["liquidity_score"] > 0, top_depth
+    if "bid_px_1" in market.columns and "ask_px_1" in market.columns:
+        market["mid_price"] = np.where(
+            market["bid_px_1"].notna() & market["ask_px_1"].notna(),
+            (market["bid_px_1"] + market["ask_px_1"]) / 2.0,
+            market.get("price", np.nan),
         )
-
-    if "size" in market.columns:
-        market.loc[market["feed"] == "trade", "liquidity_score"] = market.loc[
-            market["feed"] == "trade", "size"
-        ].abs()
-
-    market["liquidity_score"] = np.log1p(market["liquidity_score"].clip(lower=0.0))
-
-    if has_book.any():
-        spread = (ask - bid).where(has_book)
-        mid = ((ask + bid) / 2.0).where(has_book)
-        market["spread_pct"] = (spread / mid).replace([np.inf, -np.inf], np.nan)
     else:
-        market["spread_pct"] = np.nan
-
-    if "source_engine_ts_ns" in market.columns:
-        latency_ns = market["ts_ns"] - market["source_engine_ts_ns"]
-        market["latency_ms"] = latency_ns / 1e6
-    else:
-        market["latency_ms"] = np.nan
+        market["mid_price"] = market.get("price", np.nan)
 
     market = market.dropna(subset=["mid_price"]).copy()
+    market = market.sort_values("ts_ns").reset_index(drop=True)
+
+    anchor_target = settings.anchor_exchange.lower()
+    alias_map = {alias.lower(): anchor_target for alias in settings.target_aliases}
+    alias_map[anchor_target] = anchor_target
+
+    market["venue"] = market["exchange"].apply(
+        lambda x: alias_map.get(str(x).lower().strip(), str(x).lower().strip())
+    )
     market["timestamp"] = pd.to_datetime(market["ts_ns"], unit="ns", utc=True)
-    market["venue"] = market["exchange"].apply(lambda x: _normalise_exchange(x, alias_map))
+    return market
 
-    feed_priority = {"orderbook": 0, "bbo": 1, "trade": 2}
-    market["feed_priority"] = market["feed"].map(feed_priority).fillna(5)
-    market = market.sort_values(["ts_ns", "feed_priority"])
-    market = market.drop_duplicates(subset=["ts_ns", "venue"], keep="first")
-    return market.reset_index(drop=True)
+
+def learn_bias_series(
+    market: pd.DataFrame,
+    settings: Settings,
+) -> tuple[pd.Series, pd.Series, pd.DataFrame]:
+    """Align venues to anchor timeline and learn slow-moving biases."""
+
+    if market.empty:
+        empty = pd.Series(dtype=float)
+        return empty, empty, pd.DataFrame()
+
+    anchor = settings.anchor_exchange.lower()
+    venues = sorted(market["venue"].unique())
+    biases: Dict[str, float] = {v: 0.0 for v in venues}
+
+    anchor_prices = []
+    anchor_times = []
+    state_vars = []
+    bias_snapshots = []
+
+    last_anchor_price: Optional[float] = None
+    last_anchor_ts: Optional[int] = None
+    anchor_slope = 0.0
+    volatility_state = settings.min_state_variance
+
+    rejection_scale = max(settings.rejection_threshold_bp, 1e-3) / 10_000.0
+
+    for row in market.itertuples():
+        venue = row.venue
+        price = float(row.mid_price)
+        ts_ns = int(row.ts_ns)
+
+        if venue == anchor:
+            if last_anchor_price is not None and last_anchor_ts is not None:
+                dt_s = (ts_ns - last_anchor_ts) / 1e9
+                if dt_s > 0:
+                    candidate = (price - last_anchor_price) / dt_s
+                    if abs(candidate) <= settings.slope_cap_abs:
+                        anchor_slope = candidate
+                price_delta = price - last_anchor_price
+                volatility_state = (
+                    (1.0 - settings.volatility_alpha) * volatility_state
+                    + settings.volatility_alpha * (price_delta ** 2)
+                )
+            last_anchor_price = price
+            last_anchor_ts = ts_ns
+
+            anchor_prices.append(price)
+            anchor_times.append(ts_ns)
+            state_vars.append(max(volatility_state, settings.min_state_variance))
+            bias_snapshots.append({v: biases.get(v, 0.0) for v in venues})
+            continue
+
+        if last_anchor_price is None or last_anchor_ts is None:
+            continue
+
+        gap_ns = ts_ns - last_anchor_ts
+        if gap_ns < 0 or gap_ns > settings.max_alignment_gap_ns:
+            continue
+
+        dt_s = gap_ns / 1e9
+        aligned_anchor = last_anchor_price + anchor_slope * dt_s
+        diff = price - aligned_anchor
+        current_bias = biases.get(venue, 0.0)
+        threshold = rejection_scale * max(abs(aligned_anchor), 1.0)
+
+        if abs(diff - current_bias) <= threshold:
+            new_bias = (1.0 - settings.bias_alpha) * current_bias + settings.bias_alpha * diff
+            biases[venue] = new_bias
+
+    if not anchor_times:
+        empty = pd.Series(dtype=float)
+        return empty, empty, pd.DataFrame()
+
+    index = pd.to_datetime(anchor_times, unit="ns", utc=True).tz_convert(None)
+    anchor_series = pd.Series(anchor_prices, index=index, dtype=float)
+    state_var_series = pd.Series(state_vars, index=index, dtype=float)
+    bias_df = pd.DataFrame(bias_snapshots, index=index, columns=venues)
+    bias_df = bias_df.ffill().fillna(0.0)
+
+    return anchor_series, state_var_series, bias_df
 
 
 # --------------------------------------------------------------------------- #
-# Consensus building                                                          #
+# Plot helpers                                                                #
 # --------------------------------------------------------------------------- #
 
 
-def _build_timeline_index(market: pd.DataFrame, settings: BasicSettings) -> pd.DatetimeIndex:
-    start = pd.to_datetime(market["ts_ns"].min(), unit="ns", utc=True)
-    end = pd.to_datetime(market["ts_ns"].max(), unit="ns", utc=True)
-    if start == end:
-        return pd.DatetimeIndex([start])
-
-    freq_value = max(1, settings.resample_ms)
-    freq = f"{freq_value}ms"
-    aligned_start = start.floor(freq)
-    aligned_end = end.ceil(freq)
-    return pd.date_range(aligned_start, aligned_end, freq=freq)
+def _lazy_import_matplotlib():
+    try:
+        import matplotlib.dates as mdates  # type: ignore
+        import matplotlib.pyplot as plt  # type: ignore
+    except ImportError as exc:  # pragma: no cover
+        raise SystemExit(
+            "matplotlib is required for plotting; install it or use plot_mid_with_quotes.py."
+        ) from exc
+    return mdates, plt
 
 
-def _pivot_feature(
-    market: pd.DataFrame,
-    column: str,
-    timeline: pd.DatetimeIndex,
-    limit: int,
-) -> pd.DataFrame:
-    if column not in market.columns:
-        return pd.DataFrame(index=timeline)
+def _plot_market_scatter(ax, market: pd.DataFrame) -> None:
+    if market.empty:
+        return
 
-    pivot = (
-        market.pivot_table(index="timestamp", columns="venue", values=column, aggfunc="last")
-        .sort_index()
-    )
-    pivot = pivot.reindex(timeline)
-    pivot = pivot.ffill(limit=limit)
-    return pivot
+    feeds = {"orderbook", "bbo", "trade"}
+    subset = market[market["feed"].isin(feeds)].copy()
+    if subset.empty:
+        return
 
+    color_map = {
+        "bybit": "tab:blue",
+        "binance": "tab:orange",
+        "gate": "tab:green",
+        "gateio": "tab:green",
+        "bitget": "tab:red",
+        "okx": "tab:purple",
+    }
+    marker_map = {"bbo": "o", "orderbook": "s", "trade": "^"}
 
-def _compute_staleness(
-    market: pd.DataFrame,
-    timeline: pd.DatetimeIndex,
-) -> pd.DataFrame:
-    ts_pivot = (
-        market.pivot_table(index="timestamp", columns="venue", values="ts_ns", aggfunc="last")
-        .sort_index()
-    )
-    ts_pivot = ts_pivot.reindex(timeline).ffill()
-    timeline_ns = timeline.view("int64")
-    values = (timeline_ns.reshape(-1, 1) - ts_pivot.to_numpy()) / 1e6
-    staleness = pd.DataFrame(values, index=timeline, columns=ts_pivot.columns)
-    return staleness
+    seen = set()
+    for (exchange, feed), group in subset.groupby(["exchange", "feed"]):
+        label = f"{exchange}:{feed}"
+        if label in seen:
+            label = None
+        seen.add(f"{exchange}:{feed}")
 
-
-def _compute_consensus(
-    prices: pd.DataFrame,
-    liquidity: pd.DataFrame,
-    latency: pd.DataFrame,
-    staleness: pd.DataFrame,
-    settings: BasicSettings,
-) -> tuple[pd.Series, pd.DataFrame, pd.Series, pd.Series]:
-    if prices.empty:
-        index = liquidity.index if not liquidity.empty else pd.Index([])
-        return (
-            pd.Series(dtype=float, index=index),
-            pd.DataFrame(index=index),
-            pd.Series(dtype=float, index=index),
-            pd.Series(dtype=float, index=index),
+        timestamps = group["timestamp"].dt.tz_convert("UTC").dt.tz_localize(None)
+        ax.scatter(
+            timestamps,
+            group["mid_price"],
+            s=12,
+            c=color_map.get(exchange, "grey"),
+            marker=marker_map.get(feed, "."),
+            alpha=0.55,
+            label=label,
         )
 
-    limit_mask = prices.notna()
-    freshness = np.exp(
-        -staleness.clip(lower=0.0).divide(settings.consensus_half_life_ms)
+
+def _plot_fair_band(ax, price_frame: pd.DataFrame, sigma: float) -> None:
+    if price_frame.empty:
+        return
+
+    required = {"timestamp", "efficient_price", "state_variance"}
+    missing = required - set(price_frame.columns)
+    if missing:
+        raise ValueError(f"Price frame missing columns: {missing}")
+
+    clean = price_frame.dropna(subset=["efficient_price"]).copy()
+    if clean.empty:
+        return
+
+    timestamps = pd.to_datetime(clean["timestamp"])
+    mean_series = clean["efficient_price"]
+    std_series = np.sqrt(clean["state_variance"].clip(lower=0.0))
+    delta = sigma * std_series
+
+    ax.plot(
+        timestamps,
+        mean_series,
+        color="black",
+        linewidth=1.8,
+        label="Anchor fair (F_t)",
+        zorder=5,
     )
-    freshness = freshness.where(limit_mask, 0.0)
-
-    latency_penalty = np.exp(
-        -latency.clip(lower=0.0).divide(settings.latency_half_life_ms)
-    ).where(limit_mask, 0.0)
-
-    base_weight = liquidity.where(limit_mask, 0.0).fillna(0.0) + 1.0
-
-    median = prices.median(axis=1, skipna=True)
-    median = median.replace(0.0, np.nan)
-    diff_pct = prices.subtract(median, axis=0).abs().divide(median.abs(), axis=0)
-    threshold = max(settings.outlier_threshold_bp, 1e-3) / 10000.0
-    outlier_penalty = np.exp(-np.square(diff_pct / threshold)).where(limit_mask, 0.0)
-
-    weights = base_weight * freshness * latency_penalty * outlier_penalty
-    weight_sum = weights.sum(axis=1)
-    consensus = weights.mul(prices).sum(axis=1).divide(weight_sum)
-
-    abs_dev = prices.subtract(median, axis=0).abs()
-    mad = abs_dev.median(axis=1, skipna=True)
-    dispersion = (mad / median.abs()).replace([np.inf, -np.inf], np.nan)
-    obs_count = limit_mask.sum(axis=1)
-
-    return consensus, weights, dispersion, obs_count
-
-
-# --------------------------------------------------------------------------- #
-# Regression + blending                                                       #
-# --------------------------------------------------------------------------- #
-
-
-def _fit_gate_regression(consensus: pd.Series, gate_mid: pd.Series) -> RegressionSummary:
-    reg_df = pd.DataFrame(
-        {
-            "gate_mid": gate_mid,
-            "consensus": consensus,
-            "gate_lag": gate_mid.shift(1),
-        }
-    ).dropna()
-
-    if reg_df.empty or len(reg_df) < 50:
-        return EMPTY_SUMMARY
-
-    X = np.column_stack(
-        [
-            np.ones(len(reg_df)),
-            reg_df["consensus"].to_numpy(),
-            reg_df["gate_lag"].to_numpy(),
-        ]
-    )
-    y = reg_df["gate_mid"].to_numpy()
-    coeffs, *_ = np.linalg.lstsq(X, y, rcond=None)
-    preds = X @ coeffs
-    residuals = y - preds
-
-    summary = RegressionSummary(
-        coefficients=pd.Series(
-            coeffs,
-            index=["intercept", "consensus", "gate_lag"],
-            dtype=float,
-        ),
-        rmse=float(np.sqrt(np.mean(np.square(residuals)))),
-        mae=float(np.mean(np.abs(residuals))),
-        sample_count=len(reg_df),
-    )
-    return summary
-
-
-def _apply_mean_reversion(series: pd.Series, settings: BasicSettings) -> pd.Series:
-    if series.empty:
-        return series
-
-    ema = series.ewm(span=settings.mean_reversion_span, adjust=False, ignore_na=True).mean()
-    diff = series - ema
-    rel = diff.divide(ema).replace([np.inf, -np.inf], np.nan)
-    excess = rel.abs() - settings.mean_reversion_threshold_pct
-    mask = excess > 0
-    adjusted = ema + np.sign(diff) * ema * (
-        settings.mean_reversion_threshold_pct + excess * (1.0 - settings.mean_reversion_shrink)
-    )
-    result = series.copy()
-    result[mask] = adjusted[mask]
-    return result
-
-
-def _blend_gate_with_consensus(
-    consensus: pd.Series,
-    gate_mid: pd.Series,
-    staleness: pd.Series,
-    latency: pd.Series,
-    settings: BasicSettings,
-) -> tuple[pd.Series, pd.Series]:
-    if consensus.empty and gate_mid.empty:
-        return consensus, pd.Series(dtype=float, index=consensus.index)
-
-    gate_weight = pd.Series(0.0, index=consensus.index)
-    if gate_mid.empty:
-        blended = consensus
-        return blended, gate_weight
-
-    freshness = np.exp(-staleness.clip(lower=0.0) / settings.consensus_half_life_ms)
-    latency_penalty = np.exp(-latency.clip(lower=0.0) / settings.latency_half_life_ms)
-    scale = max(settings.gate_outlier_bp, 1e-3) / 10000.0
-    diff_pct = (gate_mid - consensus).abs().divide(consensus.abs())
-    outlier_penalty = np.exp(-np.square(diff_pct / scale))
-
-    gate_weight = (
-        settings.gate_base_weight
-        * freshness.fillna(0.0)
-        * latency_penalty.fillna(1.0)
-        * outlier_penalty.fillna(0.0)
+    ax.fill_between(
+        timestamps,
+        mean_series - delta,
+        mean_series + delta,
+        color="black",
+        alpha=0.15,
+        label=f"{sigma:.1f}σ envelope",
+        zorder=4,
     )
 
-    gate_weight = gate_weight.clip(lower=0.0, upper=1.0)
 
-    blended = consensus.copy()
-    mask = gate_mid.notna() & consensus.notna()
-    blended[mask] = (
-        (1.0 - gate_weight[mask]) * consensus[mask] + gate_weight[mask] * gate_mid[mask]
-    )
-    blended = blended.where(consensus.notna(), gate_mid)
-    blended = blended.where(blended.notna(), gate_mid)
-    return blended, gate_weight
+def _plot_market_with_overlay(
+    market: pd.DataFrame,
+    price_frame: pd.DataFrame,
+    sigma: float = DEFAULT_SIGMA,
+) -> None:
+    mdates, plt = _lazy_import_matplotlib()
+    fig, ax = plt.subplots(figsize=(14, 6))
+    _plot_market_scatter(ax, market)
+    _plot_fair_band(ax, price_frame, sigma)
 
-
-# --------------------------------------------------------------------------- #
-# Kalman filtering                                                            #
-# --------------------------------------------------------------------------- #
-
-
-def _run_kalman_filter(
-    observations: pd.Series,
-    measurement_var: pd.Series,
-    settings: BasicSettings,
-) -> tuple[pd.Series, pd.Series, pd.Series]:
-    if observations.empty:
-        return observations, measurement_var, measurement_var
-
-    non_nan = observations.dropna()
-    if non_nan.empty:
-        empty = pd.Series(np.nan, index=observations.index, dtype=float)
-        gains = pd.Series(0.0, index=observations.index, dtype=float)
-        return empty, empty.copy(), gains
-
-    state_est = pd.Series(index=observations.index, dtype=float)
-    state_var = pd.Series(index=observations.index, dtype=float)
-    gains = pd.Series(index=observations.index, dtype=float)
-
-    estimate = non_nan.iloc[0]
-    variance = measurement_var.dropna().iloc[0] if measurement_var.dropna().any() else settings.measurement_noise
-
-    for idx in observations.index:
-        pred_est = estimate
-        pred_var = variance + settings.process_noise
-        obs = observations.loc[idx]
-        meas_var = measurement_var.loc[idx] if not pd.isna(measurement_var.loc[idx]) else settings.measurement_noise
-
-        if pd.isna(obs):
-            estimate = pred_est
-            variance = pred_var
-            gain = 0.0
-        else:
-            kalman_gain = pred_var / (pred_var + meas_var)
-            estimate = pred_est + kalman_gain * (obs - pred_est)
-            variance = (1.0 - kalman_gain) * pred_var
-            gain = kalman_gain
-
-        state_est.loc[idx] = estimate
-        state_var.loc[idx] = variance
-        gains.loc[idx] = gain
-
-    return state_est, state_var, gains
+    ax.set_title("Market feeds with anchor fair overlay")
+    ax.set_ylabel("Price")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1), borderaxespad=0.0)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S.%f"))
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    plt.show()
 
 
 # --------------------------------------------------------------------------- #
@@ -448,130 +309,71 @@ def _run_kalman_filter(
 
 
 def run_analysis(
-    settings: BasicSettings = DEFAULT_SETTINGS,
+    settings: Settings = DEFAULT_SETTINGS,
+    preloaded: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, RegressionSummary]:
-    """Entry point consumed by plotting scripts."""
-
-    df = load_events(settings)
-    market = prepare_market_events(df, settings)
+    market = preloaded if preloaded is not None else load_ticks(settings)
     if market.empty:
         return pd.DataFrame(), pd.DataFrame(), EMPTY_SUMMARY
 
-    target = (settings.exchange_filter or settings.target_exchange).lower()
-    timeline = _build_timeline_index(market, settings)
-    if timeline.empty:
+    anchor_series, state_var_series, bias_df = learn_bias_series(market, settings)
+    if anchor_series.empty:
         return pd.DataFrame(), pd.DataFrame(), EMPTY_SUMMARY
 
-    ffill_limit = max(1, int(np.floor(settings.max_staleness_ms / settings.resample_ms)))
-    prices = _pivot_feature(market, "mid_price", timeline, ffill_limit)
-    liquidity = _pivot_feature(market, "liquidity_score", timeline, ffill_limit)
-    latency = _pivot_feature(market, "latency_ms", timeline, ffill_limit)
-    staleness = _compute_staleness(market, timeline)
-
-    # Align matrices.
-    common_cols = prices.columns
-    liquidity = liquidity.reindex(columns=common_cols)
-    latency = latency.reindex(columns=common_cols)
-    staleness = staleness.reindex(columns=common_cols)
-
-    external_cols = [col for col in prices.columns if col != target]
-    if not external_cols:
-        external_cols = list(prices.columns)
-
-    consensus, weights, dispersion, obs_count = _compute_consensus(
-        prices[external_cols],
-        liquidity[external_cols],
-        latency[external_cols],
-        staleness[external_cols],
-        settings,
-    )
-
-    gate_mid = prices[target] if target in prices.columns else pd.Series(dtype=float, index=timeline)
-    gate_latency = latency[target] if target in latency.columns else pd.Series(dtype=float, index=timeline)
-    gate_staleness = staleness[target] if target in staleness.columns else pd.Series(dtype=float, index=timeline)
-
-    blended, gate_weight = _blend_gate_with_consensus(
-        consensus,
-        gate_mid,
-        gate_staleness,
-        gate_latency,
-        settings,
-    )
-
-    regression_summary = _fit_gate_regression(consensus, gate_mid)
-    reg_inputs = pd.DataFrame(
-        {
-            "consensus": consensus,
-            "gate_lag": gate_mid.shift(1),
-        }
-    )
-    if regression_summary.sample_count > 0:
-        coeffs = regression_summary.coefficients.reindex(["intercept", "consensus", "gate_lag"]).fillna(0.0)
-        reg_preds = coeffs["intercept"] + coeffs["consensus"] * reg_inputs["consensus"] + coeffs["gate_lag"] * reg_inputs["gate_lag"]
-    else:
-        reg_preds = pd.Series(dtype=float, index=timeline)
-
-    blended = blended.combine_first(reg_preds)
-    blended = blended.combine_first(consensus)
-
-    mean_reverted = _apply_mean_reversion(blended, settings)
-
-    dispersion = dispersion.reindex(timeline).ffill()
-    dispersion = dispersion.fillna(0.0)
-    effective_meas = settings.measurement_noise * (1.0 + np.square(dispersion / max(settings.dispersion_ref, 1e-6)))
-    effective_meas = effective_meas.divide(obs_count.clip(lower=1))
-
-    efficient_price, state_var, kalman_gain = _run_kalman_filter(
-        mean_reverted,
-        effective_meas,
-        settings,
-    )
-
+    index = anchor_series.index
+    state_var_series = state_var_series.reindex(index, method="ffill").fillna(settings.min_state_variance)
     price_frame = pd.DataFrame(
         {
-            "timestamp": timeline,
-            "consensus_price": consensus.reindex(timeline),
-            "consensus_dispersion": dispersion.reindex(timeline),
-            "external_weight_sum": weights.sum(axis=1).reindex(timeline),
-            "obs_count": obs_count.reindex(timeline),
-            "gate_mid": gate_mid.reindex(timeline),
-            "gate_weight": gate_weight.reindex(timeline),
-            "blended_price": blended.reindex(timeline),
-            "mean_reverted_price": mean_reverted.reindex(timeline),
-            "efficient_price": efficient_price.reindex(timeline),
-            "state_variance": state_var.reindex(timeline),
-            "measurement_var": effective_meas.reindex(timeline),
-            "kalman_gain": kalman_gain.reindex(timeline),
+            "timestamp": index,
+            "efficient_price": anchor_series.values,
+            "consensus_price": anchor_series.values,
+            "state_variance": state_var_series.values,
         }
-    ).dropna(subset=["timestamp"]).reset_index(drop=True)
-
-    diag_frames = []
-    for col in prices.columns:
-        diag = pd.DataFrame(
-            {
-                "timestamp": timeline,
-                "exchange": col,
-                "mid_price": prices[col],
-                "liquidity_score": liquidity[col],
-                "latency_ms": latency[col],
-                "staleness_ms": staleness[col],
-                "weight": weights[col] if col in weights.columns else (gate_weight if col == target else np.nan),
-            }
-        )
-        diag_frames.append(diag)
-
-    diagnostics = (
-        pd.concat(diag_frames, ignore_index=True)
-        .dropna(subset=["mid_price"], how="all")
-        .reset_index(drop=True)
     )
 
-    return price_frame, diagnostics, regression_summary
+    for venue in bias_df.columns:
+        price_frame[f"bias_{venue}"] = bias_df[venue].reindex(index).values
+        price_frame[f"local_fair_{venue}"] = anchor_series.add(bias_df[venue], axis=0).reindex(index).values
+
+    bias_long = bias_df.stack().reset_index()
+    bias_long.columns = ["timestamp", "exchange", "bias"]
+    bias_long["local_fair"] = bias_long["timestamp"].map(anchor_series).add(bias_long["bias"], fill_value=np.nan)
+
+    return price_frame, bias_long, EMPTY_SUMMARY
 
 
 def main() -> None:
-    prices, _, summary = run_analysis(DEFAULT_SETTINGS)
-    print(f"Generated {len(prices)} price points. Regression samples: {summary.sample_count}.")
+    parser = argparse.ArgumentParser(description="Anchor-based fair overlay")
+    parser.add_argument(
+        "csv",
+        nargs="?",
+        default=str(DEFAULT_SETTINGS.input_path),
+        help="Path to gate activity CSV",
+    )
+    parser.add_argument("--exchange", help="Anchor override (e.g. gate, bybit)")
+    parser.add_argument("--row-limit", type=int, help="Optional row limit")
+    parser.add_argument("--sigma", type=float, default=DEFAULT_SIGMA, help="Envelope width (σ)")
+    args = parser.parse_args()
+
+    csv_path = Path(args.csv).expanduser()
+    if not csv_path.exists():
+        raise SystemExit(f"CSV not found: {csv_path}")
+
+    settings = replace(
+        DEFAULT_SETTINGS,
+        input_path=csv_path,
+        row_limit=args.row_limit if args.row_limit is not None else DEFAULT_SETTINGS.row_limit,
+        anchor_exchange=args.exchange.lower() if args.exchange else DEFAULT_SETTINGS.anchor_exchange,
+        target_aliases=DEFAULT_SETTINGS.target_aliases,
+    )
+
+    market = load_ticks(settings)
+    price_frame, _, _ = run_analysis(settings, preloaded=market)
+    if price_frame.empty:
+        print("No anchor data available.")
+        return
+
+    _plot_market_with_overlay(market, price_frame, sigma=args.sigma)
 
 
 if __name__ == "__main__":

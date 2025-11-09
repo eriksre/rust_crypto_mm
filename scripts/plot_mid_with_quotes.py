@@ -4,19 +4,14 @@
 
 import argparse
 from collections import defaultdict
-from dataclasses import replace
 from pathlib import Path
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
-
-from gate_kalman_filter import DEFAULT_SETTINGS, run_analysis
 
 
 MARKET_FEEDS = ("orderbook", "bbo", "trade")
-KALMAN_CI_SIGMA = 2.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -75,7 +70,7 @@ def load_dataframe(path: Path) -> pd.DataFrame:
         df["ref_dt"] = pd.NaT
     return df.dropna(subset=["dt"])
 
-``
+
 def split_frames(df: pd.DataFrame, exchange_filter: str | None):
     if exchange_filter:
         df = df[df["exchange"] == exchange_filter.lower()]
@@ -86,22 +81,6 @@ def split_frames(df: pd.DataFrame, exchange_filter: str | None):
     fills = df[df["event_type"] == "fill"].copy()
     reports = df[df["event_type"] == "report"].copy()
     return market, quotes, cancels, fills, reports
-
-
-def compute_kalman_overlay(csv_path: Path, exchange_filter: str | None) -> pd.DataFrame | None:
-    """Run the Kalman filter pipeline for the provided CSV."""
-    target_exchange = exchange_filter.lower() if exchange_filter else None
-    settings = replace(
-        DEFAULT_SETTINGS,
-        input_path=csv_path,
-        exchange_filter=target_exchange,
-    )
-    try:
-        kalman_df, _, _ = run_analysis(settings)
-    except Exception as exc:  # pragma: no cover - plotting utility
-        print(f"[kalman] unable to compute overlay: {exc}")
-        return None
-    return kalman_df
 
 
 def build_quote_lifecycles(
@@ -262,7 +241,6 @@ def plot_market(ax: plt.Axes, market: pd.DataFrame) -> None:
     marker_map = {
         "bbo": "o",
         "orderbook": "s",
-        "trade": "^",
     }
 
     labels_used = set()
@@ -270,80 +248,51 @@ def plot_market(ax: plt.Axes, market: pd.DataFrame) -> None:
         if feed not in MARKET_FEEDS:
             continue
         color = color_map.get(exchange, "grey")
-        marker = marker_map.get(feed, ".")
-        label = f"{exchange}:{feed}"
-        label = None if label in labels_used else label
 
-        ax.scatter(
-            group["dt"],
-            group["price"],
-            s=10,
-            c=color,
-            marker=marker,
-            alpha=0.5,
-            label=label,
-        )
-        labels_used.add(f"{exchange}:{feed}")
+        if feed == "trade":
+            # Plot trades separately with direction-based markers and size scaling
+            # Trades use 'direction' column, not 'side'
+            for direction in ["buy", "sell"]:
+                dir_group = group[group["direction"] == direction]
+                if dir_group.empty:
+                    continue
 
+                marker = "^" if direction == "buy" else "v"
+                label = f"{exchange}:trade:{direction}"
+                label = None if label in labels_used else label
 
-def plot_kalman_band(ax: plt.Axes, kalman_df: pd.DataFrame, ci_sigma: float = KALMAN_CI_SIGMA) -> None:
-    """Overlay the Kalman efficient price and its confidence band."""
-    if kalman_df is None or kalman_df.empty:
-        return
+                # Scale sizes based on trade size (sqrt for better visual distribution)
+                if "size" in dir_group.columns:
+                    sizes = dir_group["size"].fillna(1.0).abs()
+                    scaled_sizes = (sizes.pow(0.5) * 10 + 5).clip(upper=70)
+                else:
+                    scaled_sizes = 30
 
-    cols = ["timestamp", "efficient_price", "state_variance"]
-    missing = [col for col in cols if col not in kalman_df.columns]
-    if missing:
-        raise ValueError(f"Kalman DataFrame missing columns: {missing}")
+                ax.scatter(
+                    dir_group["dt"],
+                    dir_group["price"],
+                    s=scaled_sizes,
+                    c=color,
+                    marker=marker,
+                    alpha=0.6,
+                    label=label,
+                )
+                labels_used.add(f"{exchange}:trade:{direction}")
+        else:
+            marker = marker_map.get(feed, ".")
+            label = f"{exchange}:{feed}"
+            label = None if label in labels_used else label
 
-    clean = kalman_df.dropna(subset=cols).copy()
-    if clean.empty:
-        return
-    clean = clean.sort_values("timestamp")
-
-    timestamps = clean["timestamp"]
-    mean_series = clean["efficient_price"]
-    std_series = np.sqrt(clean["state_variance"].clip(lower=0.0))
-    delta = ci_sigma * std_series
-    lower = mean_series - delta
-    upper = mean_series + delta
-
-    ax.plot(
-        timestamps,
-        mean_series,
-        color="black",
-        linewidth=2.0,
-        label="Kalman efficient price",
-        zorder=5,
-    )
-    ax.fill_between(
-        timestamps,
-        lower,
-        upper,
-        color="black",
-        alpha=0.15,
-        label=f"{ci_sigma:.1f}σ interval",
-        zorder=4,
-    )
-
-
-def plot_consensus_trace(ax: plt.Axes, kalman_df: pd.DataFrame) -> None:
-    if kalman_df is None or kalman_df.empty or "consensus_price" not in kalman_df.columns:
-        return
-
-    clean = kalman_df.dropna(subset=["timestamp", "consensus_price"]).copy()
-    if clean.empty:
-        return
-
-    clean = clean.sort_values("timestamp")
-    ax.plot(
-        clean["timestamp"],
-        clean["consensus_price"],
-        color="tab:orange",
-        linewidth=1.7,
-        label="Consensus (fast)",
-        zorder=6,
-    )
+            ax.scatter(
+                group["dt"],
+                group["price"],
+                s=10,
+                c=color,
+                marker=marker,
+                alpha=0.5,
+                label=label,
+            )
+            labels_used.add(f"{exchange}:{feed}")
 
 
 def plot_quote_bars(ax: plt.Axes, lifecycles: pd.DataFrame) -> None:
@@ -599,21 +548,6 @@ def main() -> None:
         ax_price.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S.%f"))
         fig.autofmt_xdate()
         fig.tight_layout()
-
-    kalman_overlay = compute_kalman_overlay(csv_path, args.exchange)
-    if kalman_overlay is not None:
-        fig_kalman, ax_kalman = plt.subplots(figsize=(14, 6))
-        plot_market(ax_kalman, market_df)
-        plot_consensus_trace(ax_kalman, kalman_overlay)
-        plot_kalman_band(ax_kalman, kalman_overlay, KALMAN_CI_SIGMA)
-
-        ax_kalman.set_title("Market feeds with Kalman efficient price overlay")
-        ax_kalman.set_ylabel("Price")
-        ax_kalman.grid(True, alpha=0.3)
-        ax_kalman.legend(loc="upper left", bbox_to_anchor=(1.02, 1), borderaxespad=0.0)
-        ax_kalman.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S.%f"))
-        fig_kalman.autofmt_xdate()
-        fig_kalman.tight_layout()
 
     plt.show()
 
