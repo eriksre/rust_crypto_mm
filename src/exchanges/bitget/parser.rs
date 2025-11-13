@@ -2,7 +2,9 @@
 
 use crate::base_classes::types::Ts;
 use crate::base_classes::ws::{AppHeartbeat, ExchangeHandler, HeartbeatPayload};
+use crate::exchanges::bitget::orderbook::BitgetMsg;
 use crate::exchanges::endpoints::BitgetWs;
+use serde_json::{self, Value};
 use std::time::Instant;
 
 #[derive(Debug, Clone)]
@@ -10,6 +12,8 @@ pub struct BitgetFrame {
     pub ts: Ts,
     pub recv_instant: Instant,
     pub raw: Vec<u8>,
+    json_cache: Option<Value>,
+    orderbook_cache: Option<BitgetMsg>,
 }
 
 pub struct BitgetHandler {
@@ -39,18 +43,14 @@ impl ExchangeHandler for BitgetHandler {
         &self.subs
     }
     fn parse_text(&self, text: &str, ts: Ts, recv_instant: Instant) -> Option<Self::Out> {
-        Some(BitgetFrame {
-            ts,
-            recv_instant,
-            raw: text.as_bytes().to_vec(),
-        })
+        let mut frame = BitgetFrame::from_text(text, ts, recv_instant);
+        frame.preparse_text(text);
+        Some(frame)
     }
     fn parse_binary(&self, data: &[u8], ts: Ts, recv_instant: Instant) -> Option<Self::Out> {
-        Some(BitgetFrame {
-            ts,
-            recv_instant,
-            raw: data.to_vec(),
-        })
+        let mut frame = BitgetFrame::from_bytes(data.to_vec(), ts, recv_instant);
+        frame.preparse_binary();
+        Some(frame)
     }
 
     // Bitget app-level heartbeat
@@ -96,6 +96,72 @@ impl ExchangeHandler for BitgetHandler {
 }
 
 impl BitgetFrame {
+    pub fn from_text(text: &str, ts: Ts, recv_instant: Instant) -> Self {
+        Self {
+            ts,
+            recv_instant,
+            raw: text.as_bytes().to_vec(),
+            json_cache: None,
+            orderbook_cache: None,
+        }
+    }
+
+    pub fn from_bytes(raw: Vec<u8>, ts: Ts, recv_instant: Instant) -> Self {
+        Self {
+            ts,
+            recv_instant,
+            raw,
+            json_cache: None,
+            orderbook_cache: None,
+        }
+    }
+
+    pub fn preparse_text(&mut self, text: &str) {
+        let flags = bitget_preparse_flags(text);
+        if flags.needs_json && self.json_cache.is_none() {
+            self.json_cache = serde_json::from_str::<Value>(text).ok();
+        }
+        if flags.needs_orderbook && self.orderbook_cache.is_none() {
+            self.orderbook_cache = serde_json::from_str::<BitgetMsg>(text).ok();
+        }
+    }
+
+    pub fn preparse_binary(&mut self) {
+        if let Ok(text) = core::str::from_utf8(&self.raw) {
+            let flags = bitget_preparse_flags(text);
+            if !flags.needs_json && !flags.needs_orderbook {
+                return;
+            }
+            if flags.needs_json && self.json_cache.is_none() {
+                self.json_cache = serde_json::from_slice(&self.raw).ok();
+            }
+            if flags.needs_orderbook && self.orderbook_cache.is_none() {
+                self.orderbook_cache = serde_json::from_slice(&self.raw).ok();
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub fn text(&self) -> Option<&str> {
+        core::str::from_utf8(&self.raw).ok()
+    }
+
+    #[inline(always)]
+    pub fn json(&mut self) -> Option<&Value> {
+        if self.json_cache.is_none() {
+            self.json_cache = serde_json::from_slice(&self.raw).ok();
+        }
+        self.json_cache.as_ref()
+    }
+
+    #[inline(always)]
+    pub fn orderbook_msg(&mut self) -> Option<&BitgetMsg> {
+        if self.orderbook_cache.is_none() {
+            self.orderbook_cache = serde_json::from_slice(&self.raw).ok();
+        }
+        self.orderbook_cache.as_ref()
+    }
+
     pub fn channel(&self) -> &str {
         if let Ok(s) = core::str::from_utf8(&self.raw) {
             if let Some(v) = find_json_string(s, "channel") {
@@ -160,4 +226,23 @@ fn find_json_u64(s: &str, key: &str) -> Option<u64> {
         }
     }
     if f { Some(v) } else { None }
+}
+
+struct BitgetParseFlags {
+    needs_json: bool,
+    needs_orderbook: bool,
+}
+
+#[inline(always)]
+fn bitget_preparse_flags(text: &str) -> BitgetParseFlags {
+    let is_books1 = text.contains("\"channel\":\"books1\"");
+    let is_books = text.contains("\"channel\":\"books\"");
+    let needs_orderbook = is_books1 || is_books;
+    let needs_json = needs_orderbook
+        || text.contains("\"channel\":\"ticker\"")
+        || text.contains("\"channel\":\"trade\"");
+    BitgetParseFlags {
+        needs_json,
+        needs_orderbook,
+    }
 }

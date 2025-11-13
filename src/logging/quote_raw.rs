@@ -820,6 +820,8 @@ struct QuoteCsvLogger {
     last_binance: (u64, u64, u64),
     last_gate: (u64, u64, u64),
     last_bitget: (u64, u64, u64),
+    last_okx: (u64, u64, u64),
+    last_mexc: (u64, u64, u64),
     orders: HashMap<String, QuoteSnapshot>,
     pending_cancels: HashMap<String, CancelSnapshot>,
 }
@@ -829,6 +831,8 @@ enum ExchangeId {
     Binance,
     Gate,
     Bitget,
+    Okx,
+    Mexc,
 }
 
 enum LogEvent {
@@ -1008,6 +1012,8 @@ impl QuoteCsvLogger {
             last_binance: (0, 0, 0),
             last_gate: (0, 0, 0),
             last_bitget: (0, 0, 0),
+            last_okx: (0, 0, 0),
+            last_mexc: (0, 0, 0),
             orders: HashMap::new(),
             pending_cancels: HashMap::new(),
         })
@@ -1037,6 +1043,13 @@ impl QuoteCsvLogger {
             &st.bitget,
             Some(&st.demean.bitget),
         )?;
+        self.write_exchange(ExchangeId::Okx, "okx", &st.okx, Some(&st.demean.okx))?;
+        self.write_exchange(
+            ExchangeId::Mexc,
+            "mexc",
+            &st.mexc,
+            Some(&st.demean.mexc),
+        )?;
         Ok(())
     }
 
@@ -1052,6 +1065,8 @@ impl QuoteCsvLogger {
             ExchangeId::Binance => &mut self.last_binance,
             ExchangeId::Gate => &mut self.last_gate,
             ExchangeId::Bitget => &mut self.last_bitget,
+            ExchangeId::Okx => &mut self.last_okx,
+            ExchangeId::Mexc => &mut self.last_mexc,
         };
         let (orderbook_seq, bbo_seq, trade_seq) = cache;
         let writer = &mut self.writer;

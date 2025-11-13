@@ -90,6 +90,7 @@ fn main() {
     let mut last_binance = (0u64, 0u64, 0u64);
     let mut last_gate = (0u64, 0u64, 0u64);
     let mut last_bitget = (0u64, 0u64, 0u64);
+    let mut last_mexc = (0u64, 0u64, 0u64);
 
     loop {
         {
@@ -172,6 +173,26 @@ fn main() {
                 }
             }
             last_bitget.2 = st.bitget.trade.seq;
+
+            if st.mexc.orderbook.seq != last_mexc.0 && st.mexc.orderbook.price.is_some() {
+                write_feed_line(&mut writer, "mexc", "orderbook", &st.mexc.orderbook).ok();
+                last_mexc.0 = st.mexc.orderbook.seq;
+            }
+            if st.mexc.bbo.seq != last_mexc.1 && st.mexc.bbo.price.is_some() {
+                write_feed_line(&mut writer, "mexc", "bbo", &st.mexc.bbo).ok();
+                last_mexc.1 = st.mexc.bbo.seq;
+            }
+            while let Some(event) = st.mexc.trade_events.pop_front() {
+                if let Some(price) = restore_price(Some(event.price), &st.demean.mexc) {
+                    let mut snap = FeedSnap::default();
+                    snap.price = Some(price);
+                    snap.ts_ns = Some(event.ts_ns);
+                    snap.direction = event.direction;
+                    snap.size = event.quantity;
+                    write_feed_line(&mut writer, "mexc", "trade", &snap).ok();
+                }
+            }
+            last_mexc.2 = st.mexc.trade.seq;
         }
 
         let _ = writer.flush();

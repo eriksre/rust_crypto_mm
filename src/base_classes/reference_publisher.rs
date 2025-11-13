@@ -217,6 +217,24 @@ impl ReferencePublisher {
             st.okx.trade.received_at,
         );
 
+        // MEXC sources (adjusted)
+        consider(
+            Self::adjust_price(st.mexc.bbo.price, &st.demean.mexc),
+            st.mexc.bbo.seq,
+            st.mexc.bbo.ts_ns,
+            11,
+            Self::label("mexc_bbo", &st.demean.mexc),
+            st.mexc.bbo.received_at,
+        );
+        consider(
+            Self::adjust_price(st.mexc.trade.price, &st.demean.mexc),
+            st.mexc.trade.seq,
+            st.mexc.trade.ts_ns,
+            12,
+            Self::label("mexc_trade", &st.demean.mexc),
+            st.mexc.trade.received_at,
+        );
+
         let candidate = best?;
         let key = RevisionKey {
             source_idx: candidate.source_idx,

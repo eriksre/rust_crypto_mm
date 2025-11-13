@@ -56,6 +56,13 @@ pub struct QuotePlan {
     pub reference_meta: Option<ReferenceMeta>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct QuoteStateMetrics {
+    pub active_orders: usize,
+    pub pending_cancels: usize,
+    pub needs_requote: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct ReferenceMeta {
     pub source: String,
@@ -174,6 +181,14 @@ impl SimpleQuoteStrategy {
 
     pub fn record_cancel_submission(&mut self, when: Instant) {
         self.last_cancel_submission_at = Some(when);
+    }
+
+    pub fn state_metrics(&self) -> QuoteStateMetrics {
+        QuoteStateMetrics {
+            active_orders: self.active_orders.len(),
+            pending_cancels: self.pending_cancels.len(),
+            needs_requote: self.needs_requote,
+        }
     }
 
     pub fn handle_report(&mut self, report: &ExecutionReport) {

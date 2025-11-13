@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio::task::spawn_blocking;
 use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
@@ -49,6 +49,7 @@ pub struct GateWsGateway {
     tx: mpsc::Sender<GatewayCommand>,
     reports: Arc<Mutex<Vec<ExecutionReport>>>,
     client_to_exchange: Arc<Mutex<HashMap<ClientOrderId, ExchangeOrderId>>>,
+    report_notify: Arc<Notify>,
 }
 
 impl GateWsGateway {
@@ -89,11 +90,14 @@ impl GateWsGateway {
         let reports = Arc::new(Mutex::new(Vec::new()));
         let client_to_exchange = Arc::new(Mutex::new(HashMap::new()));
 
+        let report_notify = Arc::new(Notify::new());
+
         let worker = GateWsWorker::new(
             worker_config,
             rx,
             reports.clone(),
             client_to_exchange.clone(),
+            report_notify.clone(),
         );
         tokio::spawn(async move {
             if let Err(err) = worker.run().await {
@@ -105,6 +109,7 @@ impl GateWsGateway {
             tx,
             reports,
             client_to_exchange,
+            report_notify,
         })
     }
 
@@ -152,12 +157,18 @@ impl ExecutionGateway for GateWsGateway {
     }
 
     async fn poll_reports(&self) -> Result<Vec<ExecutionReport>> {
-        let (resp_tx, resp_rx) = oneshot::channel();
-        self.tx
-            .send(GatewayCommand::Poll { resp: resp_tx })
-            .await
-            .context("failed to enqueue poll command")?;
-        resp_rx.await.context("poll response channel closed")?
+        loop {
+            let (resp_tx, resp_rx) = oneshot::channel();
+            self.tx
+                .send(GatewayCommand::Poll { resp: resp_tx })
+                .await
+                .context("failed to enqueue poll command")?;
+            let reports = resp_rx.await.context("poll response channel closed")??;
+            if !reports.is_empty() {
+                return Ok(reports);
+            }
+            self.report_notify.notified().await;
+        }
     }
 }
 
@@ -202,6 +213,7 @@ struct GateWsWorker {
     command_rx: mpsc::Receiver<GatewayCommand>,
     reports: Arc<Mutex<Vec<ExecutionReport>>>,
     client_to_exchange: Arc<Mutex<HashMap<ClientOrderId, ExchangeOrderId>>>,
+    report_notify: Arc<Notify>,
     req_counter: u64,
     user_id: Option<String>,
 }
@@ -212,12 +224,14 @@ impl GateWsWorker {
         command_rx: mpsc::Receiver<GatewayCommand>,
         reports: Arc<Mutex<Vec<ExecutionReport>>>,
         client_to_exchange: Arc<Mutex<HashMap<ClientOrderId, ExchangeOrderId>>>,
+        report_notify: Arc<Notify>,
     ) -> Self {
         Self {
             cfg,
             command_rx,
             reports,
             client_to_exchange,
+            report_notify,
             req_counter: 0,
             user_id: None,
         }
@@ -330,6 +344,8 @@ impl GateWsWorker {
                     avg_fill_price: price,
                     ts: ts_ns,
                 });
+                drop(guard);
+                self.report_notify.notify_one();
             }
         }
 
@@ -611,6 +627,7 @@ impl GateWsWorker {
                                             let mut guard = self.reports.lock().await;
                                             guard.extend(reports);
                                         }
+                                        self.report_notify.notify_one();
                                         let _ = resp_tx.send(Ok(acks));
                                     }
                                     Err(err) => {
@@ -624,6 +641,8 @@ impl GateWsWorker {
                                         if !reports.is_empty() {
                                             let mut guard = self.reports.lock().await;
                                             guard.append(&mut reports);
+                                            drop(guard);
+                                            self.report_notify.notify_one();
                                         }
                                         let _ = resp_tx.send(Ok(()));
                                     }

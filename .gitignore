@@ -10,4 +10,8 @@ env/
 /*.env
 /.env.*
 /.venv
-*.csv
+
+# Large log files
+logs/*.csv
+logs/*copy*.csv
+

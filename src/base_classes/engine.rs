@@ -16,7 +16,7 @@ use crate::base_classes::state::{
 use crate::base_classes::tickers::TickerStore;
 use crate::base_classes::types::Ts;
 use crate::base_classes::ws::{FeedSignal, spawn_ws_worker};
-use crate::collectors::{binance, bitget, bybit, gate, okx};
+use crate::collectors::{binance, bitget, bybit, gate, mexc, okx};
 
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -25,6 +25,7 @@ use crate::exchanges::bitget::{BitgetFrame, BitgetHandler};
 use crate::exchanges::bybit::{BybitFrame, BybitHandler};
 use crate::exchanges::endpoints::{BitgetWs, GateioWs, OkxWs};
 use crate::exchanges::gate::{GateFrame, GateHandler, canonical_contract_symbol};
+use crate::exchanges::mexc::{MexcFrame, MexcHandler};
 use crate::exchanges::okx::{OkxFrame, OkxHandler};
 
 #[cfg(feature = "gate_exec")]
@@ -80,6 +81,11 @@ fn is_bitget_bbo_frame(frame: &BitgetFrame) -> bool {
 #[inline(always)]
 fn is_okx_bbo_frame(frame: &OkxFrame) -> bool {
     frame.channel() == OkxWs::BBO_TBT
+}
+
+#[inline(always)]
+fn is_mexc_bbo_frame(frame: &MexcFrame) -> bool {
+    matches!(frame.channel(), Some("push.ticker"))
 }
 
 #[inline(always)]
@@ -432,6 +438,7 @@ pub fn spawn_state_engine(
         let gate_auto = feeds.gate.is_auto();
         let bitget_auto = feeds.bitget.is_auto();
         let okx_auto = feeds.okx.is_auto();
+        let mexc_auto = feeds.mexc.is_auto();
 
         let symbol_uc = symbol.to_uppercase();
         let cross_venue_symbol = symbol_uc.replace('_', "");
@@ -439,6 +446,7 @@ pub fn spawn_state_engine(
         let binance_symbol = cross_venue_symbol.clone();
         let bitget_symbol = cross_venue_symbol.clone();
         let okx_inst_id = format_okx_inst_id(&symbol);
+        let mexc_symbol = symbol_uc.replace('/', "_");
         let gate_contract = canonical_contract_symbol(&symbol);
         let gate_symbol = gate_contract.clone();
         let gate_contract_meta = crate::exchanges::gate::fetch_contract_meta(&gate_contract);
@@ -493,6 +501,8 @@ pub fn spawn_state_engine(
             true
         };
 
+        let mexc_supported = if mexc_auto { true } else { true };
+
         let mut bybit_c = if feeds.bybit.initial_enabled() && bybit_supported {
             let (consumer, _jh) = spawn_ws_worker::<BybitHandler, N>(
                 BybitHandler::new(symbol.clone()),
@@ -536,6 +546,16 @@ pub fn spawn_state_engine(
         let mut okx_c = if feeds.okx.initial_enabled() && okx_supported {
             let (consumer, _jh) = spawn_ws_worker::<OkxHandler, N>(
                 OkxHandler::new(symbol.clone()),
+                None,
+                Some(wake_signal.clone()),
+            );
+            Some(consumer)
+        } else {
+            None
+        };
+        let mut mexc_c = if feeds.mexc.initial_enabled() && mexc_supported {
+            let (consumer, _jh) = spawn_ws_worker::<MexcHandler, N>(
+                MexcHandler::new(mexc_symbol.clone()),
                 None,
                 Some(wake_signal.clone()),
             );
@@ -609,6 +629,11 @@ pub fn spawn_state_engine(
             crate::exchanges::okx::OkxBook::<1024>::PRICE_SCALE,
             crate::exchanges::okx::OkxBook::<1024>::QTY_SCALE,
         );
+        let mut mexc_book = crate::exchanges::mexc::MexcBook::<1024>::new(
+            &mexc_symbol,
+            crate::exchanges::mexc::MexcBook::<1024>::PRICE_SCALE,
+            crate::exchanges::mexc::MexcBook::<1024>::QTY_SCALE,
+        );
 
         // Per-exchange BBO/trades stores
         let mut bybit_bbo = crate::base_classes::bbo_store::BboStore::default();
@@ -616,18 +641,21 @@ pub fn spawn_state_engine(
         let mut gate_bbo = crate::base_classes::bbo_store::BboStore::default();
         let mut bitget_bbo = crate::base_classes::bbo_store::BboStore::default();
         let mut okx_bbo = crate::base_classes::bbo_store::BboStore::default();
+        let mut mexc_bbo = crate::base_classes::bbo_store::BboStore::default();
 
         let mut bybit_trades = crate::base_classes::trades::FixedTrades::<64>::default();
         let mut binance_trades = crate::base_classes::trades::FixedTrades::<64>::default();
         let mut gate_trades = crate::base_classes::trades::FixedTrades::<64>::default();
         let mut bitget_trades = crate::base_classes::trades::FixedTrades::<64>::default();
         let mut okx_trades = crate::base_classes::trades::FixedTrades::<64>::default();
+        let mut mexc_trades = crate::base_classes::trades::FixedTrades::<64>::default();
 
         let mut bybit_tickers = TickerStore::default();
         let mut bitget_tickers = TickerStore::default();
         let mut gate_tickers = TickerStore::default();
         let mut binance_tickers = TickerStore::default();
         let mut okx_tickers = TickerStore::default();
+        let mut mexc_tickers = TickerStore::default();
 
         let mut demean = DemeanController::new(demean_enabled(), Duration::from_secs(8));
         let mut feed_gate = FeedTimestampGate::new();
@@ -644,6 +672,7 @@ pub fn spawn_state_engine(
                     ExchangeKind::Binance => &mut st.demean.binance,
                     ExchangeKind::Bitget => &mut st.demean.bitget,
                     ExchangeKind::Okx => &mut st.demean.okx,
+                    ExchangeKind::Mexc => &mut st.demean.mexc,
                 };
                 *target = *adj;
             }
@@ -654,6 +683,7 @@ pub fn spawn_state_engine(
         let mut gate_pending: Option<GateFrame> = None;
         let mut bitget_pending: Option<BitgetFrame> = None;
         let mut okx_pending: Option<OkxFrame> = None;
+        let mut mexc_pending: Option<MexcFrame> = None;
 
         loop {
             let mut progressed = false;
@@ -671,9 +701,12 @@ pub fn spawn_state_engine(
                         &mut bybit_pending,
                         is_bybit_bbo_frame,
                     );
+                    let Some(text) = f.text() else {
+                        continue;
+                    };
                     let ts = f.ts;
-                    if let Ok(s) = core::str::from_utf8(&f.raw) {
-                        for (feed, _) in bybit::events_for(s, &mut bybit_book) {
+                    {
+                        for (feed, _) in bybit::events_for(text, &mut bybit_book) {
                             match feed {
                                 "orderbook" => {
                                     if let Some(mid) = bybit_book.mid_price_f64() {
@@ -684,11 +717,6 @@ pub fn spawn_state_engine(
                                             ob_ts,
                                         ) {
                                             GateDecision::Accept => {
-                                                demean.record_other(
-                                                    ExchangeKind::Bybit,
-                                                    Some(ob_ts),
-                                                    Some(mid),
-                                                );
                                                 // Compute outside lock
                                                 let (bid_vec, ask_vec) =
                                                     bybit_book.top_levels_f64(SNAPSHOT_DEPTH);
@@ -729,7 +757,7 @@ pub fn spawn_state_engine(
                                     }
                                 }
                                 "bbo" => {
-                                    if bybit::update_bbo_store(s, &mut bybit_bbo) {
+                                    if bybit::update_bbo_store(text, &mut bybit_bbo) {
                                         if let Some(mid) = bybit_bbo
                                             .mid_price_f64_for(&bybit_symbol)
                                             .or_else(|| bybit_bbo.mid_price_f64())
@@ -863,7 +891,7 @@ pub fn spawn_state_engine(
                                 _ => {}
                             }
                         }
-                        let new_trades = bybit::update_trades(s, &mut bybit_trades);
+                        let new_trades = bybit::update_trades(text, &mut bybit_trades);
                         if new_trades > 0 {
                             for trade in bybit_trades.iter_last(new_trades) {
                                 let trade_ts = trade.ts;
@@ -875,11 +903,6 @@ pub fn spawn_state_engine(
                                     GateDecision::Accept => {
                                         let px = (trade.px as f64)
                                             / crate::exchanges::bybit::PRICE_SCALE;
-                                        demean.record_other(
-                                            ExchangeKind::Bybit,
-                                            Some(trade_ts),
-                                            Some(px),
-                                        );
                                         let direction = if trade.is_buyer_maker {
                                             TradeDirection::Sell
                                         } else {
@@ -928,7 +951,8 @@ pub fn spawn_state_engine(
                                 }
                             }
                         }
-                        if let Some((_, ticker)) = bybit::update_tickers(s, &mut bybit_tickers) {
+                        if let Some((_, ticker)) = bybit::update_tickers(text, &mut bybit_tickers)
+                        {
                             let mut st = lock_state();
                             let entry = &mut st.bybit.ticker;
                             let price_scale = crate::exchanges::bybit::PRICE_SCALE;
@@ -1002,10 +1026,15 @@ pub fn spawn_state_engine(
                         &mut binance_pending,
                         is_binance_bbo_frame,
                     );
+                    let Some(text) = f.text() else {
+                        continue;
+                    };
                     let ts = f.ts;
-                    if let Ok(s) = core::str::from_utf8(&f.raw) {
+                    {
                         #[cfg(feature = "binance_book")]
-                        if let Some((_feed, _)) = binance::events_for_book(s, &mut binance_book) {
+                        if let Some((_feed, _)) =
+                            binance::events_for_book(text, &mut binance_book)
+                        {
                             if let Some(mid) = binance_book.mid_price_f64() {
                                 let ob_ts = binance_book.last_ts();
                                 match feed_gate.evaluate(
@@ -1014,11 +1043,6 @@ pub fn spawn_state_engine(
                                     ob_ts,
                                 ) {
                                     GateDecision::Accept => {
-                                        demean.record_other(
-                                            ExchangeKind::Binance,
-                                            Some(ob_ts),
-                                            Some(mid),
-                                        );
                                         let (bid_vec, ask_vec) =
                                             binance_book.top_levels_f64(SNAPSHOT_DEPTH);
                                         let bid_levels = levels_to_array(&bid_vec);
@@ -1050,7 +1074,7 @@ pub fn spawn_state_engine(
                                 }
                             }
                         }
-                        if binance::update_bbo_store(s, &mut binance_bbo) {
+                        if binance::update_bbo_store(text, &mut binance_bbo) {
                             if let Some(mid) = binance_bbo
                                 .mid_price_f64_for(&binance_symbol)
                                 .or_else(|| binance_bbo.mid_price_f64())
@@ -1129,7 +1153,7 @@ pub fn spawn_state_engine(
                                 }
                             }
                         }
-                        let new_trades = binance::update_trades(s, &mut binance_trades);
+                        let new_trades = binance::update_trades(text, &mut binance_trades);
                         if new_trades > 0 {
                             for trade in binance_trades.iter_last(new_trades) {
                                 let trade_ts = trade.ts;
@@ -1140,11 +1164,6 @@ pub fn spawn_state_engine(
                                 ) {
                                     GateDecision::Accept => {
                                         let px = (trade.px as f64) / binance::PRICE_SCALE;
-                                        demean.record_other(
-                                            ExchangeKind::Binance,
-                                            Some(trade_ts),
-                                            Some(px),
-                                        );
                                         let direction = if trade.is_buyer_maker {
                                             TradeDirection::Sell
                                         } else {
@@ -1192,7 +1211,8 @@ pub fn spawn_state_engine(
                                 }
                             }
                         }
-                        if let Some((_, ticker)) = binance::update_tickers(s, &mut binance_tickers)
+                        if let Some((_, ticker)) =
+                            binance::update_tickers(text, &mut binance_tickers)
                         {
                             let mut st = lock_state();
                             let entry = &mut st.binance.ticker;
@@ -1263,9 +1283,12 @@ pub fn spawn_state_engine(
                         &mut gate_pending,
                         is_gate_bbo_frame,
                     );
+                    let Some(text) = f.text() else {
+                        continue;
+                    };
                     let ts = f.ts;
-                    if let Ok(s) = core::str::from_utf8(&f.raw) {
-                        for (feed, _) in gate::events_for(s, &mut gate_book) {
+                    {
+                        for (feed, _) in gate::events_for(text, &mut gate_book) {
                             if feed == "orderbook" {
                                 if let Some(mid) = gate_book.mid_price_f64() {
                                     let ob_ts = gate_book.last_ts();
@@ -1298,9 +1321,6 @@ pub fn spawn_state_engine(
                                                 snap.direction = None;
                                                 snap.received_at = Some(f.recv_instant);
                                             }
-                                            let updates =
-                                                demean.on_gate_event(Some(ob_ts), Some(mid));
-                                            apply_demean(&updates);
                                             publisher.publish();
                                         }
                                         GateDecision::Reject {
@@ -1319,7 +1339,7 @@ pub fn spawn_state_engine(
                                 }
                             }
                         }
-                        if gate::update_bbo_store(s, &mut gate_bbo) {
+                        if gate::update_bbo_store(text, &mut gate_bbo) {
                             if let Some(mid) = gate_bbo
                                 .mid_price_f64_for(&gate_symbol)
                                 .or_else(|| gate_bbo.mid_price_f64())
@@ -1385,7 +1405,7 @@ pub fn spawn_state_engine(
                                 }
                             }
                         }
-                        let new_trades = gate::update_trades(s, &mut gate_trades);
+                        let new_trades = gate::update_trades(text, &mut gate_trades);
                         if new_trades > 0 {
                             for trade in gate_trades.iter_last(new_trades) {
                                 let trade_ts = trade.ts;
@@ -1432,9 +1452,6 @@ pub fn spawn_state_engine(
                                                 snap.trade_events.pop_front();
                                             }
                                         }
-                                        let updates =
-                                            demean.on_gate_event(Some(trade_ts), Some(px));
-                                        apply_demean(&updates);
                                         publisher.publish();
                                     }
                                     GateDecision::Reject {
@@ -1453,7 +1470,7 @@ pub fn spawn_state_engine(
                             }
                         }
                         if let Some((symbol, mut ticker)) =
-                            gate::update_tickers(s, &mut gate_tickers)
+                            gate::update_tickers(text, &mut gate_tickers)
                         {
                             let mut needs_store_update = false;
 
@@ -1570,9 +1587,12 @@ pub fn spawn_state_engine(
                         &mut bitget_pending,
                         is_bitget_bbo_frame,
                     );
+                    let Some(text) = f.text() else {
+                        continue;
+                    };
                     let ts = f.ts;
-                    if let Ok(s) = core::str::from_utf8(&f.raw) {
-                        for (feed, _) in bitget::events_for(s, &mut bitget_book) {
+                    {
+                        for (feed, _) in bitget::events_for(text, &mut bitget_book) {
                             if feed == "orderbook" {
                                 if let Some(mid) = bitget_book.mid_price_f64() {
                                     let ob_ts = bitget_book.last_ts();
@@ -1582,11 +1602,6 @@ pub fn spawn_state_engine(
                                         ob_ts,
                                     ) {
                                         GateDecision::Accept => {
-                                            demean.record_other(
-                                                ExchangeKind::Bitget,
-                                                Some(ob_ts),
-                                                Some(mid),
-                                            );
                                             let (bid_vec, ask_vec) =
                                                 bitget_book.top_levels_f64(SNAPSHOT_DEPTH);
                                             let bid_levels = levels_to_array(&bid_vec);
@@ -1620,7 +1635,7 @@ pub fn spawn_state_engine(
                                 }
                             }
                         }
-                        if bitget::update_bbo_store(s, &mut bitget_bbo) {
+                        if bitget::update_bbo_store(text, &mut bitget_bbo) {
                             if let Some(mid) = bitget_bbo
                                 .mid_price_f64_for(&bitget_symbol)
                                 .or_else(|| bitget_bbo.mid_price_f64())
@@ -1685,7 +1700,7 @@ pub fn spawn_state_engine(
                                 }
                             }
                         }
-                        let new_trades = bitget::update_trades(s, &mut bitget_trades);
+                        let new_trades = bitget::update_trades(text, &mut bitget_trades);
                         if new_trades > 0 {
                             for trade in bitget_trades.iter_last(new_trades) {
                                 let trade_ts = trade.ts;
@@ -1696,11 +1711,6 @@ pub fn spawn_state_engine(
                                 ) {
                                     GateDecision::Accept => {
                                         let px = (trade.px as f64) / bitget::PRICE_SCALE;
-                                        demean.record_other(
-                                            ExchangeKind::Bitget,
-                                            Some(trade_ts),
-                                            Some(px),
-                                        );
                                         let direction = if trade.is_buyer_maker {
                                             TradeDirection::Sell
                                         } else {
@@ -1748,7 +1758,9 @@ pub fn spawn_state_engine(
                                 }
                             }
                         }
-                        if let Some((_, ticker)) = bitget::update_tickers(s, &mut bitget_tickers) {
+                        if let Some((_, ticker)) =
+                            bitget::update_tickers(text, &mut bitget_tickers)
+                        {
                             let mut st = lock_state();
                             let entry = &mut st.bitget.ticker;
                             let price_scale = bitget::PRICE_SCALE;
@@ -1817,8 +1829,8 @@ pub fn spawn_state_engine(
                     progressed = true;
                     drain_latest_bbo(&mut f, &*okx_consumer, &mut okx_pending, is_okx_bbo_frame);
                     let ts = f.ts;
-                    if let Ok(s) = core::str::from_utf8(&f.raw) {
-                        for (feed, _) in okx::events_for(s, &mut okx_book) {
+                    {
+                        for (feed, _) in okx::events_for(&mut f, &mut okx_book) {
                             match feed {
                                 "orderbook" => {
                                     if let Some(mid) = okx_book.mid_price_f64() {
@@ -1829,11 +1841,6 @@ pub fn spawn_state_engine(
                                             ob_ts,
                                         ) {
                                             GateDecision::Accept => {
-                                                demean.record_other(
-                                                    ExchangeKind::Okx,
-                                                    Some(ob_ts),
-                                                    Some(mid),
-                                                );
                                                 let (bid_vec, ask_vec) =
                                                     okx_book.top_levels_f64(SNAPSHOT_DEPTH);
                                                 let bid_levels = levels_to_array(&bid_vec);
@@ -1872,7 +1879,7 @@ pub fn spawn_state_engine(
                                 _ => {}
                             }
                         }
-                        if okx::update_bbo_store(s, &mut okx_bbo) {
+                        if okx::update_bbo_store(&mut f, &mut okx_bbo) {
                             if let Some(mid) = okx_bbo
                                 .mid_price_f64_for(&okx_inst_id)
                                 .or_else(|| okx_bbo.mid_price_f64())
@@ -1933,7 +1940,7 @@ pub fn spawn_state_engine(
                                 }
                             }
                         }
-                        let new_trades = okx::update_trades(s, &mut okx_trades);
+                        let new_trades = okx::update_trades(&mut f, &mut okx_trades);
                         if new_trades > 0 {
                             for trade in okx_trades.iter_last(new_trades) {
                                 let trade_ts = trade.ts;
@@ -1944,11 +1951,6 @@ pub fn spawn_state_engine(
                                 ) {
                                     GateDecision::Accept => {
                                         let px = (trade.px as f64) / okx::PRICE_SCALE;
-                                        demean.record_other(
-                                            ExchangeKind::Okx,
-                                            Some(trade_ts),
-                                            Some(px),
-                                        );
                                         let direction = if trade.is_buyer_maker {
                                             TradeDirection::Sell
                                         } else {
@@ -1996,7 +1998,7 @@ pub fn spawn_state_engine(
                                 }
                             }
                         }
-                        if let Some((_, ticker)) = okx::update_tickers(s, &mut okx_tickers) {
+                        if let Some((_, ticker)) = okx::update_tickers(&mut f, &mut okx_tickers) {
                             let mut st = lock_state();
                             let entry = &mut st.okx.ticker;
                             let price_scale = okx::PRICE_SCALE;
@@ -2047,6 +2049,235 @@ pub fn spawn_state_engine(
                                 entry.seq.wrapping_add(1)
                             };
                             entry.seq = seq;
+
+                            let ticker_ts = if ticker.ticker.ts != 0 {
+                                ticker.ticker.ts
+                            } else {
+                                ts
+                            };
+                            entry.ts_ns = Some(ticker_ts);
+                        }
+                    }
+                }
+            }
+
+            // Mexc
+            if let Some(mexc_consumer) = mexc_c.as_mut() {
+                if let Some(mut f) = mexc_pending.take().or_else(|| mexc_consumer.try_pop().ok()) {
+                    progressed = true;
+                    drain_latest_bbo(
+                        &mut f,
+                        &*mexc_consumer,
+                        &mut mexc_pending,
+                        is_mexc_bbo_frame,
+                    );
+                    let ts = f.ts;
+                    {
+                        for (feed, _) in mexc::events_for(&mut f, &mut mexc_book) {
+                            if feed == "orderbook" {
+                                if let Some(mid) = mexc_book.mid_price_f64() {
+                                    let ob_ts = mexc_book.last_ts();
+                                    match feed_gate.evaluate(
+                                        ExchangeFeed::Mexc,
+                                        FeedKind::OrderBook,
+                                        ob_ts,
+                                    ) {
+                                        GateDecision::Accept => {
+                                            let (bid_vec, ask_vec) =
+                                                mexc_book.top_levels_f64(SNAPSHOT_DEPTH);
+                                            let bid_levels = levels_to_array(&bid_vec);
+                                            let ask_levels = levels_to_array(&ask_vec);
+                                            {
+                                                let mut st = lock_state();
+                                                let snap = &mut st.mexc.orderbook;
+                                                snap.price = Some(mid);
+                                                snap.seq = snap.seq.wrapping_add(1);
+                                                snap.ts_ns = Some(ts);
+                                                snap.source_engine_ts_ns = Some(ob_ts);
+                                                snap.source_system_ts_ns =
+                                                    mexc_book.last_system_ts_ns();
+                                                snap.bid_levels = bid_levels;
+                                                snap.ask_levels = ask_levels;
+                                                snap.direction = None;
+                                                snap.received_at = Some(f.recv_instant);
+                                            }
+                                            publisher.publish();
+                                        }
+                                        GateDecision::Reject {
+                                            last_ts,
+                                            reject_count,
+                                        } => {
+                                            log_stale_update(
+                                                ExchangeFeed::Mexc,
+                                                FeedKind::OrderBook,
+                                                ob_ts,
+                                                last_ts,
+                                                reject_count,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if mexc::update_bbo_store(&mut f, &mut mexc_bbo) {
+                            let entry = mexc_bbo.get(&mexc_symbol).copied().or_else(|| {
+                                mexc_bbo
+                                    .last_symbol()
+                                    .and_then(|symbol| mexc_bbo.get(symbol).copied())
+                            });
+                            if let Some(bbo) = entry {
+                                let mid = 0.5 * (bbo.bid_px + bbo.ask_px);
+                                let bbo_ts = bbo.ts;
+                                let system_ts_ns =
+                                    bbo.system_ts_ns.or_else(|| mexc_book.last_system_ts_ns());
+                                match feed_gate.evaluate(ExchangeFeed::Mexc, FeedKind::Bbo, bbo_ts)
+                                {
+                                    GateDecision::Accept => {
+                                        demean.record_other(
+                                            ExchangeKind::Mexc,
+                                            Some(bbo_ts),
+                                            Some(mid),
+                                        );
+                                        let bid_levels =
+                                            level_from_option(Some((bbo.bid_px, bbo.bid_qty)));
+                                        let ask_levels =
+                                            level_from_option(Some((bbo.ask_px, bbo.ask_qty)));
+                                        {
+                                            let mut st = lock_state();
+                                            let snap = &mut st.mexc.bbo;
+                                            snap.price = Some(mid);
+                                            snap.seq = snap.seq.wrapping_add(1);
+                                            snap.ts_ns = Some(ts);
+                                            snap.source_engine_ts_ns = Some(bbo_ts);
+                                            snap.source_system_ts_ns = system_ts_ns;
+                                            snap.bid_levels = bid_levels;
+                                            snap.ask_levels = ask_levels;
+                                            snap.direction = None;
+                                            snap.received_at = Some(f.recv_instant);
+                                        }
+                                        publisher.publish();
+                                    }
+                                    GateDecision::Reject {
+                                        last_ts,
+                                        reject_count,
+                                    } => {
+                                        log_stale_update(
+                                            ExchangeFeed::Mexc,
+                                            FeedKind::Bbo,
+                                            bbo_ts,
+                                            last_ts,
+                                            reject_count,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        let new_trades = mexc::update_trades(&mut f, &mut mexc_trades);
+                        if new_trades > 0 {
+                            for trade in mexc_trades.iter_last(new_trades) {
+                                let trade_ts = trade.ts;
+                                match feed_gate.evaluate(
+                                    ExchangeFeed::Mexc,
+                                    FeedKind::Trades,
+                                    trade_ts,
+                                ) {
+                                    GateDecision::Accept => {
+                                        let px = (trade.px as f64) / mexc::PRICE_SCALE;
+                                        let qty = (trade.qty as f64).abs() / mexc::QTY_SCALE;
+                                        let direction = if trade.is_buyer_maker {
+                                            TradeDirection::Sell
+                                        } else {
+                                            TradeDirection::Buy
+                                        };
+                                        {
+                                            let mut st = lock_state();
+                                            let snap = &mut st.mexc;
+                                            snap.trade.price = Some(px);
+                                            snap.trade.seq = snap.trade.seq.wrapping_add(1);
+                                            snap.trade.ts_ns = Some(ts);
+                                            snap.trade.source_engine_ts_ns = Some(trade_ts);
+                                            snap.trade.source_system_ts_ns = trade.system_ts_ns;
+                                            snap.trade.direction = Some(direction);
+                                            snap.trade.size = Some(qty);
+                                            snap.trade.received_at = Some(f.recv_instant);
+                                            snap.trade.bid_levels = [None; SNAPSHOT_DEPTH];
+                                            snap.trade.ask_levels = [None; SNAPSHOT_DEPTH];
+                                            snap.trade_events.push_back(TradeEvent {
+                                                ts_ns: trade_ts,
+                                                price: px,
+                                                direction: Some(direction),
+                                                quantity: Some(qty),
+                                            });
+                                            if snap.trade_events.len() > 256 {
+                                                snap.trade_events.pop_front();
+                                            }
+                                        }
+                                        publisher.publish();
+                                    }
+                                    GateDecision::Reject {
+                                        last_ts,
+                                        reject_count,
+                                    } => {
+                                        log_stale_update(
+                                            ExchangeFeed::Mexc,
+                                            FeedKind::Trades,
+                                            trade_ts,
+                                            last_ts,
+                                            reject_count,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        if let Some((_, ticker)) = mexc::update_tickers(&mut f, &mut mexc_tickers) {
+                            let mut st = lock_state();
+                            let entry = &mut st.mexc.ticker;
+
+                            if ticker.ticker.last_px != 0 {
+                                entry.last_price =
+                                    Some((ticker.ticker.last_px as f64) / mexc::PRICE_SCALE);
+                            }
+                            if ticker.ticker.last_qty != 0 {
+                                entry.last_qty =
+                                    Some((ticker.ticker.last_qty as f64) / mexc::QTY_SCALE);
+                            }
+                            if ticker.ticker.best_bid != 0 {
+                                entry.best_bid =
+                                    Some((ticker.ticker.best_bid as f64) / mexc::PRICE_SCALE);
+                            }
+                            if ticker.ticker.best_ask != 0 {
+                                entry.best_ask =
+                                    Some((ticker.ticker.best_ask as f64) / mexc::PRICE_SCALE);
+                            }
+
+                            if let Some(mark) = ticker.mark_px {
+                                entry.mark_price = Some(mark);
+                            }
+                            if let Some(index) = ticker.index_px {
+                                entry.index_price = Some(index);
+                            }
+                            if let Some(rate) = ticker.funding_rate {
+                                entry.funding_rate = Some(rate);
+                            }
+                            if let Some(turnover) = ticker.turnover_24h {
+                                entry.turnover_24h = Some(turnover);
+                            }
+                            if let Some(oi) = ticker.open_interest {
+                                entry.open_interest = Some(oi);
+                            }
+                            if let Some(oi_val) = ticker.open_interest_value {
+                                entry.open_interest_value = Some(oi_val);
+                            } else if let (Some(oi), Some(mark)) =
+                                (entry.open_interest, entry.mark_price)
+                            {
+                                entry.open_interest_value = Some(oi * mark);
+                            }
+
+                            if ticker.ticker.seq != 0 {
+                                entry.seq = ticker.ticker.seq;
+                            } else {
+                                entry.seq = entry.seq.wrapping_add(1);
+                            }
 
                             let ticker_ts = if ticker.ticker.ts != 0 {
                                 ticker.ticker.ts

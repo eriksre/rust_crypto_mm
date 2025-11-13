@@ -5,6 +5,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Result, anyhow, bail};
 use clap::Parser;
+use parking_lot::Mutex;
 use rust_test::base_classes::engine::{
     configure_demean_enabled, configure_feed_overrides, spawn_state_engine,
 };
@@ -21,9 +22,8 @@ use rust_test::execution::{
 };
 use rust_test::logging::quote::{DebugLogger, QuoteLogHandle, format_f64};
 use rust_test::strategy::{ReferenceMeta, SimpleQuoteStrategy};
-use parking_lot::Mutex;
 use tokio::sync::{Semaphore, mpsc};
-use tokio::time::{self, MissedTickBehavior, interval};
+use tokio::time::{self, MissedTickBehavior, interval, sleep};
 
 #[derive(Debug, Parser)]
 #[command(name = "gate-runner", about = "Gate.io MVP dry-run executor")]
@@ -238,6 +238,42 @@ async fn main() -> Result<()> {
         config.strategy.clone(),
     )));
 
+    {
+        let reports_strategy = strategy.clone();
+        let reports_config = config.clone();
+        let reports_order_manager = order_manager.clone();
+        let reports_logger = logger.clone();
+        let reports_debug = debug.clone();
+        let reports_inventory = inventory.clone();
+        tokio::spawn(async move {
+            loop {
+                match reports_order_manager.poll_reports().await {
+                    Ok(reports) => {
+                        if reports.is_empty() {
+                            continue;
+                        }
+                        if let Err(err) = process_reports(
+                            reports,
+                            reports_strategy.clone(),
+                            reports_config.clone(),
+                            reports_logger.clone(),
+                            reports_debug.clone(),
+                            reports_inventory.clone(),
+                        )
+                        .await
+                        {
+                            reports_debug.error(|| format!("error processing reports: {:#}", err));
+                        }
+                    }
+                    Err(err) => {
+                        reports_debug.error(|| format!("order report poll error: {:#}", err));
+                        sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+        });
+    }
+
     let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<CancelMessage>();
     let cancel_strategy = strategy.clone();
     let cancel_order_manager = order_manager.clone();
@@ -348,19 +384,6 @@ async fn main() -> Result<()> {
                         if start_time.elapsed() < warmup {
                             continue;
                         }
-
-                        if let Err(err) =
-                            drain_reports(
-                                strategy.clone(),
-                                config.clone(),
-                                order_manager.clone(),
-                                logger.clone(),
-                                debug.clone(),
-                                inventory.clone(),
-                            ).await
-                        {
-                            debug.error(|| format!("error processing reports: {:#}", err));
-                        }
                     }
                     _ = quote_timer.tick() => {
                         if start_time.elapsed() < warmup {
@@ -430,11 +453,14 @@ async fn handle_market_update(
     };
     let lock_start = Instant::now();
     let mut strategy_guard = strategy.lock();
+    let lock_acquired = Instant::now();
     let lock_wait = lock_start.elapsed();
     let queue_delay = lock_start.saturating_duration_since(reference.received_at);
     let dispatch_delay = lock_start.saturating_duration_since(dispatched_at);
     let cancels =
         strategy_guard.on_market_update(reference.price, Some(meta.clone()), reference.received_at);
+    let state_metrics = strategy_guard.state_metrics();
+    let after_update = Instant::now();
     let strat_dur = lock_start.elapsed();
     let send_start_opt = if cancels.is_empty() {
         None
@@ -443,6 +469,7 @@ async fn handle_market_update(
         strategy_guard.record_cancel_submission(send_start);
         Some(send_start)
     };
+    let after_record = Instant::now();
     drop(strategy_guard);
 
     if latency_debug && lock_wait > Duration::from_micros(200) {
@@ -503,14 +530,28 @@ async fn handle_market_update(
     if latency_debug || cancel_internal > CANCEL_WARN {
         debug.latency(|| {
             format!(
-                "latency-debug::cancel summary queue={}us dispatch={}us compute={}us total={}us cancels={}",
+                "latency-debug::cancel summary queue={}us dispatch={}us compute={}us total={}us cancels={} active_orders={} pending_cancels={} needs_requote={}",
                 dur_us(queue_delay),
                 dur_us(dispatch_delay),
                 dur_us(compute_delay),
                 dur_us(cancel_internal),
-                cancels.len()
+                cancels.len(),
+                state_metrics.active_orders,
+                state_metrics.pending_cancels,
+                state_metrics.needs_requote
             )
         });
+        if latency_debug {
+            debug.latency(|| {
+                format!(
+                    "latency-debug::cancel breakdown lock_acquire={}us on_market={}us record={}us total_locked={}us",
+                    dur_us(lock_wait),
+                    dur_us(after_update.saturating_duration_since(lock_acquired)),
+                    dur_us(after_record.saturating_duration_since(after_update)),
+                    dur_us(after_record.saturating_duration_since(lock_acquired))
+                )
+            });
+        }
     }
 
     // Logging after dispatch so we don't delay the cancel send
@@ -542,20 +583,23 @@ async fn handle_quote_tick(
     debug: DebugLogger,
     inventory: Arc<Mutex<InventoryTracker>>,
 ) -> Result<()> {
-    drain_reports(
-        strategy.clone(),
-        config.clone(),
-        order_manager.clone(),
-        logger.clone(),
-        debug.clone(),
-        inventory.clone(),
-    )
-    .await?;
-
     let config_ref = config.as_ref();
 
     let plan_opt = match strategy.try_lock() {
-        Some(mut guard) => guard.plan_quotes(now),
+        Some(mut guard) => {
+            let plan = guard.plan_quotes(now);
+            let metrics = guard.state_metrics();
+            drop(guard);
+            if latency_debug_enabled() {
+                debug.latency(|| {
+                    format!(
+                        "latency-debug::strategy_state active_orders={} pending_cancels={} needs_requote={}",
+                        metrics.active_orders, metrics.pending_cancels, metrics.needs_requote
+                    )
+                });
+            }
+            plan
+        }
         None => {
             if latency_debug_enabled() {
                 debug.latency(|| "latency-debug::quote skipped (strategy busy)".to_string());
@@ -728,15 +772,14 @@ async fn handle_quote_tick(
     Ok(())
 }
 
-async fn drain_reports(
+async fn process_reports(
+    reports: Vec<ExecutionReport>,
     strategy: Arc<Mutex<SimpleQuoteStrategy>>,
     config: Arc<RunnerConfig>,
-    order_manager: Arc<OrderManager>,
     logger: Option<QuoteLogHandle>,
     debug: DebugLogger,
     inventory: Arc<Mutex<InventoryTracker>>,
 ) -> Result<()> {
-    let reports = order_manager.poll_reports().await?;
     if reports.is_empty() {
         return Ok(());
     }

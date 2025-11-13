@@ -24,6 +24,8 @@ fn main() {
             last_seq.update_and_print("binance", st.binance.ticker);
             last_seq.update_and_print("gate", st.gate.ticker);
             last_seq.update_and_print("bitget", st.bitget.ticker);
+            last_seq.update_and_print("okx", st.okx.ticker);
+            last_seq.update_and_print("mexc", st.mexc.ticker);
         }
 
         thread::sleep(Duration::from_millis(100));
@@ -36,6 +38,8 @@ struct ExchangeSeqs {
     binance: u64,
     gate: u64,
     bitget: u64,
+    okx: u64,
+    mexc: u64,
 }
 
 impl ExchangeSeqs {
@@ -45,6 +49,8 @@ impl ExchangeSeqs {
             "binance" => &mut self.binance,
             "gate" => &mut self.gate,
             "bitget" => &mut self.bitget,
+            "okx" => &mut self.okx,
+            "mexc" => &mut self.mexc,
             _ => return,
         };
 

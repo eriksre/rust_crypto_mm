@@ -2,4 +2,6 @@
 
 pub mod simple_quote;
 
-pub use simple_quote::{QuoteConfig, QuotePlan, ReferenceMeta, SimpleQuoteStrategy};
+pub use simple_quote::{
+    QuoteConfig, QuotePlan, QuoteStateMetrics, ReferenceMeta, SimpleQuoteStrategy,
+};

@@ -2,14 +2,20 @@
 
 use crate::base_classes::types::Ts;
 use crate::base_classes::ws::ExchangeHandler;
+#[cfg(feature = "binance_book")]
+use crate::exchanges::binance::parsed::DepthUpdate;
+use serde_json::{self, Value};
 use std::time::Instant;
 
-// Minimal frame wrapper. For prod, map to typed events.
+// Minimal frame wrapper with cached JSON/typed payloads prepared on the WS thread.
 #[derive(Debug, Clone)]
 pub struct BinanceFrame {
     pub ts: Ts,
     pub recv_instant: Instant,
     pub raw: Vec<u8>,
+    json_cache: Option<Value>,
+    #[cfg(feature = "binance_book")]
+    depth_cache: Option<DepthUpdate>,
 }
 
 pub struct BinanceHandler {
@@ -47,20 +53,16 @@ impl ExchangeHandler for BinanceHandler {
 
     #[inline(always)]
     fn parse_text(&self, text: &str, ts: Ts, recv_instant: Instant) -> Option<Self::Out> {
-        Some(BinanceFrame {
-            ts,
-            recv_instant,
-            raw: text.as_bytes().to_vec(),
-        })
+        let mut frame = BinanceFrame::from_text(text, ts, recv_instant);
+        frame.preparse_text(text);
+        Some(frame)
     }
 
     #[inline(always)]
     fn parse_binary(&self, data: &[u8], ts: Ts, recv_instant: Instant) -> Option<Self::Out> {
-        Some(BinanceFrame {
-            ts,
-            recv_instant,
-            raw: data.to_vec(),
-        })
+        let mut frame = BinanceFrame::from_bytes(data.to_vec(), ts, recv_instant);
+        frame.preparse_binary();
+        Some(frame)
     }
 
     // Binance futures WS does not accept JSON PING on this endpoint; rely on WS-level pings only.
@@ -82,6 +84,81 @@ impl ExchangeHandler for BinanceHandler {
 }
 
 impl BinanceFrame {
+    pub fn from_text(text: &str, ts: Ts, recv_instant: Instant) -> Self {
+        Self {
+            ts,
+            recv_instant,
+            raw: text.as_bytes().to_vec(),
+            json_cache: None,
+            #[cfg(feature = "binance_book")]
+            depth_cache: None,
+        }
+    }
+
+    pub fn from_bytes(raw: Vec<u8>, ts: Ts, recv_instant: Instant) -> Self {
+        Self {
+            ts,
+            recv_instant,
+            raw,
+            json_cache: None,
+            #[cfg(feature = "binance_book")]
+            depth_cache: None,
+        }
+    }
+
+    pub fn preparse_text(&mut self, text: &str) {
+        let flags = binance_preparse_flags(text);
+        if flags.needs_json && self.json_cache.is_none() {
+            self.json_cache = serde_json::from_str::<Value>(text).ok();
+        }
+        #[cfg(feature = "binance_book")]
+        {
+            if flags.needs_depth && self.depth_cache.is_none() {
+                self.depth_cache = serde_json::from_str::<DepthUpdate>(text).ok();
+            }
+        }
+    }
+
+    pub fn preparse_binary(&mut self) {
+        if let Ok(text) = core::str::from_utf8(&self.raw) {
+            let flags = binance_preparse_flags(text);
+            if !flags.needs_json && !flags.needs_depth {
+                return;
+            }
+            if flags.needs_json && self.json_cache.is_none() {
+                self.json_cache = serde_json::from_slice(&self.raw).ok();
+            }
+            #[cfg(feature = "binance_book")]
+            {
+                if flags.needs_depth && self.depth_cache.is_none() {
+                    self.depth_cache = serde_json::from_slice(&self.raw).ok();
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub fn text(&self) -> Option<&str> {
+        core::str::from_utf8(&self.raw).ok()
+    }
+
+    #[inline(always)]
+    pub fn json(&mut self) -> Option<&Value> {
+        if self.json_cache.is_none() {
+            self.json_cache = serde_json::from_slice(&self.raw).ok();
+        }
+        self.json_cache.as_ref()
+    }
+
+    #[inline(always)]
+    #[cfg(feature = "binance_book")]
+    pub fn depth_update(&mut self) -> Option<&DepthUpdate> {
+        if self.depth_cache.is_none() {
+            self.depth_cache = serde_json::from_slice(&self.raw).ok();
+        }
+        self.depth_cache.as_ref()
+    }
+
     // Try to extract event type (e), or label some common messages.
     pub fn topic(&self) -> &str {
         if let Ok(s) = core::str::from_utf8(&self.raw) {
@@ -150,4 +227,29 @@ fn find_json_u64(s: &str, key: &str) -> Option<u64> {
         }
     }
     None
+}
+
+struct BinanceParseFlags {
+    needs_json: bool,
+    #[cfg(feature = "binance_book")]
+    needs_depth: bool,
+}
+
+#[inline(always)]
+fn binance_preparse_flags(text: &str) -> BinanceParseFlags {
+    let needs_json = text.contains("\"e\":\"bookTicker\"")
+        || text.contains("\"e\":\"markPriceUpdate\"")
+        || text.contains("\"e\":\"aggTrade\"");
+    #[cfg(feature = "binance_book")]
+    {
+        let needs_depth = text.contains("\"e\":\"depthUpdate\"");
+        BinanceParseFlags {
+            needs_json,
+            needs_depth,
+        }
+    }
+    #[cfg(not(feature = "binance_book"))]
+    {
+        BinanceParseFlags { needs_json }
+    }
 }

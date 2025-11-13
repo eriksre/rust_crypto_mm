@@ -2,36 +2,35 @@ use crate::base_classes::bbo_store::BboStore;
 use crate::base_classes::tickers::{TickerSnapshot, TickerStore};
 use crate::base_classes::trades::{FixedTrades, Trade};
 use crate::base_classes::types::{Price, Qty, Seq};
-use crate::collectors::helpers::find_json_string;
-use crate::exchanges::okx::OkxBook;
-use crate::exchanges::okx::orderbook::OkxMsg;
+use crate::exchanges::okx::{OkxBook, OkxFrame};
 use crate::utils::time::ms_to_ns;
 use serde_json::{self, Value};
 
-pub fn events_for<const N: usize>(s: &str, book: &mut OkxBook<N>) -> Vec<(&'static str, f64)> {
+pub fn events_for<const N: usize>(
+    frame: &mut OkxFrame,
+    book: &mut OkxBook<N>,
+) -> Vec<(&'static str, f64)> {
     let mut out = Vec::with_capacity(1);
-    if let Some(channel) = find_json_string(s, "channel") {
-        match channel {
-            "books" => {
-                if let Ok(msg) = serde_json::from_str::<OkxMsg>(s) {
-                    if book.apply(&msg) {
-                        if let Some(mid) = book.mid_price_f64() {
-                            out.push(("orderbook", mid));
-                        }
+    match frame.channel() {
+        "books" => {
+            if let Some(msg) = frame.orderbook_msg() {
+                if book.apply(msg) {
+                    if let Some(mid) = book.mid_price_f64() {
+                        out.push(("orderbook", mid));
                     }
                 }
             }
-            "bbo-tbt" => {
-                if let Ok(msg) = serde_json::from_str::<OkxMsg>(s) {
-                    if book.apply_bbo(&msg) {
-                        if let Some(mid) = book.mid_price_f64() {
-                            out.push(("orderbook", mid));
-                        }
-                    }
-                }
-            }
-            _ => {}
         }
+        "bbo-tbt" => {
+            if let Some(msg) = frame.orderbook_msg() {
+                if book.apply_bbo(msg) {
+                    if let Some(mid) = book.mid_price_f64() {
+                        out.push(("orderbook", mid));
+                    }
+                }
+            }
+        }
+        _ => {}
     }
     out
 }
@@ -39,8 +38,11 @@ pub fn events_for<const N: usize>(s: &str, book: &mut OkxBook<N>) -> Vec<(&'stat
 pub const PRICE_SCALE: f64 = OkxBook::<1>::PRICE_SCALE;
 pub const QTY_SCALE: f64 = OkxBook::<1>::QTY_SCALE;
 
-pub fn update_tickers(s: &str, store: &mut TickerStore) -> Option<(String, TickerSnapshot)> {
-    let raw: Value = serde_json::from_str(s).ok()?;
+pub fn update_tickers(
+    frame: &mut OkxFrame,
+    store: &mut TickerStore,
+) -> Option<(String, TickerSnapshot)> {
+    let raw = frame.json()?;
     let channel = raw
         .get("arg")
         .and_then(|arg| arg.get("channel"))
@@ -99,10 +101,10 @@ pub fn update_tickers(s: &str, store: &mut TickerStore) -> Option<(String, Ticke
     Some((inst_id.to_string(), stored))
 }
 
-pub fn update_bbo_store(s: &str, store: &mut BboStore) -> bool {
-    let raw: Value = match serde_json::from_str(s) {
-        Ok(v) => v,
-        Err(_) => return false,
+pub fn update_bbo_store(frame: &mut OkxFrame, store: &mut BboStore) -> bool {
+    let raw = match frame.json() {
+        Some(v) => v,
+        None => return false,
     };
     let channel = raw
         .get("arg")
@@ -154,10 +156,10 @@ pub fn update_bbo_store(s: &str, store: &mut BboStore) -> bool {
     true
 }
 
-pub fn update_trades<const N: usize>(s: &str, trades: &mut FixedTrades<N>) -> usize {
-    let raw: Value = match serde_json::from_str(s) {
-        Ok(v) => v,
-        Err(_) => return 0,
+pub fn update_trades<const N: usize>(frame: &mut OkxFrame, trades: &mut FixedTrades<N>) -> usize {
+    let raw = match frame.json() {
+        Some(v) => v,
+        None => return 0,
     };
     let channel = raw
         .get("arg")

@@ -87,6 +87,7 @@ fn main() {
     let mut last_gate = (0u64, 0u64, 0u64);
     let mut last_gate_user_trade = 0u64;
     let mut last_bitget = (0u64, 0u64, 0u64);
+    let mut last_mexc = (0u64, 0u64, 0u64);
 
     loop {
         let mut st = state().lock().unwrap();
@@ -311,6 +312,58 @@ fn main() {
             }
         }
         last_bitget.2 = st.bitget.trade.seq;
+
+        // mexc
+        if st.mexc.orderbook.seq != last_mexc.0 {
+            if let Some(p) = restore_price(st.mexc.orderbook.price, &st.demean.mexc) {
+                let ts = st.mexc.orderbook.ts_ns.unwrap_or(0);
+                write_csv_row(
+                    &mut w,
+                    ts,
+                    "mexc",
+                    "orderbook",
+                    p,
+                    st.mexc.orderbook.direction,
+                    None,
+                    None,
+                    None,
+                );
+                last_mexc.0 = st.mexc.orderbook.seq;
+            }
+        }
+        if st.mexc.bbo.seq != last_mexc.1 {
+            if let Some(p) = restore_price(st.mexc.bbo.price, &st.demean.mexc) {
+                let ts = st.mexc.bbo.ts_ns.unwrap_or(0);
+                write_csv_row(
+                    &mut w,
+                    ts,
+                    "mexc",
+                    "bbo",
+                    p,
+                    st.mexc.bbo.direction,
+                    None,
+                    None,
+                    None,
+                );
+                last_mexc.1 = st.mexc.bbo.seq;
+            }
+        }
+        while let Some(event) = st.mexc.trade_events.pop_front() {
+            if let Some(price) = restore_price(Some(event.price), &st.demean.mexc) {
+                write_csv_row(
+                    &mut w,
+                    event.ts_ns,
+                    "mexc",
+                    "trade",
+                    price,
+                    event.direction,
+                    event.quantity,
+                    None,
+                    None,
+                );
+            }
+        }
+        last_mexc.2 = st.mexc.trade.seq;
         drop(st);
 
         let _ = w.flush();

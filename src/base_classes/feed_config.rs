@@ -80,6 +80,7 @@ pub struct FeedToggles {
     pub bybit: FeedToggle,
     pub bitget: FeedToggle,
     pub okx: FeedToggle,
+    pub mexc: FeedToggle,
 }
 
 impl Default for FeedToggles {
@@ -90,6 +91,7 @@ impl Default for FeedToggles {
             bybit: FeedToggle::Auto,
             bitget: FeedToggle::Auto,
             okx: FeedToggle::Auto,
+            mexc: FeedToggle::Auto,
         }
     }
 }

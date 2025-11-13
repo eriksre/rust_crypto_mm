@@ -207,3 +207,29 @@ impl OkxWs {
         s
     }
 }
+
+// ---------------- MEXC ----------------
+pub struct MexcWs;
+impl MexcWs {
+    pub const BASE: &str = "wss://contract.mexc.com/edge";
+
+    #[inline]
+    pub fn sub_depth(symbol: &str, limit: Option<u32>) -> String {
+        match limit {
+            Some(limit) => format!(
+                r#"{{"method":"sub.depth","param":{{"symbol":"{symbol}","limit":{limit}}},"id":1}}"#
+            ),
+            None => format!(r#"{{"method":"sub.depth","param":{{"symbol":"{symbol}"}},"id":1}}"#),
+        }
+    }
+
+    #[inline]
+    pub fn sub_ticker(symbol: &str) -> String {
+        format!(r#"{{"method":"sub.ticker","param":{{"symbol":"{symbol}"}},"id":2}}"#)
+    }
+
+    #[inline]
+    pub fn sub_trades(symbol: &str) -> String {
+        format!(r#"{{"method":"sub.deal","param":{{"symbol":"{symbol}"}},"id":3}}"#)
+    }
+}

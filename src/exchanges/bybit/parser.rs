@@ -2,15 +2,20 @@
 
 use crate::base_classes::types::Ts;
 use crate::base_classes::ws::ExchangeHandler;
+use crate::exchanges::bybit::orderbook::BybitMsg;
 use crate::exchanges::endpoints::BybitWs;
+use serde_json::{self, Value};
 use std::time::Instant;
 
-// Lightweight event wrapper. For production, map to typed events.
+// Lightweight event wrapper with cached JSON/typed payloads so downstream logic
+// never re-parses on the engine thread.
 #[derive(Debug, Clone)]
 pub struct BybitFrame {
     pub ts: Ts,
     pub recv_instant: Instant,
     pub raw: Vec<u8>,
+    json_cache: Option<Value>,
+    orderbook_cache: Option<BybitMsg>,
 }
 
 pub struct BybitHandler {
@@ -63,20 +68,16 @@ impl ExchangeHandler for BybitHandler {
 
     #[inline(always)]
     fn parse_text(&self, text: &str, ts: Ts, recv_instant: Instant) -> Option<Self::Out> {
-        Some(BybitFrame {
-            ts,
-            recv_instant,
-            raw: text.as_bytes().to_vec(),
-        })
+        let mut frame = BybitFrame::from_text(text, ts, recv_instant);
+        frame.preparse_text(text);
+        Some(frame)
     }
 
     #[inline(always)]
     fn parse_binary(&self, data: &[u8], ts: Ts, recv_instant: Instant) -> Option<Self::Out> {
-        Some(BybitFrame {
-            ts,
-            recv_instant,
-            raw: data.to_vec(),
-        })
+        let mut frame = BybitFrame::from_bytes(data.to_vec(), ts, recv_instant);
+        frame.preparse_binary();
+        Some(frame)
     }
 
     // Gate orderbook.* streams by Bybit 'seq' only. Accept strictly increasing.
@@ -93,9 +94,83 @@ impl ExchangeHandler for BybitHandler {
         format!("bybit:{}", self.symbol)
     }
 }
-
-// Small helpers for demo/display
+// Small helpers for demo/display plus cached payload accessors
 impl BybitFrame {
+    pub fn from_text(text: &str, ts: Ts, recv_instant: Instant) -> Self {
+        Self {
+            ts,
+            recv_instant,
+            raw: text.as_bytes().to_vec(),
+            json_cache: None,
+            orderbook_cache: None,
+        }
+    }
+
+    pub fn from_bytes(raw: Vec<u8>, ts: Ts, recv_instant: Instant) -> Self {
+        Self {
+            ts,
+            recv_instant,
+            raw,
+            json_cache: None,
+            orderbook_cache: None,
+        }
+    }
+
+    pub fn preparse_text(&mut self, text: &str) {
+        match bybit_preparse_flags(text) {
+            BybitParseTarget::Orderbook => {
+                if self.orderbook_cache.is_none() {
+                    self.orderbook_cache = serde_json::from_str::<BybitMsg>(text).ok();
+                }
+            }
+            BybitParseTarget::Json => {
+                if self.json_cache.is_none() {
+                    self.json_cache = serde_json::from_str::<Value>(text).ok();
+                }
+            }
+            BybitParseTarget::None => {}
+        }
+    }
+
+    pub fn preparse_binary(&mut self) {
+        if let Ok(text) = core::str::from_utf8(&self.raw) {
+            match bybit_preparse_flags(text) {
+                BybitParseTarget::Orderbook => {
+                    if self.orderbook_cache.is_none() {
+                        self.orderbook_cache = serde_json::from_slice(&self.raw).ok();
+                    }
+                }
+                BybitParseTarget::Json => {
+                    if self.json_cache.is_none() {
+                        self.json_cache = serde_json::from_slice(&self.raw).ok();
+                    }
+                }
+                BybitParseTarget::None => {}
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub fn text(&self) -> Option<&str> {
+        core::str::from_utf8(&self.raw).ok()
+    }
+
+    #[inline(always)]
+    pub fn json(&mut self) -> Option<&Value> {
+        if self.json_cache.is_none() {
+            self.json_cache = serde_json::from_slice(&self.raw).ok();
+        }
+        self.json_cache.as_ref()
+    }
+
+    #[inline(always)]
+    pub fn orderbook_msg(&mut self) -> Option<&BybitMsg> {
+        if self.orderbook_cache.is_none() {
+            self.orderbook_cache = serde_json::from_slice(&self.raw).ok();
+        }
+        self.orderbook_cache.as_ref()
+    }
+
     pub fn topic(&self) -> Option<&str> {
         // Fast substring find for "topic":"..."
         if let Ok(s) = core::str::from_utf8(&self.raw) {
@@ -160,4 +235,27 @@ fn find_json_u64(s: &str, key: &str) -> Option<u64> {
         i = idx;
     }
     None
+}
+
+enum BybitParseTarget {
+    Orderbook,
+    Json,
+    None,
+}
+
+fn bybit_preparse_flags(text: &str) -> BybitParseTarget {
+    if let Some(topic) = find_json_string(text, "topic") {
+        if topic.starts_with("orderbook.") {
+            BybitParseTarget::Orderbook
+        } else if topic.starts_with("publicTrade.")
+            || topic.starts_with("tickers.")
+            || topic.starts_with("kline.")
+        {
+            BybitParseTarget::Json
+        } else {
+            BybitParseTarget::None
+        }
+    } else {
+        BybitParseTarget::None
+    }
 }

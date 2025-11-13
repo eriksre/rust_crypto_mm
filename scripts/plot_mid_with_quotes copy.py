@@ -238,6 +238,7 @@ def plot_market(ax: plt.Axes, market: pd.DataFrame) -> None:
         "gate": "tab:green",
         "bitget": "tab:red",
         "mexc": "tab:purple",
+        "okx": "tab:brown",
     }
     marker_map = {
         "bbo": "o",

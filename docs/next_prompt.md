@@ -63,3 +63,14 @@ My pricing algorithm:
 * Have the volume weighted mid price. And then do a regression estimate of how much of that to apply to the mid. Several ways you can do it - turn it into a ratio and then regression estimate the next mid price on that ratio. Throw that, and the raw, unadjusted mid price into a regression, and figure out weights for each of them, and adjust on the fly (might be neat). 
 
 * I need to create a way of predicting the gate price with data from other exchanges. What that means is that I guess I need to use the gate price as some like fair value price. And then essentially, when I don't have data from gate, impute the price on gate with a confidence interval using data from other exchanges. The problem with this, though, is that it assumes that the gate price is always correct, which it might not be. And so I'll need to think about it because the way that you could make this work is that you have some kind of regression and then you figure out the fair price on gate, or you use the most recent price on gate instead. And you assume that that is the correct price, but it might not be. And so the thing that I'm unsure about, well, the thing that I don't want to do actually is to always use the gate price as the representative price because gate might have noise, and I don't want to be that affected by that noise. So I need an algorithm that doesn't 100% of the time respect Gate's price. It should almost all of the time because almost all of the time Gate will be correct, but it should not have the Gate price as the 100% fair price all of the time because it might be wrong 
+
+## TODO 
+* WE HAVE A BIG LATENCY ISSUE. But we've also started adding MEXC. if we can't fix the latency issue, we'll have to re-implement MEXC as a venue and git roll back. p90 latency is 1ms, which is awful. try to fix it first, and if that doesn't work, then roll back to a previous push.
+* Fix trade size stuff for gate and okx
+* Fix the weird gate order submission delay stuff, where some are at 10ms and others are at 20
+* Make sure data structures are nice and fast. ob is optimised.
+* Add in remote markouts (gate mid / bbo at various durations) that I can query from db / have work with grafana / something else thats good. Maybe can hook up some vercel type website instance so it's easy view?
+* Add a bunch of exchanges as data sources (MEXC, hyperliquid, others)
+* Make multi symbol compatable?
+* Prepare codebase to have pricing algo so that things don't break
+

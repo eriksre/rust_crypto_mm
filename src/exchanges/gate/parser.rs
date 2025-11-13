@@ -3,6 +3,8 @@
 use crate::base_classes::types::Ts;
 use crate::base_classes::ws::{ExchangeHandler, HeartbeatPayload};
 use crate::exchanges::endpoints::GateioWs;
+use crate::exchanges::gate::orderbook::GateMsg;
+use serde_json::{self, Value};
 use std::time::Instant;
 
 /// Normalize a Gate.io contract symbol into the expected `BASE_QUOTE` form.
@@ -44,6 +46,8 @@ pub struct GateFrame {
     pub ts: Ts,
     pub recv_instant: Instant,
     pub raw: Vec<u8>,
+    json_cache: Option<Value>,
+    orderbook_cache: Option<GateMsg>,
 }
 
 const ENABLE_ORDERBOOK_SUB: bool = true;
@@ -101,18 +105,14 @@ impl ExchangeHandler for GateHandler {
         &self.subs
     }
     fn parse_text(&self, text: &str, ts: Ts, recv_instant: Instant) -> Option<Self::Out> {
-        Some(GateFrame {
-            ts,
-            recv_instant,
-            raw: text.as_bytes().to_vec(),
-        })
+        let mut frame = GateFrame::from_text(text, ts, recv_instant);
+        frame.preparse_text(text);
+        Some(frame)
     }
     fn parse_binary(&self, data: &[u8], ts: Ts, recv_instant: Instant) -> Option<Self::Out> {
-        Some(GateFrame {
-            ts,
-            recv_instant,
-            raw: data.to_vec(),
-        })
+        let mut frame = GateFrame::from_bytes(data.to_vec(), ts, recv_instant);
+        frame.preparse_binary();
+        Some(frame)
     }
 
     // Gate requires app-level heartbeats with current time
@@ -155,6 +155,72 @@ fn now_secs() -> u64 {
 }
 
 impl GateFrame {
+    pub fn from_text(text: &str, ts: Ts, recv_instant: Instant) -> Self {
+        Self {
+            ts,
+            recv_instant,
+            raw: text.as_bytes().to_vec(),
+            json_cache: None,
+            orderbook_cache: None,
+        }
+    }
+
+    pub fn from_bytes(raw: Vec<u8>, ts: Ts, recv_instant: Instant) -> Self {
+        Self {
+            ts,
+            recv_instant,
+            raw,
+            json_cache: None,
+            orderbook_cache: None,
+        }
+    }
+
+    pub fn preparse_text(&mut self, text: &str) {
+        let (needs_json, is_obu) = gate_preparse_flags(text);
+        if needs_json && self.json_cache.is_none() {
+            self.json_cache = serde_json::from_str::<Value>(text).ok();
+        }
+        if is_obu && self.orderbook_cache.is_none() {
+            self.orderbook_cache = serde_json::from_str::<GateMsg>(text).ok();
+        }
+    }
+
+    pub fn preparse_binary(&mut self) {
+        if let Ok(text) = core::str::from_utf8(&self.raw) {
+            let (needs_json, is_obu) = gate_preparse_flags(text);
+            if !needs_json && !is_obu {
+                return;
+            }
+            if needs_json && self.json_cache.is_none() {
+                self.json_cache = serde_json::from_slice(&self.raw).ok();
+            }
+            if is_obu && self.orderbook_cache.is_none() {
+                self.orderbook_cache = serde_json::from_slice(&self.raw).ok();
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub fn text(&self) -> Option<&str> {
+        core::str::from_utf8(&self.raw).ok()
+    }
+
+    #[inline(always)]
+    pub fn json(&mut self) -> Option<&Value> {
+        if self.json_cache.is_none() {
+            self.json_cache = serde_json::from_slice(&self.raw).ok();
+        }
+        self.json_cache.as_ref()
+    }
+
+    #[inline(always)]
+    pub fn orderbook_msg(&mut self) -> Option<&GateMsg> {
+        if self.orderbook_cache.is_none() {
+            self.orderbook_cache = serde_json::from_slice(&self.raw).ok();
+        }
+        self.orderbook_cache.as_ref()
+    }
+
     pub fn channel(&self) -> &str {
         if let Ok(s) = core::str::from_utf8(&self.raw) {
             if let Some(i) = s.find("\"channel\"") {
@@ -215,4 +281,14 @@ fn find_json_u64(s: &str, key: &str) -> Option<u64> {
         }
     }
     if f { Some(v) } else { None }
+}
+
+#[inline(always)]
+fn gate_preparse_flags(text: &str) -> (bool, bool) {
+    let is_obu = text.contains("\"channel\":\"futures.obu\"");
+    let needs_json = is_obu
+        || text.contains("\"channel\":\"futures.book_ticker\"")
+        || text.contains("\"channel\":\"futures.tickers\"")
+        || text.contains("\"channel\":\"futures.trades\"");
+    (needs_json, is_obu)
 }

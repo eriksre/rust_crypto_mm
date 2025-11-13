@@ -70,7 +70,8 @@ impl BboStore {
         let symbol = symbol.into();
         match self.by_symbol.entry(symbol) {
             Entry::Occupied(mut e) => {
-                e.get_mut().set(bid_px, bid_qty, ask_px, ask_qty, ts, system_ts_ns);
+                e.get_mut()
+                    .set(bid_px, bid_qty, ask_px, ask_qty, ts, system_ts_ns);
                 // Symbol already exists, update last_symbol if needed
                 if self.last_symbol.as_deref() != Some(e.key()) {
                     self.last_symbol = Some(e.key().clone());
@@ -78,7 +79,14 @@ impl BboStore {
             }
             Entry::Vacant(e) => {
                 let key = e.key().clone();
-                e.insert(BboEntry::default()).set(bid_px, bid_qty, ask_px, ask_qty, ts, system_ts_ns);
+                e.insert(BboEntry::default()).set(
+                    bid_px,
+                    bid_qty,
+                    ask_px,
+                    ask_qty,
+                    ts,
+                    system_ts_ns,
+                );
                 self.last_symbol = Some(key);
             }
         }
