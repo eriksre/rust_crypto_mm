@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha512};
 use tokio::time::{Duration, MissedTickBehavior, interval};
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::connect_async_with_config;
 use tokio_tungstenite::tungstenite::Message;
 
 type HmacSha512 = Hmac<Sha512>;
@@ -170,7 +170,7 @@ async fn main() -> Result<()> {
 
     println!("Connecting to Gate private websocket...");
     let ws_url = format!("{}/{}", WS_BASE.trim_end_matches('/'), settle);
-    let (mut ws_stream, _) = connect_async(&ws_url)
+    let (mut ws_stream, _) = connect_async_with_config(&ws_url, None, true)
         .await
         .with_context(|| format!("failed to connect to {}", ws_url))?;
     ws_stream.send(Message::Ping(Vec::new())).await.ok();

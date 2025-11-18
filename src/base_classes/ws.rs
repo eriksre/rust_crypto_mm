@@ -482,7 +482,7 @@ where
             let port = uri.port_u16().unwrap_or(443);
             let addr = format!("{host}:{port}");
 
-            let stream = match TcpStream::connect(addr).await {
+            let mut stream = match TcpStream::connect(addr).await {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!(
@@ -495,6 +495,10 @@ where
                     continue;
                 }
             };
+
+            if let Err(e) = stream.set_nodelay(true) {
+                eprintln!("tcp set_nodelay failed: {e}");
+            }
 
             let (mut sender, conn) = match http1::handshake(stream).await {
                 Ok(ok) => ok,

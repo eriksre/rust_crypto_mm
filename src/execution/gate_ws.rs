@@ -12,7 +12,9 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio::task::spawn_blocking;
 use tokio::time::{Instant, MissedTickBehavior, interval_at, sleep};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    connect_async_with_config, MaybeTlsStream, WebSocketStream, tungstenite::Message,
+};
 
 use crate::base_classes::state::{TradeDirection, state};
 use crate::base_classes::types::Side;
@@ -427,7 +429,7 @@ impl GateWsWorker {
             self.cfg.ws_url.trim_end_matches('/'),
             self.cfg.settle
         );
-        let (mut ws, _) = connect_async(&url)
+        let (mut ws, _) = connect_async_with_config(&url, None, true)
             .await
             .with_context(|| format!("failed to connect to {}", url))?;
         ws.send(Message::Ping(Vec::new())).await.ok();

@@ -10,7 +10,7 @@ use rust_test::exchanges::gate::rest;
 use rust_test::execution::GateWsConfig;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tokio_tungstenite::{connect_async_with_config, MaybeTlsStream, WebSocketStream};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -89,7 +89,7 @@ async fn main() -> Result<()> {
         ws_endpoint, ws_config.symbol, contract_size
     );
 
-    let (stream, _) = connect_async(&ws_endpoint).await?;
+    let (stream, _) = connect_async_with_config(&ws_endpoint, None, true).await?;
     let (mut write, mut read) = stream.split();
     let mut req_counter: u64 = 0;
 

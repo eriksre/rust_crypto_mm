@@ -23,7 +23,7 @@ mod runner {
     use serde_yaml::Value as YamlValue;
     use sha2::Sha512;
     use tokio::time::{Duration, Instant, MissedTickBehavior, interval_at};
-    use tokio_tungstenite::{connect_async, tungstenite::Message};
+    use tokio_tungstenite::{connect_async_with_config, tungstenite::Message};
 
     type HmacSha512 = Hmac<Sha512>;
 
@@ -218,7 +218,7 @@ mod runner {
             "Connecting to {ws_url} for user {} ...",
             user_id.as_deref().unwrap_or("(pending)")
         );
-        let (mut ws, _) = connect_async(&ws_url)
+        let (mut ws, _) = connect_async_with_config(&ws_url, None, true)
             .await
             .with_context(|| format!("failed to connect to {ws_url}"))?;
 

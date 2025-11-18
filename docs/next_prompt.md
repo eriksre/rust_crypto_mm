@@ -74,3 +74,6 @@ My pricing algorithm:
 * Make multi symbol compatable?
 * Prepare codebase to have pricing algo so that things don't break
 
+refactor engine.rs
+
+turn off naggle to stop kernel message coalessing
