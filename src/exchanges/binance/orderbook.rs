@@ -65,9 +65,15 @@ impl<const N: usize> BinanceBook<N> {
                 },
             )
             .collect();
+        let bids_len = bids.len();
+        let asks_len = asks.len();
         self.book.refresh_from_levels(&asks, &bids, ts, seq);
         self.first_valid_processed = false;
         self.last_u = None;
+        eprintln!(
+            "binance depth snapshot loaded: symbol={}, last_update_id={}, bids_loaded={}, asks_loaded={}",
+            self.symbol, self.last_update_id, bids_len, asks_len
+        );
         Ok(())
     }
 
@@ -115,34 +121,39 @@ impl<const N: usize> BinanceBook<N> {
     // Apply depthUpdate event; returns true if applied.
     #[cfg(feature = "parse_binance")]
     pub fn apply_depth_update(&mut self, d: &DepthUpdate) -> bool {
-        // Drop if u < snapshot lastUpdateId
+        self.log_stage("received", d);
         if d.u <= self.last_update_id {
-            return false;
+            return self.log_reject("u <= last_update_id", d);
         }
 
         if !self.first_valid_processed {
             let target = self.last_update_id.saturating_add(1);
-            if d.U <= target && d.u >= target {
-                self.first_valid_processed = true;
-                self.last_u = Some(d.u);
-            } else {
-                return false; // wait for first valid event
+            if !(d.U <= target && d.u >= target) {
+                return self.log_reject("initial diff missing target id", d);
             }
+            let Some(pu) = d.pu else {
+                return self.log_reject("initial diff missing pu", d);
+            };
+            if pu != self.last_update_id {
+                return self.log_reject("initial diff pu mismatch", d);
+            }
+            self.first_valid_processed = true;
+            self.log_stage("initial diff accepted", d);
         } else {
-            if let Some(prev_u) = self.last_u {
-                let expected = prev_u.saturating_add(1);
-                if let Some(pu) = d.pu {
-                    if pu != prev_u {
-                        return false;
-                    }
-                }
-                if !(d.U <= expected && d.u >= expected) {
-                    return false;
-                }
+            let prev_u = match self.last_u {
+                Some(prev) => prev,
+                None => return self.log_reject("missing prev_u state", d),
+            };
+            let Some(pu) = d.pu else {
+                return self.log_reject("incremental diff missing pu", d);
+            };
+            if pu != prev_u {
+                return self.log_reject("incremental diff pu mismatch", d);
             }
-            self.last_u = Some(d.u);
+            self.log_stage("incremental diff accepted", d);
         }
 
+        self.last_u = Some(d.u);
         self.last_update_id = d.u;
 
         let ts = ms_to_ns(d.E); // event time in ns
@@ -168,6 +179,7 @@ impl<const N: usize> BinanceBook<N> {
         } else if !asks.is_empty() {
             self.book.update_asks_batch(&asks, ts, seq);
         }
+        self.log_stage("book update applied", d);
         true
     }
 }
@@ -219,5 +231,38 @@ impl<const N: usize> OrderBookOps for BinanceBook<N> {
         self.first_valid_processed = false;
         self.last_update_id = 0;
         self.last_u = None;
+    }
+}
+
+impl<const N: usize> BinanceBook<N> {
+    #[cfg(feature = "parse_binance")]
+    #[inline(always)]
+    fn log_reject(&self, reason: &str, d: &DepthUpdate) -> bool {
+        eprintln!(
+            "binance depth reject [{}]: symbol={}, last_id={}, event_U={}, event_u={}, pu={:?}",
+            reason,
+            self.symbol,
+            self.last_update_id,
+            d.U,
+            d.u,
+            d.pu
+        );
+        false
+    }
+
+    #[cfg(feature = "parse_binance")]
+    #[inline(always)]
+    fn log_stage(&self, stage: &str, d: &DepthUpdate) {
+        eprintln!(
+            "binance depth [{}]: symbol={}, last_id={}, last_u={:?}, first_valid={}, event_U={}, event_u={}, pu={:?}",
+            stage,
+            self.symbol,
+            self.last_update_id,
+            self.last_u,
+            self.first_valid_processed,
+            d.U,
+            d.u,
+            d.pu
+        );
     }
 }
