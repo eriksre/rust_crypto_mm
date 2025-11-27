@@ -273,10 +273,7 @@ mod tests {
         assert_eq!(last_trade.ts, ms_to_ns(1763026190802));
         assert_eq!(last_trade.seq, 1_763_026_190_802);
         assert!(last_trade.is_buyer_maker);
-        assert_eq!(
-            last_trade.system_ts_ns,
-            Some(ms_to_ns(1_763_026_190_867))
-        );
+        assert_eq!(last_trade.system_ts_ns, Some(ms_to_ns(1_763_026_190_867)));
 
         let taker_buy_qty = (184.0 * QTY_SCALE).round() as Qty;
         let taker_buy = trades
@@ -306,10 +303,7 @@ mod tests {
         assert_eq!(taker_buy.seq, 1_763_026_190_572);
 
         let last_trade = trades_vec.last().expect("missing last trade");
-        assert_eq!(
-            last_trade.system_ts_ns,
-            Some(ms_to_ns(1_763_026_190_572))
-        );
+        assert_eq!(last_trade.system_ts_ns, Some(ms_to_ns(1_763_026_190_572)));
         assert_eq!(last_trade.ts, ms_to_ns(1_763_026_190_515));
         assert!(last_trade.is_buyer_maker);
     }

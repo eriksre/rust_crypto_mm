@@ -10,7 +10,7 @@ use rust_test::exchanges::gate::rest;
 use rust_test::execution::GateWsConfig;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio_tungstenite::{connect_async_with_config, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
 
 #[derive(Debug, Parser)]
 #[command(

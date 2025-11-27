@@ -240,12 +240,7 @@ impl<const N: usize> BinanceBook<N> {
     fn log_reject(&self, reason: &str, d: &DepthUpdate) -> bool {
         eprintln!(
             "binance depth reject [{}]: symbol={}, last_id={}, event_U={}, event_u={}, pu={:?}",
-            reason,
-            self.symbol,
-            self.last_update_id,
-            d.U,
-            d.u,
-            d.pu
+            reason, self.symbol, self.last_update_id, d.U, d.u, d.pu
         );
         false
     }

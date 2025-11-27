@@ -29,8 +29,8 @@ impl Default for DryRunGateway {
             id_counter: AtomicU64::new(1),
             order_ids: Mutex::new(HashMap::new()),
             reports: Mutex::new(VecDeque::new()),
-             notify: Notify::new(),
-             closed: AtomicBool::new(false),
+            notify: Notify::new(),
+            closed: AtomicBool::new(false),
         }
     }
 }
