@@ -28,3 +28,4 @@ logging:
 credentials:
   api_key_env: gateio_api_key
   api_secret_env: gateio_secret_key
+

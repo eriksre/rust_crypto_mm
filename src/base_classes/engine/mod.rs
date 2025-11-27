@@ -13,6 +13,7 @@ mod okx;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use tokio::runtime::Runtime;
 use tokio::sync::mpsc::UnboundedSender;
 
 pub use config::{configure_demean_enabled, configure_feed_overrides};
@@ -61,127 +62,109 @@ impl FastEventSender {
     }
 }
 
-fn bybit_symbol_supported(symbol: &str) -> bool {
+async fn bybit_symbol_supported(symbol: &str) -> bool {
     let url = format!(
         "https://api.bybit.com/v5/market/instruments-info?category=linear&symbol={}",
         symbol
     );
-    let rt = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
+    let client = reqwest::Client::new();
+    let resp = match client.get(url).send().await {
+        Ok(resp) => resp,
         Err(_) => return true,
     };
-    rt.block_on(async move {
-        let client = reqwest::Client::new();
-        let resp = match client.get(url).send().await {
-            Ok(resp) => resp,
-            Err(_) => return true,
-        };
-        if !resp.status().is_success() {
-            return false;
-        }
-        let value: serde_json::Value = match resp.json().await {
-            Ok(json) => json,
-            Err(_) => return true,
-        };
-        if value
-            .get("retCode")
-            .and_then(|c| c.as_i64())
-            .unwrap_or_default()
-            != 0
-        {
-            return false;
-        }
-        value
-            .get("result")
-            .and_then(|res| res.get("list"))
-            .and_then(|list| list.as_array())
-            .map(|list| !list.is_empty())
-            .unwrap_or(false)
-    })
+    if !resp.status().is_success() {
+        return false;
+    }
+    let value: serde_json::Value = match resp.json().await {
+        Ok(json) => json,
+        Err(_) => return true,
+    };
+    if value
+        .get("retCode")
+        .and_then(|c| c.as_i64())
+        .unwrap_or_default()
+        != 0
+    {
+        return false;
+    }
+    value
+        .get("result")
+        .and_then(|res| res.get("list"))
+        .and_then(|list| list.as_array())
+        .map(|list| !list.is_empty())
+        .unwrap_or(false)
 }
 
-fn bitget_symbol_supported(symbol: &str) -> bool {
+async fn bitget_symbol_supported(symbol: &str) -> bool {
     let inst_id = symbol.replace('_', "").to_ascii_uppercase();
     let expected = format!("{inst_id}_UMCBL");
     let url = "https://api.bitget.com/api/mix/v1/market/contracts?productType=umcbl";
-    let rt = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
+    let client = reqwest::Client::new();
+    let resp = match client.get(url).send().await {
+        Ok(resp) => resp,
         Err(_) => return true,
     };
-    rt.block_on(async move {
-        let client = reqwest::Client::new();
-        let resp = match client.get(url).send().await {
-            Ok(resp) => resp,
-            Err(_) => return true,
-        };
-        if !resp.status().is_success() {
-            return false;
-        }
-        let value: serde_json::Value = match resp.json().await {
-            Ok(json) => json,
-            Err(_) => return true,
-        };
-        if value
-            .get("code")
-            .and_then(|code| code.as_str())
-            .unwrap_or("")
-            != "00000"
-        {
-            return false;
-        }
-        let Some(entries) = value.get("data").and_then(|data| data.as_array()) else {
-            return false;
-        };
-        entries.iter().any(|entry| {
-            let sym_match = entry
-                .get("symbol")
-                .and_then(|v| v.as_str())
-                .map(|sym| sym.eq_ignore_ascii_case(&expected))
-                .unwrap_or(false);
-            let display_match = entry
-                .get("symbolDisplayName")
-                .and_then(|v| v.as_str())
-                .map(|sym| sym.eq_ignore_ascii_case(&inst_id))
-                .unwrap_or(false);
-            sym_match || display_match
-        })
+    if !resp.status().is_success() {
+        return false;
+    }
+    let value: serde_json::Value = match resp.json().await {
+        Ok(json) => json,
+        Err(_) => return true,
+    };
+    if value
+        .get("code")
+        .and_then(|code| code.as_str())
+        .unwrap_or("")
+        != "00000"
+    {
+        return false;
+    }
+    let Some(entries) = value.get("data").and_then(|data| data.as_array()) else {
+        return false;
+    };
+    entries.iter().any(|entry| {
+        let sym_match = entry
+            .get("symbol")
+            .and_then(|v| v.as_str())
+            .map(|sym| sym.eq_ignore_ascii_case(&expected))
+            .unwrap_or(false);
+        let display_match = entry
+            .get("symbolDisplayName")
+            .and_then(|v| v.as_str())
+            .map(|sym| sym.eq_ignore_ascii_case(&inst_id))
+            .unwrap_or(false);
+        sym_match || display_match
     })
 }
 
-fn okx_symbol_supported(inst_id: &str) -> bool {
+async fn okx_symbol_supported(inst_id: &str) -> bool {
     let url =
         format!("https://www.okx.com/api/v5/public/instruments?instType=SWAP&instId={inst_id}");
-    let rt = match tokio::runtime::Runtime::new() {
-        Ok(rt) => rt,
+    let client = reqwest::Client::new();
+    let resp = match client.get(url).send().await {
+        Ok(resp) => resp,
         Err(_) => return true,
     };
-    rt.block_on(async move {
-        let client = reqwest::Client::new();
-        let resp = match client.get(url).send().await {
-            Ok(resp) => resp,
-            Err(_) => return true,
-        };
-        if !resp.status().is_success() {
-            return false;
-        }
-        let value: serde_json::Value = match resp.json().await {
-            Ok(json) => json,
-            Err(_) => return true,
-        };
-        if value
-            .get("code")
-            .and_then(|code| code.as_str())
-            .unwrap_or("")
-            != "0"
-        {
-            return false;
-        }
-        value
-            .get("data")
-            .and_then(|data| data.as_array())
-            .map(|entries| !entries.is_empty())
-            .unwrap_or(false)
-    })
+    if !resp.status().is_success() {
+        return false;
+    }
+    let value: serde_json::Value = match resp.json().await {
+        Ok(json) => json,
+        Err(_) => return true,
+    };
+    if value
+        .get("code")
+        .and_then(|code| code.as_str())
+        .unwrap_or("")
+        != "0"
+    {
+        return false;
+    }
+    value
+        .get("data")
+        .and_then(|data| data.as_array())
+        .map(|entries| !entries.is_empty())
+        .unwrap_or(false)
 }
 
 #[cfg(feature = "gate_exec")]
@@ -254,17 +237,46 @@ pub fn spawn_state_engine(
         let mexc_symbol = symbol_uc.replace('/', "_");
         let gate_contract = canonical_contract_symbol(&symbol);
         let gate_symbol = gate_contract.clone();
-        let gate_contract_meta = crate::exchanges::gate::fetch_contract_meta(&gate_contract);
+        let rt = Runtime::new().expect("tokio rt");
+        let (gate_contract_meta, bybit_supported, bitget_supported, okx_supported): (
+            Option<crate::exchanges::gate::GateContractMeta>,
+            bool,
+            bool,
+            bool,
+        ) = rt.block_on(async {
+            let gate_meta = crate::exchanges::gate::fetch_contract_meta_async(&gate_contract);
+            let bybit_fut = async {
+                if bybit_auto {
+                    bybit_symbol_supported(&bybit_symbol).await
+                } else {
+                    true
+                }
+            };
+            let bitget_fut = async {
+                if bitget_auto {
+                    bitget_symbol_supported(&bitget_symbol).await
+                } else {
+                    true
+                }
+            };
+            let okx_fut = async {
+                if okx_auto {
+                    okx_symbol_supported(&okx_inst_id).await
+                } else {
+                    true
+                }
+            };
+            tokio::join!(gate_meta, bybit_fut, bitget_fut, okx_fut)
+        });
 
         let bybit_supported = if bybit_auto {
-            let supported = bybit_symbol_supported(&bybit_symbol);
-            if !supported {
+            if !bybit_supported {
                 eprintln!(
                     "Bybit symbol {} not found; disabling Bybit feeds (auto mode)",
                     bybit_symbol
                 );
             }
-            supported
+            bybit_supported
         } else {
             true
         };
@@ -282,26 +294,24 @@ pub fn spawn_state_engine(
             true
         };
         let bitget_supported = if bitget_auto {
-            let supported = bitget_symbol_supported(&bitget_symbol);
-            if !supported {
+            if !bitget_supported {
                 eprintln!(
                     "Bitget contract {} not found; disabling Bitget feeds (auto mode)",
                     bitget_symbol
                 );
             }
-            supported
+            bitget_supported
         } else {
             true
         };
         let okx_supported = if okx_auto {
-            let supported = okx_symbol_supported(&okx_inst_id);
-            if !supported {
+            if !okx_supported {
                 eprintln!(
                     "OKX instrument {} not found; disabling OKX feeds (auto mode)",
                     okx_inst_id
                 );
             }
-            supported
+            okx_supported
         } else {
             true
         };

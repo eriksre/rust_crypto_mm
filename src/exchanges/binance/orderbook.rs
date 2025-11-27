@@ -5,6 +5,7 @@ use crate::base_classes::orderbook_trait::OrderBookOps;
 use crate::base_classes::types::*;
 use crate::exchanges::binance::rest::{BinanceSnapshot, get_orderbook_snapshot};
 use crate::utils::time::ms_to_ns;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "parse_binance")]
 use crate::exchanges::binance::parsed::DepthUpdate;
@@ -17,11 +18,14 @@ pub struct BinanceBook<const N: usize> {
     pub last_update_id: u64,
     last_u: Option<u64>,
     first_valid_processed: bool,
+    last_resync: Option<Instant>,
 }
 
 impl<const N: usize> BinanceBook<N> {
     pub const PRICE_SCALE: f64 = 100_000.0;
     pub const QTY_SCALE: f64 = 1_000_000.0;
+    const SNAPSHOT_LIMIT: usize = 1000;
+    const RESYNC_COOLDOWN: Duration = Duration::from_secs(1);
 
     pub fn new(symbol: &str, price_scale: f64, qty_scale: f64) -> Self {
         Self {
@@ -32,6 +36,7 @@ impl<const N: usize> BinanceBook<N> {
             last_update_id: 0,
             last_u: None,
             first_valid_processed: false,
+            last_resync: None,
         }
     }
 
@@ -121,33 +126,30 @@ impl<const N: usize> BinanceBook<N> {
     // Apply depthUpdate event; returns true if applied.
     #[cfg(feature = "parse_binance")]
     pub fn apply_depth_update(&mut self, d: &DepthUpdate) -> bool {
-        self.log_stage("received", d);
-        if d.u <= self.last_update_id {
-            return self.log_reject("u <= last_update_id", d);
+        // Drop stale updates silently (can happen if snapshot is ahead of buffered WS messages)
+        if d.u < self.last_update_id {
+            return false;
         }
 
         if !self.first_valid_processed {
-            let target = self.last_update_id.saturating_add(1);
-            if !(d.U <= target && d.u >= target) {
+            // First valid event must overlap the snapshot: U <= lastUpdateId && u >= lastUpdateId.
+            if !(d.U <= self.last_update_id && d.u >= self.last_update_id) {
+                self.try_resync("initial diff missing target id", d);
                 return self.log_reject("initial diff missing target id", d);
             }
-            let Some(pu) = d.pu else {
-                return self.log_reject("initial diff missing pu", d);
-            };
-            if pu != self.last_update_id {
-                return self.log_reject("initial diff pu mismatch", d);
-            }
+            // Do not enforce pu on the first update: pre-snapshot messages were dropped.
             self.first_valid_processed = true;
-            self.log_stage("initial diff accepted", d);
         } else {
             let prev_u = match self.last_u {
                 Some(prev) => prev,
                 None => return self.log_reject("missing prev_u state", d),
             };
             let Some(pu) = d.pu else {
+                self.try_resync("incremental diff missing pu", d);
                 return self.log_reject("incremental diff missing pu", d);
             };
             if pu != prev_u {
+                self.try_resync("incremental diff pu mismatch", d);
                 return self.log_reject("incremental diff pu mismatch", d);
             }
             self.log_stage("incremental diff accepted", d);
@@ -179,7 +181,6 @@ impl<const N: usize> BinanceBook<N> {
         } else if !asks.is_empty() {
             self.book.update_asks_batch(&asks, ts, seq);
         }
-        self.log_stage("book update applied", d);
         true
     }
 }
@@ -248,16 +249,35 @@ impl<const N: usize> BinanceBook<N> {
     #[cfg(feature = "parse_binance")]
     #[inline(always)]
     fn log_stage(&self, stage: &str, d: &DepthUpdate) {
+        let _ = (stage, d); // logging disabled
+    }
+
+    #[cfg(feature = "parse_binance")]
+    #[inline(always)]
+    fn try_resync(&mut self, reason: &str, d: &DepthUpdate) {
+        let now = Instant::now();
+        if let Some(last) = self.last_resync {
+            if now.duration_since(last) < Self::RESYNC_COOLDOWN {
+                return; // throttle resync attempts
+            }
+        }
+        self.last_resync = Some(now);
         eprintln!(
-            "binance depth [{}]: symbol={}, last_id={}, last_u={:?}, first_valid={}, event_U={}, event_u={}, pu={:?}",
-            stage,
-            self.symbol,
-            self.last_update_id,
-            self.last_u,
-            self.first_valid_processed,
-            d.U,
-            d.u,
-            d.pu
+            "binance depth resync: symbol={}, reason={}, last_id={}, event_U={}, event_u={}, pu={:?}",
+            self.symbol, reason, self.last_update_id, d.U, d.u, d.pu
         );
+        match tokio::runtime::Runtime::new() {
+            Ok(rt) => {
+                if let Err(err) = rt.block_on(self.init_from_rest(Self::SNAPSHOT_LIMIT)) {
+                    eprintln!("binance depth resync failed: symbol={}, err={}", self.symbol, err);
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "binance depth resync runtime init failed: symbol={}, err={}",
+                    self.symbol, err
+                );
+            }
+        }
     }
 }

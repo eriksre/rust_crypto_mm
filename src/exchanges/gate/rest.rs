@@ -37,7 +37,6 @@ pub fn fetch_contract_meta(contract: &str) -> Option<GateContractMeta> {
     })
 }
 
-#[cfg(feature = "gate_exec")]
 pub async fn fetch_contract_meta_async(contract: &str) -> Option<GateContractMeta> {
     let url = format!(
         "{}{}",

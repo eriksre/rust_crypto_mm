@@ -30,8 +30,23 @@ impl<const N: usize> BinanceEngine<N> {
         binance_auto: bool,
     ) -> Option<Self> {
         #[cfg(feature = "binance_book")]
+        {
+            use std::time::{Duration, Instant};
+            // Wait until the WS worker has delivered a few frames so we are
+            // less likely to miss the overlap window with the snapshot.
+            let wait_start = Instant::now();
+            while consumer.len() < 3 {
+                if wait_start.elapsed() > Duration::from_secs(2) {
+                    break; // don't block forever; continue even if underfilled
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        #[cfg(feature = "binance_book")]
         let book = {
             use crate::exchanges::binance::BinanceBook;
+
             let rt = tokio::runtime::Runtime::new().expect("tokio rt");
             let mut bk: BinanceBook<1024> = BinanceBook::new(
                 &symbol,
