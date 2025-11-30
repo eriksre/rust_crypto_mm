@@ -207,17 +207,20 @@ fn now_secs() -> u64 {
 }
 
 fn gate_ping_reply(text: &str) -> Option<String> {
-    if !text.contains("\"channel\":\"futures.ping\"") {
-        return None;
+    if text.contains("\"channel\":\"futures.ping\"") {
+        match find_json_string(text, "event") {
+            Some(ev) if ev == "ping" => {}
+            _ => return None,
+        }
+        let time = find_json_u64(text, "time").unwrap_or_else(now_secs);
+        return Some(format!(
+            "{{\"time\":{time},\"channel\":\"futures.pong\",\"event\":\"pong\"}}"
+        ));
     }
-    match find_json_string(text, "event") {
-        Some(ev) if ev == "ping" => {}
-        _ => return None,
+    if text.contains("\"type\":\"ping\"") {
+        return Some(r#"{"type":"pong"}"#.to_string());
     }
-    let time = find_json_u64(text, "time").unwrap_or_else(now_secs);
-    Some(format!(
-        "{{\"time\":{time},\"channel\":\"futures.pong\",\"event\":\"pong\"}}"
-    ))
+    None
 }
 
 fn find_json_string<'a>(s: &'a str, key: &str) -> Option<&'a str> {

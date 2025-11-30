@@ -14,6 +14,7 @@
 //! - **Bitget**: Market data
 //! - **OKX**: Market data (perpetual futures)
 //! - **MEXC**: Market data
+//! - **Lighter**: Market data
 //!
 //! # Adding a New Exchange
 //! 1. Create `src/exchanges/{exchange}/` directory
@@ -28,6 +29,7 @@ pub mod bitget;
 pub mod bybit;
 pub mod endpoints;
 pub mod gate;
+pub mod lighter;
 pub mod mexc;
 pub mod okx;
 
@@ -49,5 +51,6 @@ pub use gate::rest as gate_rest;
 #[cfg(feature = "gate_exec")]
 pub use gate::signing as gate_sign;
 
+pub use lighter::orderbook as lighter_book;
 pub use mexc::orderbook as mexc_book;
 pub use okx::orderbook as okx_book;

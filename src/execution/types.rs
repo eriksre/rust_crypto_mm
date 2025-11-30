@@ -8,6 +8,17 @@ use crate::base_classes::types::Side;
 #[serde(rename_all = "snake_case")]
 pub enum Venue {
     Gate,
+    Lighter,
+}
+
+impl Venue {
+    #[inline]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Venue::Gate => "gate",
+            Venue::Lighter => "lighter",
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

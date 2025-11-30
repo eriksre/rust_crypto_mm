@@ -9,6 +9,7 @@ pub enum ExchangeFeed {
     Bitget,
     Okx,
     Mexc,
+    Lighter,
 }
 
 #[cfg(test)]
@@ -76,6 +77,7 @@ impl ExchangeFeed {
             ExchangeFeed::Bitget => "bitget",
             ExchangeFeed::Okx => "okx",
             ExchangeFeed::Mexc => "mexc",
+            ExchangeFeed::Lighter => "lighter",
         }
     }
 }

@@ -273,7 +273,8 @@ impl SimpleQuoteStrategy {
     fn next_client_id(&mut self, side_tag: &str) -> ClientOrderId {
         self.next_id = self.next_id.wrapping_add(1);
         ClientOrderId::new(format!(
-            "t-gate-{}-{}",
+            "t-{}-{}-{}",
+            self.config.venue.as_str(),
             side_tag.to_lowercase(),
             self.next_id
         ))

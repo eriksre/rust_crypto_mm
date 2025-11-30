@@ -233,3 +233,24 @@ impl MexcWs {
         format!(r#"{{"method":"sub.deal","param":{{"symbol":"{symbol}"}},"id":3}}"#)
     }
 }
+
+// ---------------- Lighter ----------------
+pub struct LighterWs;
+impl LighterWs {
+    pub const BASE: &str = "wss://mainnet.zklighter.elliot.ai/stream";
+    pub const ORDER_BOOK: &str = "order_book";
+    pub const TRADE: &str = "trade";
+    pub const MARKET_STATS: &str = "market_stats";
+
+    #[inline]
+    pub fn sub(channel: &str, market_id: u32) -> String {
+        format!(r#"{{"type":"subscribe","channel":"{channel}/{market_id}"}}"#)
+    }
+}
+
+pub struct LighterGet;
+impl LighterGet {
+    pub const BASE: &str = "https://mainnet.zklighter.elliot.ai";
+    pub const ORDER_BOOKS: &str = "/api/v1/orderBooks";
+    pub const ORDER_BOOK_DETAILS: &str = "/api/v1/orderBookDetails";
+}

@@ -3,5 +3,6 @@ pub mod bitget;
 pub mod bybit;
 pub mod gate;
 pub mod helpers;
+pub mod lighter;
 pub mod mexc;
 pub mod okx;

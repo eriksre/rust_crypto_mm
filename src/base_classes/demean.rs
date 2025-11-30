@@ -11,6 +11,7 @@ pub enum ExchangeKind {
     Bitget,
     Okx,
     Mexc,
+    Lighter,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -107,6 +108,7 @@ pub struct DemeanTracker {
     bitget: ExchangeState,
     okx: ExchangeState,
     mexc: ExchangeState,
+    lighter: ExchangeState,
 }
 
 impl DemeanTracker {
@@ -119,6 +121,7 @@ impl DemeanTracker {
             bitget: ExchangeState::default(),
             okx: ExchangeState::default(),
             mexc: ExchangeState::default(),
+            lighter: ExchangeState::default(),
         }
     }
 
@@ -158,6 +161,7 @@ impl DemeanTracker {
             ExchangeKind::Bitget,
             ExchangeKind::Okx,
             ExchangeKind::Mexc,
+            ExchangeKind::Lighter,
         ] {
             let adj = self
                 .state_mut(exchange)
@@ -174,6 +178,7 @@ impl DemeanTracker {
             ExchangeKind::Bitget => &mut self.bitget,
             ExchangeKind::Okx => &mut self.okx,
             ExchangeKind::Mexc => &mut self.mexc,
+            ExchangeKind::Lighter => &mut self.lighter,
         }
     }
 }

@@ -235,6 +235,24 @@ impl ReferencePublisher {
             st.mexc.trade.received_at,
         );
 
+        // Lighter sources (adjusted)
+        consider(
+            Self::adjust_price(st.lighter.bbo.price, &st.demean.lighter),
+            st.lighter.bbo.seq,
+            st.lighter.bbo.ts_ns,
+            13,
+            Self::label("lighter_bbo", &st.demean.lighter),
+            st.lighter.bbo.received_at,
+        );
+        consider(
+            Self::adjust_price(st.lighter.trade.price, &st.demean.lighter),
+            st.lighter.trade.seq,
+            st.lighter.trade.ts_ns,
+            14,
+            Self::label("lighter_trade", &st.demean.lighter),
+            st.lighter.trade.received_at,
+        );
+
         let candidate = best?;
         let key = RevisionKey {
             source_idx: candidate.source_idx,

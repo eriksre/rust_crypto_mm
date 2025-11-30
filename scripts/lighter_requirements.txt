@@ -1,0 +1,7 @@
+# Requirements for lighter_latency_test.py
+# Install with: pip install -r lighter_requirements.txt
+
+websockets>=12.0
+aiohttp>=3.9.0
+eth-account>=0.11.0
+

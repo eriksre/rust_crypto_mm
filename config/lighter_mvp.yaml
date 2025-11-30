@@ -1,0 +1,31 @@
+strategy:
+  venue: lighter
+  symbol: XRP_USDT
+  size: 10
+  spread_bps: 40.0
+  reprice_bps: 15.0
+  debounce_ms: 50
+  cancel_buffer_ms: 50
+feeds:
+  gate: false
+  binance: auto
+  bybit: auto
+  bitget: auto
+  okx: auto
+  mexc: false
+  lighter: true
+risk:
+  max_order_notional: 400.0
+  max_position_notional: 500.0
+mode:
+  dry_run: true
+  log_fills: false
+  debug_prints: true
+  demean_prices: false
+logging:
+  enabled: true
+  path: logs/lighter_activity.csv
+  flush_interval_ms: 200
+credentials:
+  api_key_env: lighter_api_key
+  api_secret_env: lighter_secret_key

@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use crate::base_classes::feed_config::FeedToggles;
+use crate::execution::types::Venue;
 use crate::execution::GateCredentials;
 use crate::strategy::QuoteConfig;
 
@@ -49,11 +50,11 @@ impl LoggingConfig {
         self.enabled
     }
 
-    pub fn resolve_path(&self) -> std::path::PathBuf {
-        self.path
-            .as_ref()
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from("logs/gate_activity.csv"))
+    pub fn resolve_path(&self, venue: Venue) -> std::path::PathBuf {
+        if let Some(path) = &self.path {
+            return std::path::PathBuf::from(path);
+        }
+        std::path::PathBuf::from(format!("logs/{}_activity.csv", venue.as_str()))
     }
 
     pub fn flush_interval(&self) -> Duration {

@@ -7,6 +7,7 @@ mod config;
 mod demean_controller;
 mod gate;
 mod helpers;
+mod lighter;
 mod mexc;
 mod okx;
 
@@ -29,6 +30,7 @@ use crate::exchanges::binance::BinanceHandler;
 use crate::exchanges::bitget::BitgetHandler;
 use crate::exchanges::bybit::BybitHandler;
 use crate::exchanges::gate::{GateHandler, canonical_contract_symbol};
+use crate::exchanges::lighter::{LighterHandler, LighterMarketMeta, fetch_market_meta_async};
 use crate::exchanges::mexc::MexcHandler;
 use crate::exchanges::okx::OkxHandler;
 
@@ -227,6 +229,7 @@ pub fn spawn_state_engine(
         let bitget_auto = feeds.bitget.is_auto();
         let okx_auto = feeds.okx.is_auto();
         let mexc_auto = feeds.mexc.is_auto();
+        let lighter_auto = feeds.lighter.is_auto();
 
         let symbol_uc = symbol.to_uppercase();
         let cross_venue_symbol = symbol_uc.replace('_', "");
@@ -237,12 +240,14 @@ pub fn spawn_state_engine(
         let mexc_symbol = symbol_uc.replace('/', "_");
         let gate_contract = canonical_contract_symbol(&symbol);
         let gate_symbol = gate_contract.clone();
+        let lighter_symbol = crate::exchanges::lighter::rest::normalize_symbol(&symbol);
         let rt = Runtime::new().expect("tokio rt");
-        let (gate_contract_meta, bybit_supported, bitget_supported, okx_supported): (
+        let (gate_contract_meta, bybit_supported, bitget_supported, okx_supported, lighter_meta): (
             Option<crate::exchanges::gate::GateContractMeta>,
             bool,
             bool,
             bool,
+            Option<LighterMarketMeta>,
         ) = rt.block_on(async {
             let gate_meta = crate::exchanges::gate::fetch_contract_meta_async(&gate_contract);
             let bybit_fut = async {
@@ -266,7 +271,14 @@ pub fn spawn_state_engine(
                     true
                 }
             };
-            tokio::join!(gate_meta, bybit_fut, bitget_fut, okx_fut)
+            let lighter_fut = async {
+                if feeds.lighter.initial_enabled() || lighter_auto {
+                    fetch_market_meta_async(&lighter_symbol).await
+                } else {
+                    None
+                }
+            };
+            tokio::join!(gate_meta, bybit_fut, bitget_fut, okx_fut, lighter_fut)
         });
 
         let bybit_supported = if bybit_auto {
@@ -314,6 +326,30 @@ pub fn spawn_state_engine(
             okx_supported
         } else {
             true
+        };
+
+        let lighter_supported = if lighter_auto {
+            if lighter_meta.is_some() {
+                true
+            } else {
+                eprintln!(
+                    "Lighter market {} not found; disabling Lighter feeds (auto mode)",
+                    lighter_symbol
+                );
+                false
+            }
+        } else if feeds.lighter.initial_enabled() {
+            if lighter_meta.is_some() {
+                true
+            } else {
+                eprintln!(
+                    "Lighter market {} not found; disabling Lighter feeds",
+                    lighter_symbol
+                );
+                false
+            }
+        } else {
+            false
         };
 
         let mexc_supported = if mexc_auto { true } else { true };
@@ -378,6 +414,20 @@ pub fn spawn_state_engine(
         } else {
             None
         };
+        let mut lighter_c = if feeds.lighter.initial_enabled() && lighter_supported {
+            if let Some(meta) = lighter_meta.clone() {
+                let (consumer, _jh) = spawn_ws_worker::<LighterHandler, N>(
+                    LighterHandler::new(meta.clone()),
+                    None,
+                    Some(wake_signal.clone()),
+                );
+                Some((consumer, meta))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         #[cfg(feature = "gate_exec")]
         {
             if gate_c.is_some() {
@@ -422,6 +472,9 @@ pub fn spawn_state_engine(
         let mut mexc_engine = mexc_c
             .take()
             .map(|consumer| mexc::MexcEngine::new(mexc_symbol.clone(), consumer));
+        let mut lighter_engine = lighter_c.take().map(|(consumer, meta)| {
+            lighter::LighterEngine::new(lighter_symbol.clone(), meta, consumer)
+        });
 
         loop {
             let mut progressed = false;
@@ -443,6 +496,9 @@ pub fn spawn_state_engine(
                 progressed |= engine.process(&mut feed_gate, &mut publisher, &mut demean);
             }
             if let Some(engine) = mexc_engine.as_mut() {
+                progressed |= engine.process(&mut feed_gate, &mut publisher, &mut demean);
+            }
+            if let Some(engine) = lighter_engine.as_mut() {
                 progressed |= engine.process(&mut feed_gate, &mut publisher, &mut demean);
             }
 

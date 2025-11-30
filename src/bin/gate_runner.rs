@@ -15,10 +15,11 @@ use rust_test::config::runner::{
     RiskConfig, RunnerConfig, load_gate_credentials, load_runner_config,
 };
 use rust_test::exchanges::gate::rest;
+use rust_test::exchanges::lighter::rest as lighter_rest;
 use rust_test::execution::{
     ClientOrderId, DryRunGateway, ExecutionGateway, ExecutionReport, GateClient, GateCredentials,
     GateWsConfig, GateWsGateway, InventoryReportOutcome, InventoryTracker, OrderAck, OrderManager,
-    OrderStatus, QuoteIntent,
+    OrderStatus, QuoteIntent, Venue,
 };
 use rust_test::logging::quote::{DebugLogger, QuoteLogHandle, format_f64};
 use rust_test::strategy::{ReferenceMeta, SimpleQuoteStrategy};
@@ -60,58 +61,97 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     let cli = Cli::parse();
     let mut config = load_runner_config(&cli.config)?;
+    let venue = config.strategy.venue;
     configure_feed_overrides(config.feeds);
     configure_demean_enabled(config.mode.demean_prices);
     let debug = DebugLogger::new(config.mode.debug_prints);
 
-    let contract_meta = rest::fetch_contract_meta_async(&config.strategy.symbol)
-        .await
-        .ok_or_else(|| {
-            anyhow!(
-                "failed to fetch Gate contract metadata for {}",
-                config.strategy.symbol
-            )
-        })?;
+    let settle = config.settle.clone().unwrap_or_else(|| "usdt".to_string());
 
-    if contract_meta.in_delisting.unwrap_or(false) {
-        bail!(
-            "{} is marked for delisting on Gate; aborting execution",
-            config.strategy.symbol
-        );
-    }
+    let contract_size = match venue {
+        Venue::Gate => {
+            let contract_meta = rest::fetch_contract_meta_async(&config.strategy.symbol)
+                .await
+                .ok_or_else(|| {
+                    anyhow!(
+                        "failed to fetch Gate contract metadata for {}",
+                        config.strategy.symbol
+                    )
+                })?;
 
-    if let Some(min_tick) = contract_meta
-        .order_price_round
-        .or(contract_meta.rounding_precision)
-        .filter(|v| v.is_finite() && *v > 0.0)
-    {
-        if (config.strategy.min_tick - min_tick).abs() > f64::EPSILON {
+            if contract_meta.in_delisting.unwrap_or(false) {
+                bail!(
+                    "{} is marked for delisting on Gate; aborting execution",
+                    config.strategy.symbol
+                );
+            }
+
+            if let Some(min_tick) = contract_meta
+                .order_price_round
+                .or(contract_meta.rounding_precision)
+                .filter(|v| v.is_finite() && *v > 0.0)
+            {
+                if (config.strategy.min_tick - min_tick).abs() > f64::EPSILON {
+                    debug.info(|| {
+                        format!(
+                            "overriding min_tick for {} from {:.8} to {:.8}",
+                            config.strategy.symbol, config.strategy.min_tick, min_tick
+                        )
+                    });
+                }
+                config.strategy.min_tick = min_tick;
+            }
+
+            let size = contract_meta
+                .quanto_multiplier
+                .filter(|m| m.is_finite() && *m > 0.0)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "contract metadata missing valid quanto_multiplier for {}",
+                        config.strategy.symbol
+                    )
+                })?;
+
             debug.info(|| {
                 format!(
-                    "overriding min_tick for {} from {:.8} to {:.8}",
-                    config.strategy.symbol, config.strategy.min_tick, min_tick
+                    "resolved contract size for {} (gate): {}",
+                    config.strategy.symbol, size
                 )
             });
+            size
         }
-        config.strategy.min_tick = min_tick;
-    }
+        Venue::Lighter => {
+            let meta = lighter_rest::fetch_market_meta_async(&config.strategy.symbol)
+                .await
+                .ok_or_else(|| {
+                    anyhow!(
+                        "failed to fetch Lighter market metadata for {}",
+                        config.strategy.symbol
+                    )
+                })?;
 
-    let contract_size = contract_meta
-        .quanto_multiplier
-        .filter(|m| m.is_finite() && *m > 0.0)
-        .ok_or_else(|| {
-            anyhow!(
-                "contract metadata missing valid quanto_multiplier for {}",
-                config.strategy.symbol
-            )
-        })?;
+            let min_tick = 10f64.powi(-(meta.price_decimals as i32));
+            if (config.strategy.min_tick - min_tick).abs() > f64::EPSILON {
+                debug.info(|| {
+                    format!(
+                        "overriding min_tick for {} from {:.8} to {:.8} (lighter)",
+                        config.strategy.symbol, config.strategy.min_tick, min_tick
+                    )
+                });
+                config.strategy.min_tick = min_tick;
+            }
 
-    debug.info(|| {
-        format!(
-            "resolved contract size for {}: {}",
-            config.strategy.symbol, contract_size
-        )
-    });
+            debug.info(|| {
+                format!(
+                    "resolved Lighter market {} (id {}) price_decimals={} size_decimals={}",
+                    meta.symbol, meta.market_id, meta.price_decimals, meta.size_decimals
+                )
+            });
+
+            // TODO: pull actual contract sizing once Lighter trading API is wired.
+            1.0
+        }
+    };
 
     let config = Arc::new(config);
 
@@ -123,26 +163,32 @@ async fn main() -> Result<()> {
         None
     };
 
-    let settle = config.settle.clone().unwrap_or_else(|| "usdt".to_string());
-
     let credentials = if config.mode.dry_run {
         None
     } else {
-        Some(load_gate_credentials(config.as_ref())?)
+        match venue {
+            Venue::Gate => Some(load_gate_credentials(config.as_ref())?),
+            Venue::Lighter => {
+                bail!("Lighter live execution not implemented yet; need trading API details")
+            }
+        }
     };
 
-    let rest_client = credentials
-        .as_ref()
-        .map(|creds| Arc::new(GateClient::new(creds.clone())));
+    let rest_client = match (venue, credentials.as_ref()) {
+        (Venue::Gate, Some(creds)) => Some(Arc::new(GateClient::new(creds.clone()))),
+        _ => None,
+    };
 
-    let initial_contracts = if let Some(client) = rest_client.as_ref() {
-        match client
+    let initial_contracts = match (venue, rest_client.as_ref()) {
+        (Venue::Gate, Some(client)) => match client
             .fetch_position_contracts(&settle, &config.strategy.symbol)
             .await
         {
             Ok(Some(contracts)) => {
-                debug
-                    .info(|| format!("Initial REST position: {} contracts", format_f64(contracts)));
+                debug.info(|| format!(
+                    "Initial REST position: {} contracts",
+                    format_f64(contracts)
+                ));
                 contracts
             }
             Ok(None) => {
@@ -153,9 +199,8 @@ async fn main() -> Result<()> {
                 debug.error(|| format!("failed to fetch initial position: {:#}", err));
                 0.0
             }
-        }
-    } else {
-        0.0
+        },
+        _ => 0.0,
     };
 
     let inventory = Arc::new(Mutex::new(InventoryTracker::new(
@@ -163,7 +208,7 @@ async fn main() -> Result<()> {
         initial_contracts,
     )));
 
-    if let Some(client) = rest_client.clone() {
+    if let (Venue::Gate, Some(client)) = (venue, rest_client.clone()) {
         let inventory_clone = inventory.clone();
         let settle_clone = settle.clone();
         let symbol_clone = config.strategy.symbol.clone();
@@ -219,8 +264,10 @@ async fn main() -> Result<()> {
     );
     debug.info(|| {
         format!(
-            "Gate runner started for {} (dry_run: {})",
-            config.strategy.symbol, config.mode.dry_run
+            "{} runner started for {} (dry_run: {})",
+            venue.as_str(),
+            config.strategy.symbol,
+            config.mode.dry_run
         )
     });
 

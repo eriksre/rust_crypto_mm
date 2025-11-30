@@ -60,6 +60,7 @@ pub struct DemeanState {
     pub bitget: ExchangeAdjustment,
     pub okx: ExchangeAdjustment,
     pub mexc: ExchangeAdjustment,
+    pub lighter: ExchangeAdjustment,
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -111,6 +112,7 @@ pub struct GlobalState {
     pub bitget: ExchangeSnap,
     pub okx: ExchangeSnap,
     pub mexc: ExchangeSnap,
+    pub lighter: ExchangeSnap,
     pub demean: DemeanState,
 }
 

@@ -232,6 +232,7 @@ struct QuoteCsvLogger {
     last_bitget: (u64, u64, u64),
     last_okx: (u64, u64, u64),
     last_mexc: (u64, u64, u64),
+    last_lighter: (u64, u64, u64),
     orders: HashMap<String, QuoteSnapshot>,
     pending_cancels: HashMap<String, CancelSnapshot>,
 }
@@ -243,13 +244,14 @@ enum ExchangeId {
     Bitget,
     Okx,
     Mexc,
+    Lighter,
 }
 
 const EMPTY_LEVELS: [Option<(f64, f64)>; SNAPSHOT_DEPTH] = [None; SNAPSHOT_DEPTH];
 
 impl QuoteCsvLogger {
     fn new(config: &RunnerConfig) -> Result<Self> {
-        let path = config.logging.resolve_path();
+        let path = config.logging.resolve_path(config.strategy.venue);
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create log dir {}", parent.display()))?;
@@ -273,6 +275,7 @@ impl QuoteCsvLogger {
             last_bitget: (0, 0, 0),
             last_okx: (0, 0, 0),
             last_mexc: (0, 0, 0),
+            last_lighter: (0, 0, 0),
             orders: HashMap::new(),
             pending_cancels: HashMap::new(),
         })
@@ -304,6 +307,12 @@ impl QuoteCsvLogger {
         )?;
         self.write_exchange(ExchangeId::Okx, "okx", &st.okx, Some(&st.demean.okx))?;
         self.write_exchange(ExchangeId::Mexc, "mexc", &st.mexc, Some(&st.demean.mexc))?;
+        self.write_exchange(
+            ExchangeId::Lighter,
+            "lighter",
+            &st.lighter,
+            Some(&st.demean.lighter),
+        )?;
         Ok(())
     }
 
@@ -321,6 +330,7 @@ impl QuoteCsvLogger {
             ExchangeId::Bitget => &mut self.last_bitget,
             ExchangeId::Okx => &mut self.last_okx,
             ExchangeId::Mexc => &mut self.last_mexc,
+            ExchangeId::Lighter => &mut self.last_lighter,
         };
         let (orderbook_seq, bbo_seq, trade_seq) = cache;
         Self::write_feed_entry(
@@ -674,6 +684,7 @@ impl QuoteCsvLogger {
 fn venue_to_string(venue: Venue) -> &'static str {
     match venue {
         Venue::Gate => "gate",
+        Venue::Lighter => "lighter",
     }
 }
 

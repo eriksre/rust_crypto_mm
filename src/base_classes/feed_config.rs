@@ -81,6 +81,7 @@ pub struct FeedToggles {
     pub bitget: FeedToggle,
     pub okx: FeedToggle,
     pub mexc: FeedToggle,
+    pub lighter: FeedToggle,
 }
 
 impl Default for FeedToggles {
@@ -92,6 +93,7 @@ impl Default for FeedToggles {
             bitget: FeedToggle::Auto,
             okx: FeedToggle::Auto,
             mexc: FeedToggle::Auto,
+            lighter: FeedToggle::Auto,
         }
     }
 }
