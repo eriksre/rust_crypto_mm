@@ -21,7 +21,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "csv",
         nargs="?",
-        default="logs/gate_activity.csv",
+        default="logs/lighter_activity.csv",
         help="Path to CSV produced by the gate activity logger",
     )
     parser.add_argument(

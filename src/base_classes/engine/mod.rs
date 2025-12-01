@@ -99,19 +99,30 @@ async fn bybit_symbol_supported(symbol: &str) -> bool {
 
 async fn bitget_symbol_supported(symbol: &str) -> bool {
     let inst_id = symbol.replace('_', "").to_ascii_uppercase();
-    let expected = format!("{inst_id}_UMCBL");
-    let url = "https://api.bitget.com/api/mix/v1/market/contracts?productType=umcbl";
+    // Bitget deprecated v1; v2 uses productType=USDT-FUTURES for linear swaps.
+    let url = "https://api.bitget.com/api/v2/mix/market/contracts?productType=USDT-FUTURES";
     let client = reqwest::Client::new();
     let resp = match client.get(url).send().await {
         Ok(resp) => resp,
-        Err(_) => return true,
+        Err(err) => {
+            eprintln!("Bitget symbol check request failed: {err}; keeping Bitget enabled");
+            return true;
+        }
     };
     if !resp.status().is_success() {
-        return false;
+        eprintln!(
+            "Bitget symbol check HTTP {} for {}; keeping Bitget enabled",
+            resp.status(),
+            inst_id
+        );
+        return true;
     }
     let value: serde_json::Value = match resp.json().await {
         Ok(json) => json,
-        Err(_) => return true,
+        Err(err) => {
+            eprintln!("Bitget symbol check JSON decode failed: {err}; keeping Bitget enabled");
+            return true;
+        }
     };
     if value
         .get("code")
@@ -124,28 +135,30 @@ async fn bitget_symbol_supported(symbol: &str) -> bool {
             .and_then(|v| v.as_str())
             .unwrap_or_default();
         eprintln!(
-            "Bitget symbol check returned code {:?} msg {:?}; assuming supported to keep feeds",
+            "Bitget symbol check returned code {:?} msg {:?}; keeping Bitget enabled",
             value.get("code"),
             msg
         );
         return true;
     }
     let Some(entries) = value.get("data").and_then(|data| data.as_array()) else {
+        eprintln!("Bitget symbol check: missing data array; keeping Bitget enabled");
         return true;
     };
-    entries.iter().any(|entry| {
-        let sym_match = entry
+    let found = entries.iter().any(|entry| {
+        entry
             .get("symbol")
             .and_then(|v| v.as_str())
-            .map(|sym| sym.eq_ignore_ascii_case(&expected))
-            .unwrap_or(false);
-        let display_match = entry
-            .get("symbolDisplayName")
-            .and_then(|v| v.as_str())
             .map(|sym| sym.eq_ignore_ascii_case(&inst_id))
-            .unwrap_or(false);
-        sym_match || display_match
-    })
+            .unwrap_or(false)
+    });
+    if !found {
+        eprintln!(
+            "Bitget symbol {} not found in USDT-FUTURES list; disabling Bitget feeds (auto mode)",
+            inst_id
+        );
+    }
+    found
 }
 
 async fn okx_symbol_supported(inst_id: &str) -> bool {
