@@ -1,13 +1,13 @@
 strategy:
   venue: lighter
-  symbol: XRP_USDT
-  size: 20
+  symbol: BTC_USDT
+  size: min
   spread_bps: 40.0
   reprice_bps: 5.0
   debounce_ms: 50
   cancel_buffer_ms: 50
 feeds:
-  gate: false
+  gate: auto
   binance: auto
   bybit: auto
   bitget: auto

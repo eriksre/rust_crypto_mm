@@ -119,10 +119,19 @@ async fn bitget_symbol_supported(symbol: &str) -> bool {
         .unwrap_or("")
         != "00000"
     {
-        return false;
+        let msg = value
+            .get("msg")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        eprintln!(
+            "Bitget symbol check returned code {:?} msg {:?}; assuming supported to keep feeds",
+            value.get("code"),
+            msg
+        );
+        return true;
     }
     let Some(entries) = value.get("data").and_then(|data| data.as_array()) else {
-        return false;
+        return true;
     };
     entries.iter().any(|entry| {
         let sym_match = entry

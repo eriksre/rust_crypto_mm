@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
+use anyhow::{Result, anyhow};
 use serde::Deserialize;
 
 use crate::base_classes::types::Side;
@@ -31,11 +32,46 @@ fn default_cancel_buffer_ms() -> u64 {
     DEFAULT_CANCEL_BUFFER_MS
 }
 
+#[derive(Debug, Clone)]
+pub enum SizeSpec {
+    Fixed(f64),
+    ExchangeMin,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+enum SizeSpecInput {
+    Fixed(f64),
+    Text(String),
+}
+
+fn deserialize_size_spec<'de, D>(deserializer: D) -> std::result::Result<SizeSpec, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = SizeSpecInput::deserialize(deserializer)?;
+    match raw {
+        SizeSpecInput::Fixed(v) => Ok(SizeSpec::Fixed(v)),
+        SizeSpecInput::Text(s) => {
+            let lower = s.trim().to_ascii_lowercase();
+            if ["min", "minimum", "exchange_min", "exchange"].contains(&lower.as_str()) {
+                Ok(SizeSpec::ExchangeMin)
+            } else {
+                Err(serde::de::Error::custom(format!(
+                    "unknown size value '{}'; use a number or 'min'",
+                    s
+                )))
+            }
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct QuoteConfig {
     pub venue: Venue,
     pub symbol: String,
-    pub size: f64,
+    #[serde(deserialize_with = "deserialize_size_spec")]
+    pub size: SizeSpec,
     pub spread_bps: f64,
     #[serde(default = "default_min_tick")]
     pub min_tick: f64,
@@ -45,6 +81,16 @@ pub struct QuoteConfig {
     pub debounce_ms: u64,
     #[serde(default = "default_cancel_buffer_ms")]
     pub cancel_buffer_ms: u64,
+}
+
+impl QuoteConfig {
+    pub fn resolve_size(&self, exchange_min_base: Option<f64>) -> Result<f64> {
+        match self.size {
+            SizeSpec::Fixed(v) => Ok(v),
+            SizeSpec::ExchangeMin => exchange_min_base
+                .ok_or_else(|| anyhow!("exchange minimum size unavailable for this venue")),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +118,7 @@ pub struct ReferenceMeta {
 
 pub struct SimpleQuoteStrategy {
     config: QuoteConfig,
+    base_size: f64,
     next_id: u64,
     last_reference: Option<f64>,
     last_refresh_at: Option<Instant>,
@@ -84,9 +131,10 @@ pub struct SimpleQuoteStrategy {
 }
 
 impl SimpleQuoteStrategy {
-    pub fn new(config: QuoteConfig) -> Self {
+    pub fn new(config: QuoteConfig, base_size: f64) -> Self {
         Self {
             config,
+            base_size,
             next_id: 0,
             last_reference: None,
             last_refresh_at: None,
@@ -96,6 +144,14 @@ impl SimpleQuoteStrategy {
             latest_meta: None,
             needs_requote: true,
             last_cancel_submission_at: None,
+        }
+    }
+
+    pub fn resolve_size(&self, exchange_min_base: Option<f64>) -> Result<f64> {
+        match self.config.size {
+            SizeSpec::Fixed(v) => Ok(v),
+            SizeSpec::ExchangeMin => exchange_min_base
+                .ok_or_else(|| anyhow!("exchange minimum size unavailable for this venue")),
         }
     }
 
@@ -240,7 +296,7 @@ impl SimpleQuoteStrategy {
             self.config.symbol.clone(),
             Side::Bid,
             bid_px,
-            self.config.size,
+            self.base_size,
             TimeInForce::PostOnly,
             self.next_client_id("B"),
         );
@@ -249,7 +305,7 @@ impl SimpleQuoteStrategy {
             self.config.symbol.clone(),
             Side::Ask,
             ask_px,
-            self.config.size,
+            self.base_size,
             TimeInForce::PostOnly,
             self.next_client_id("S"),
         );

@@ -249,8 +249,9 @@ async fn main() -> Result<()> {
             .clone();
         Arc::new(setup_live_gateway(&config, contract_size, &creds).await?)
     };
+    let base_size = config.strategy.resolve_size(None)?;
     let order_manager = Arc::new(OrderManager::new(gateway, Duration::from_secs(30)));
-    let mut strategy = SimpleQuoteStrategy::new(config.strategy.clone());
+    let mut strategy = SimpleQuoteStrategy::new(config.strategy.clone(), base_size);
 
     let mut market_timer = interval(Duration::from_millis(20));
     market_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);

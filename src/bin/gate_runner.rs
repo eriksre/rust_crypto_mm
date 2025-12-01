@@ -23,7 +23,7 @@ use rust_test::execution::{
     LighterGateway, OrderAck, OrderManager, OrderStatus, QuoteIntent, Venue,
 };
 use rust_test::logging::quote::{DebugLogger, QuoteLogHandle, format_f64};
-use rust_test::strategy::{ReferenceMeta, SimpleQuoteStrategy};
+use rust_test::strategy::{ReferenceMeta, SimpleQuoteStrategy, SizeSpec};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::{self, MissedTickBehavior, interval, sleep};
 
@@ -168,8 +168,8 @@ async fn main() -> Result<()> {
                 quote: meta.min_quote_amount,
                 size_decimals: meta.size_decimals,
             });
-            // TODO: pull actual contract sizing once Lighter trading API is wired.
-            1.0
+            // Smallest lot size unit is determined by size_decimals.
+            10f64.powi(-(meta.size_decimals as i32))
         }
     };
 
@@ -312,10 +312,15 @@ async fn main() -> Result<()> {
             _ => bail!("credential/venue mismatch"),
         }
     };
+    let base_size = config
+        .strategy
+        .resolve_size(lighter_mins.as_ref().map(|m| m.base))?;
     let order_manager = Arc::new(OrderManager::new(gateway, Duration::from_secs(30)));
     let strategy = Arc::new(Mutex::new(SimpleQuoteStrategy::new(
         config.strategy.clone(),
+        base_size,
     )));
+    debug.info(|| format!("using base size {:.6}", base_size));
 
     {
         let reports_strategy = strategy.clone();
@@ -476,6 +481,7 @@ async fn main() -> Result<()> {
                         let debug_clone = debug.clone();
                         let inventory_clone = inventory.clone();
                         let minima_clone = lighter_mins.clone();
+                        let size_spec_clone = config_clone.strategy.size.clone();
                         let quote_gate_clone = quote_gate.clone();
                         if let Ok(permit) = quote_gate_clone.try_acquire_owned() {
                             tokio::spawn(async move {
@@ -490,6 +496,7 @@ async fn main() -> Result<()> {
                                     debug_clone.clone(),
                                     inventory_clone,
                                     minima_clone,
+                                    size_spec_clone,
                                 )
                                 .await
                                 {
@@ -664,6 +671,7 @@ async fn handle_quote_tick(
     debug: DebugLogger,
     inventory: Arc<Mutex<InventoryTracker>>,
     order_minima: Option<OrderMinima>,
+    size_spec: SizeSpec,
 ) -> Result<()> {
     let config_ref = config.as_ref();
 
@@ -703,6 +711,7 @@ async fn handle_quote_tick(
             net_contracts,
             reference_price,
             order_minima.as_ref(),
+            &size_spec,
         )?;
         if !filter.skipped.is_empty() {
             for (id, reason) in &filter.skipped {
@@ -929,12 +938,16 @@ fn filter_intents(
     current_contracts: f64,
     reference_price: f64,
     order_minima: Option<&OrderMinima>,
+    size_spec: &SizeSpec,
 ) -> Result<FilteredIntents> {
     if !contract_size.is_finite() || contract_size <= 0.0 {
         bail!("invalid contract size {contract_size}");
     }
     if !reference_price.is_finite() || reference_price <= 0.0 {
         bail!("invalid reference price {reference_price}");
+    }
+    if matches!(size_spec, SizeSpec::ExchangeMin) && order_minima.is_none() {
+        bail!("size: min is only supported when exchange minima are known for this venue");
     }
 
     let mut running_contracts = current_contracts;
@@ -951,21 +964,32 @@ fn filter_intents(
             );
         }
 
+        let mut effective_size = intent.size.abs();
         if let Some(mins) = order_minima {
             let min_size = mins.base.max(mins.quote / price);
             let scale = 10f64.powi(mins.size_decimals as i32);
             let rounded_min = (min_size * scale).ceil() / scale;
-            if intent.size.abs() + f64::EPSILON < rounded_min {
-                bail!(
-                    "intent {} size {:.8} below Lighter minimum {:.8}",
-                    intent.client_order_id,
-                    intent.size,
-                    rounded_min
-                );
+            match size_spec {
+                SizeSpec::ExchangeMin => {
+                    if effective_size < rounded_min {
+                        // lift to the required minimum for Lighter
+                        effective_size = rounded_min;
+                    }
+                }
+                SizeSpec::Fixed(_) => {
+                    if effective_size + f64::EPSILON < rounded_min {
+                        bail!(
+                            "intent {} size {:.8} below Lighter minimum {:.8}",
+                            intent.client_order_id,
+                            intent.size,
+                            rounded_min
+                        );
+                    }
+                }
             }
         }
 
-        let contracts = (intent.size.abs() / contract_size).round() as i64;
+        let contracts = (effective_size / contract_size).round() as i64;
         if contracts == 0 {
             bail!(
                 "intent {} size {:.8} is below contract size {}",
@@ -1014,7 +1038,9 @@ fn filter_intents(
             running_contracts = projected_contracts;
         }
 
-        allowed.push(intent.clone());
+        let mut adjusted_intent = intent.clone();
+        adjusted_intent.size = effective_size;
+        allowed.push(adjusted_intent);
     }
 
     Ok(FilteredIntents { allowed, skipped })

@@ -11,7 +11,7 @@ use parking_lot::Mutex;
 use reqwest::{Client, Url};
 use serde::Deserialize;
 use serde_json;
-use tokio::sync::oneshot;
+use tokio::sync::{Mutex as AsyncMutex, oneshot};
 
 use crate::base_classes::types::Side;
 use crate::execution::types::{
@@ -634,6 +634,7 @@ pub struct LighterGateway {
     api_base: Url,
     next_client_index: Mutex<i64>,
     next_nonce: Mutex<Option<i64>>,
+    nonce_lock: AsyncMutex<()>,
     pending_reports: Mutex<Vec<ExecutionReport>>,
     orders: Mutex<HashMap<ClientOrderId, OrderState>>,
 }
@@ -674,6 +675,7 @@ impl LighterGateway {
             api_base,
             next_client_index: Mutex::new(1),
             next_nonce: Mutex::new(None),
+            nonce_lock: AsyncMutex::new(()),
             pending_reports: Mutex::new(Vec::new()),
             orders: Mutex::new(HashMap::new()),
         })
@@ -974,6 +976,7 @@ impl ExecutionGateway for LighterGateway {
         if intents.is_empty() {
             return Ok(Vec::new());
         }
+        let _nonce_lock = self.nonce_lock.lock().await;
         for attempt in 0..2 {
             let nonces = self.allocate_nonces(intents.len()).await?;
             let mut txs = Vec::with_capacity(intents.len());
@@ -1043,6 +1046,7 @@ impl ExecutionGateway for LighterGateway {
         if ids.is_empty() {
             return Ok(());
         }
+        let _nonce_lock = self.nonce_lock.lock().await;
         // ensure we have order_index for each
         let missing_index = {
             let orders = self.orders.lock();

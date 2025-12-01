@@ -3,5 +3,5 @@
 pub mod simple_quote;
 
 pub use simple_quote::{
-    QuoteConfig, QuotePlan, QuoteStateMetrics, ReferenceMeta, SimpleQuoteStrategy,
+    QuoteConfig, QuotePlan, QuoteStateMetrics, ReferenceMeta, SimpleQuoteStrategy, SizeSpec,
 };
