@@ -1,5 +1,6 @@
 #![cfg(feature = "gate_exec")]
 
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -12,14 +13,14 @@ use rust_test::base_classes::engine::{
 use rust_test::base_classes::reference::ReferenceEvent;
 use rust_test::base_classes::types::Side;
 use rust_test::config::runner::{
-    RiskConfig, RunnerConfig, load_gate_credentials, load_runner_config,
+    RiskConfig, RunnerConfig, load_gate_credentials, load_lighter_credentials, load_runner_config,
 };
 use rust_test::exchanges::gate::rest;
 use rust_test::exchanges::lighter::rest as lighter_rest;
 use rust_test::execution::{
     ClientOrderId, DryRunGateway, ExecutionGateway, ExecutionReport, GateClient, GateCredentials,
-    GateWsConfig, GateWsGateway, InventoryReportOutcome, InventoryTracker, OrderAck, OrderManager,
-    OrderStatus, QuoteIntent, Venue,
+    GateWsConfig, GateWsGateway, InventoryReportOutcome, InventoryTracker, LighterCredentials,
+    LighterGateway, OrderAck, OrderManager, OrderStatus, QuoteIntent, Venue,
 };
 use rust_test::logging::quote::{DebugLogger, QuoteLogHandle, format_f64};
 use rust_test::strategy::{ReferenceMeta, SimpleQuoteStrategy};
@@ -51,6 +52,13 @@ const REF_WARN: Duration = Duration::from_millis(20);
 const STAGE_WARN: Duration = Duration::from_millis(5);
 const CANCEL_WARN: Duration = Duration::from_micros(500);
 
+#[derive(Clone, Debug)]
+struct OrderMinima {
+    base: f64,
+    quote: f64,
+    size_decimals: u32,
+}
+
 struct CancelMessage {
     reference: ReferenceEvent,
     dispatched_at: Instant,
@@ -68,6 +76,8 @@ async fn main() -> Result<()> {
 
     let settle = config.settle.clone().unwrap_or_else(|| "usdt".to_string());
 
+    let mut lighter_meta: Option<lighter_rest::LighterMarketMeta> = None;
+    let mut lighter_mins: Option<OrderMinima> = None;
     let contract_size = match venue {
         Venue::Gate => {
             let contract_meta = rest::fetch_contract_meta_async(&config.strategy.symbol)
@@ -143,11 +153,21 @@ async fn main() -> Result<()> {
 
             debug.info(|| {
                 format!(
-                    "resolved Lighter market {} (id {}) price_decimals={} size_decimals={}",
-                    meta.symbol, meta.market_id, meta.price_decimals, meta.size_decimals
+                    "resolved Lighter market {} (id {}) price_decimals={} size_decimals={} min_base={} min_quote={}",
+                    meta.symbol,
+                    meta.market_id,
+                    meta.price_decimals,
+                    meta.size_decimals,
+                    meta.min_base_amount,
+                    meta.min_quote_amount
                 )
             });
-
+            lighter_meta = Some(meta.clone());
+            lighter_mins = Some(OrderMinima {
+                base: meta.min_base_amount,
+                quote: meta.min_quote_amount,
+                size_decimals: meta.size_decimals,
+            });
             // TODO: pull actual contract sizing once Lighter trading API is wired.
             1.0
         }
@@ -163,19 +183,26 @@ async fn main() -> Result<()> {
         None
     };
 
+    enum LiveCreds {
+        Gate(GateCredentials),
+        Lighter(LighterCredentials),
+    }
+
     let credentials = if config.mode.dry_run {
         None
     } else {
         match venue {
-            Venue::Gate => Some(load_gate_credentials(config.as_ref())?),
-            Venue::Lighter => {
-                bail!("Lighter live execution not implemented yet; need trading API details")
-            }
+            Venue::Gate => Some(LiveCreds::Gate(load_gate_credentials(config.as_ref())?)),
+            Venue::Lighter => Some(LiveCreds::Lighter(load_lighter_credentials(
+                config.as_ref(),
+            )?)),
         }
     };
 
     let rest_client = match (venue, credentials.as_ref()) {
-        (Venue::Gate, Some(creds)) => Some(Arc::new(GateClient::new(creds.clone()))),
+        (Venue::Gate, Some(LiveCreds::Gate(creds))) => {
+            Some(Arc::new(GateClient::new(creds.clone())))
+        }
         _ => None,
     };
 
@@ -185,10 +212,8 @@ async fn main() -> Result<()> {
             .await
         {
             Ok(Some(contracts)) => {
-                debug.info(|| format!(
-                    "Initial REST position: {} contracts",
-                    format_f64(contracts)
-                ));
+                debug
+                    .info(|| format!("Initial REST position: {} contracts", format_f64(contracts)));
                 contracts
             }
             Ok(None) => {
@@ -276,9 +301,16 @@ async fn main() -> Result<()> {
     } else {
         let creds = credentials
             .as_ref()
-            .expect("credentials must exist for live mode")
-            .clone();
-        Arc::new(setup_live_gateway(config.as_ref(), contract_size, &creds).await?)
+            .expect("credentials must exist for live mode");
+        match (venue, creds, lighter_meta.as_ref()) {
+            (Venue::Gate, LiveCreds::Gate(creds), _) => {
+                Arc::new(setup_gate_gateway(config.as_ref(), contract_size, creds).await?)
+            }
+            (Venue::Lighter, LiveCreds::Lighter(creds), Some(meta)) => {
+                Arc::new(setup_lighter_gateway(config.as_ref(), creds, meta).await?)
+            }
+            _ => bail!("credential/venue mismatch"),
+        }
     };
     let order_manager = Arc::new(OrderManager::new(gateway, Duration::from_secs(30)));
     let strategy = Arc::new(Mutex::new(SimpleQuoteStrategy::new(
@@ -443,6 +475,7 @@ async fn main() -> Result<()> {
                         let logger_clone = logger.clone();
                         let debug_clone = debug.clone();
                         let inventory_clone = inventory.clone();
+                        let minima_clone = lighter_mins.clone();
                         let quote_gate_clone = quote_gate.clone();
                         if let Ok(permit) = quote_gate_clone.try_acquire_owned() {
                             tokio::spawn(async move {
@@ -456,6 +489,7 @@ async fn main() -> Result<()> {
                                     logger_clone,
                                     debug_clone.clone(),
                                     inventory_clone,
+                                    minima_clone,
                                 )
                                 .await
                                 {
@@ -629,6 +663,7 @@ async fn handle_quote_tick(
     logger: Option<QuoteLogHandle>,
     debug: DebugLogger,
     inventory: Arc<Mutex<InventoryTracker>>,
+    order_minima: Option<OrderMinima>,
 ) -> Result<()> {
     let config_ref = config.as_ref();
 
@@ -667,6 +702,7 @@ async fn handle_quote_tick(
             contract_size,
             net_contracts,
             reference_price,
+            order_minima.as_ref(),
         )?;
         if !filter.skipped.is_empty() {
             for (id, reason) in &filter.skipped {
@@ -892,6 +928,7 @@ fn filter_intents(
     contract_size: f64,
     current_contracts: f64,
     reference_price: f64,
+    order_minima: Option<&OrderMinima>,
 ) -> Result<FilteredIntents> {
     if !contract_size.is_finite() || contract_size <= 0.0 {
         bail!("invalid contract size {contract_size}");
@@ -905,6 +942,29 @@ fn filter_intents(
     let mut skipped = Vec::new();
 
     for intent in intents {
+        let price = intent.price.abs();
+        if !price.is_finite() || price <= 0.0 {
+            bail!(
+                "invalid price on intent {}: {}",
+                intent.client_order_id,
+                price
+            );
+        }
+
+        if let Some(mins) = order_minima {
+            let min_size = mins.base.max(mins.quote / price);
+            let scale = 10f64.powi(mins.size_decimals as i32);
+            let rounded_min = (min_size * scale).ceil() / scale;
+            if intent.size.abs() + f64::EPSILON < rounded_min {
+                bail!(
+                    "intent {} size {:.8} below Lighter minimum {:.8}",
+                    intent.client_order_id,
+                    intent.size,
+                    rounded_min
+                );
+            }
+        }
+
         let contracts = (intent.size.abs() / contract_size).round() as i64;
         if contracts == 0 {
             bail!(
@@ -916,7 +976,6 @@ fn filter_intents(
         }
 
         let effective_size = contracts as f64 * contract_size;
-        let price = intent.price.abs();
         let notional = price * effective_size;
         if notional > risk.max_order_notional {
             bail!(
@@ -1029,7 +1088,7 @@ async fn ctrl_c_notifier() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-async fn setup_live_gateway(
+async fn setup_gate_gateway(
     config: &RunnerConfig,
     contract_size: f64,
     creds: &GateCredentials,
@@ -1044,4 +1103,40 @@ async fn setup_live_gateway(
     };
 
     GateWsGateway::connect(ws_config).await
+}
+
+async fn setup_lighter_gateway(
+    _config: &RunnerConfig,
+    creds: &LighterCredentials,
+    meta: &lighter_rest::LighterMarketMeta,
+) -> Result<LighterGateway> {
+    let mut signer_path = creds.signer_lib.clone();
+    if !Path::new(&signer_path).exists() {
+        let alt = if signer_path.ends_with(".dylib") {
+            signer_path.trim_end_matches(".dylib").to_string() + ".so"
+        } else if signer_path.ends_with(".so") {
+            signer_path.trim_end_matches(".so").to_string() + ".dylib"
+        } else {
+            signer_path.clone()
+        };
+        if Path::new(&alt).exists() {
+            signer_path = alt;
+        } else {
+            bail!(
+                "Lighter signer library not found at {} (alt tried: {}); please place signer-amd64.so (Linux) or signer-arm64.dylib (macOS) there",
+                creds.signer_lib,
+                alt
+            );
+        }
+    }
+    let mut creds = creds.clone();
+    creds.signer_lib = signer_path;
+    LighterGateway::connect(
+        creds,
+        meta.market_id,
+        meta.price_decimals,
+        meta.size_decimals,
+    )
+    .await
+    .map_err(Into::into)
 }

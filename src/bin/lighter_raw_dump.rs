@@ -4,9 +4,7 @@ use std::time::Duration;
 
 fn main() {
     // Args: SYMBOL [frame_count]
-    let symbol = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "BTC".to_string());
+    let symbol = std::env::args().nth(1).unwrap_or_else(|| "BTC".to_string());
     let max_frames: usize = std::env::args()
         .nth(2)
         .and_then(|s| s.parse().ok())
@@ -22,14 +20,17 @@ fn main() {
         }
     };
 
-    eprintln!("Found market: {} (id={}, price_decimals={}, size_decimals={})",
-        meta.symbol, meta.market_id, meta.price_decimals, meta.size_decimals);
+    eprintln!(
+        "Found market: {} (id={}, price_decimals={}, size_decimals={})",
+        meta.symbol, meta.market_id, meta.price_decimals, meta.size_decimals
+    );
     eprintln!("Will dump {} raw frames with feed labels", max_frames);
     eprintln!("Subscribed feeds: order_book, trade, market_stats");
     eprintln!("---");
 
     const N: usize = 1 << 12;
-    let (lighter_c, _j) = spawn_ws_worker::<LighterHandler, N>(LighterHandler::new(meta), None, None);
+    let (lighter_c, _j) =
+        spawn_ws_worker::<LighterHandler, N>(LighterHandler::new(meta), None, None);
 
     let mut count = 0;
     loop {
@@ -61,6 +62,3 @@ fn main() {
     eprintln!("---");
     eprintln!("Dumped {} frames", count);
 }
-
-
-

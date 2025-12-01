@@ -14,6 +14,7 @@ use crate::base_classes::state::{ExchangeAdjustment, GlobalState, state};
 pub struct ReferencePublisher {
     tx: Option<UnboundedSender<ReferenceEvent>>,
     last_key: Option<RevisionKey>,
+    channel_closed: bool,
 }
 
 impl ReferencePublisher {
@@ -21,13 +22,20 @@ impl ReferencePublisher {
     /// If `tx` is None, the publisher is a no-op (useful for testing).
     #[inline]
     pub fn new(tx: Option<UnboundedSender<ReferenceEvent>>) -> Self {
-        Self { tx, last_key: None }
+        Self {
+            tx,
+            last_key: None,
+            channel_closed: false,
+        }
     }
 
     /// Publishes a reference price event if a new candidate is available.
     /// Silently ignores if no channel is configured or if state lock fails.
     #[inline]
     pub fn publish(&mut self) {
+        if self.channel_closed {
+            return;
+        }
         let tx = match &self.tx {
             Some(tx) => tx,
             None => return,
@@ -66,9 +74,10 @@ impl ReferencePublisher {
         };
 
         if let Err(err) = tx.send(event) {
-            // LOUD FAILURE: Channel closed unexpectedly
             eprintln!("ERROR: Failed to publish reference event: {}", err);
-            // Don't panic here - the channel might be closed during shutdown
+            // Avoid spamming: mark closed and disable further sends.
+            self.channel_closed = true;
+            self.tx = None;
         }
     }
 

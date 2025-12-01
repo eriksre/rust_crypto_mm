@@ -8,6 +8,8 @@ pub struct LighterMarketMeta {
     pub market_id: u32,
     pub price_decimals: u32,
     pub size_decimals: u32,
+    pub min_base_amount: f64,
+    pub min_quote_amount: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -17,6 +19,10 @@ struct OrderBookEntry {
     status: String,
     supported_price_decimals: u32,
     supported_size_decimals: u32,
+    #[serde(default)]
+    min_base_amount: String,
+    #[serde(default)]
+    min_quote_amount: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -63,6 +69,8 @@ pub fn fetch_market_meta(symbol: &str) -> Option<LighterMarketMeta> {
                 market_id: entry.market_id,
                 price_decimals: entry.supported_price_decimals,
                 size_decimals: entry.supported_size_decimals,
+                min_base_amount: entry.min_base_amount.parse().unwrap_or(0.0),
+                min_quote_amount: entry.min_quote_amount.parse().unwrap_or(0.0),
             })
     })
 }
@@ -88,5 +96,7 @@ pub async fn fetch_market_meta_async(symbol: &str) -> Option<LighterMarketMeta> 
             market_id: entry.market_id,
             price_decimals: entry.supported_price_decimals,
             size_decimals: entry.supported_size_decimals,
+            min_base_amount: entry.min_base_amount.parse().unwrap_or(0.0),
+            min_quote_amount: entry.min_quote_amount.parse().unwrap_or(0.0),
         })
 }

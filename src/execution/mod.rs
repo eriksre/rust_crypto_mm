@@ -5,6 +5,7 @@ pub mod gate_client;
 pub mod gate_ws;
 pub mod gateway;
 pub mod inventory;
+pub mod lighter_gateway;
 pub mod order_manager;
 pub mod types;
 
@@ -15,6 +16,7 @@ pub use gateway::ExecutionGateway;
 pub use inventory::{
     InventoryReportOutcome, InventoryTracker, InventoryUpdate, InventoryUpdateSource,
 };
+pub use lighter_gateway::{LighterCredentials, LighterGateway};
 pub use order_manager::OrderManager;
 pub use types::{
     ClientOrderId, ExchangeOrderId, ExecutionReport, OrderAck, OrderStatus, QuoteIntent,

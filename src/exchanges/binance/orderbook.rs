@@ -269,7 +269,10 @@ impl<const N: usize> BinanceBook<N> {
         match tokio::runtime::Runtime::new() {
             Ok(rt) => {
                 if let Err(err) = rt.block_on(self.init_from_rest(Self::SNAPSHOT_LIMIT)) {
-                    eprintln!("binance depth resync failed: symbol={}, err={}", self.symbol, err);
+                    eprintln!(
+                        "binance depth resync failed: symbol={}, err={}",
+                        self.symbol, err
+                    );
                 }
             }
             Err(err) => {

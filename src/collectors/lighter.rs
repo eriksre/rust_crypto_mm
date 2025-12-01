@@ -76,10 +76,7 @@ pub fn update_trades<const N: usize>(
         if px <= 0.0 || qty < 0.0 {
             continue;
         }
-        let ts = trade
-            .timestamp
-            .map(ts_from_exchange)
-            .unwrap_or(frame_ts);
+        let ts = trade.timestamp.map(ts_from_exchange).unwrap_or(frame_ts);
         let seq = trade.trade_id.unwrap_or_else(|| ts);
         let px_i = (px * price_scale).round() as Price;
         let qty_i = (qty * qty_scale).round() as Qty;
