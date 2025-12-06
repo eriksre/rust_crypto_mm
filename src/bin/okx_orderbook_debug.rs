@@ -28,6 +28,7 @@ fn main() -> Result<()> {
         &inst_id,
         OkxBook::<1024>::PRICE_SCALE,
         OkxBook::<1024>::QTY_SCALE,
+        1.0,
     );
 
     let mut last_snapshot = Instant::now();

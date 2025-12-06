@@ -22,6 +22,7 @@ pub struct GateEngine<const N: usize> {
     tickers: TickerStore,
     symbol: String,
     contract_meta: Option<GateContractMeta>,
+    qty_multiplier: f64,
 }
 
 impl<const N: usize> GateEngine<N> {
@@ -30,6 +31,10 @@ impl<const N: usize> GateEngine<N> {
         consumer: Consumer<GateFrame, N>,
         contract_meta: Option<GateContractMeta>,
     ) -> Self {
+        let qty_multiplier = contract_meta
+            .as_ref()
+            .and_then(|meta| meta.quanto_multiplier)
+            .unwrap_or(1.0);
         Self {
             consumer,
             pending: None,
@@ -37,12 +42,14 @@ impl<const N: usize> GateEngine<N> {
                 &symbol,
                 crate::exchanges::gate::GateBook::<1024>::PRICE_SCALE,
                 crate::exchanges::gate::GateBook::<1024>::QTY_SCALE,
+                qty_multiplier,
             ),
             bbo: crate::base_classes::bbo_store::BboStore::default(),
             trades: crate::base_classes::trades::FixedTrades::<64>::default(),
             tickers: TickerStore::default(),
             symbol,
             contract_meta,
+            qty_multiplier,
         }
     }
 
@@ -118,7 +125,7 @@ impl<const N: usize> GateEngine<N> {
                         }
                     }
                 }
-                if gate::update_bbo_store(text, &mut self.bbo) {
+                if gate::update_bbo_store(text, &mut self.bbo, self.qty_multiplier) {
                     if let Some(mid) = self
                         .bbo
                         .mid_price_f64_for(&self.symbol)
@@ -176,7 +183,7 @@ impl<const N: usize> GateEngine<N> {
                         }
                     }
                 }
-                let new_trades = gate::update_trades(text, &mut self.trades);
+                let new_trades = gate::update_trades(text, &mut self.trades, self.qty_multiplier);
                 if new_trades > 0 {
                     for trade in self.trades.iter_last(new_trades) {
                         let trade_ts = trade.ts;
@@ -231,7 +238,9 @@ impl<const N: usize> GateEngine<N> {
                         }
                     }
                 }
-                if let Some((symbol, mut ticker)) = gate::update_tickers(text, &mut self.tickers) {
+                if let Some((symbol, mut ticker)) =
+                    gate::update_tickers(text, &mut self.tickers, self.qty_multiplier)
+                {
                     let mut needs_store_update = false;
 
                     if ticker.quanto_multiplier.is_none() {
@@ -262,6 +271,13 @@ impl<const N: usize> GateEngine<N> {
 
                     if needs_store_update {
                         ticker = self.tickers.update(symbol.clone(), ticker);
+                    }
+
+                    if let Some(mult) = ticker.quanto_multiplier {
+                        if mult > 0.0 && (mult - self.qty_multiplier).abs() > f64::EPSILON {
+                            self.qty_multiplier = mult;
+                            self.book.set_qty_multiplier(mult);
+                        }
                     }
 
                     let mut st = lock_state();

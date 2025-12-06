@@ -18,10 +18,19 @@ pub struct MexcEngine<const N: usize> {
     trades: crate::base_classes::trades::FixedTrades<64>,
     tickers: TickerStore,
     symbol: String,
+    qty_multiplier: f64,
 }
 
 impl<const N: usize> MexcEngine<N> {
-    pub fn new(symbol: String, consumer: Consumer<MexcFrame, N>) -> Self {
+    pub fn new(
+        symbol: String,
+        consumer: Consumer<MexcFrame, N>,
+        contract_meta: Option<crate::exchanges::mexc::MexcContractMeta>,
+    ) -> Self {
+        let qty_multiplier = contract_meta
+            .as_ref()
+            .and_then(|meta| meta.qty_multiplier())
+            .unwrap_or(1.0);
         Self {
             consumer,
             pending: None,
@@ -29,11 +38,13 @@ impl<const N: usize> MexcEngine<N> {
                 &symbol,
                 crate::exchanges::mexc::MexcBook::<1024>::PRICE_SCALE,
                 crate::exchanges::mexc::MexcBook::<1024>::QTY_SCALE,
+                qty_multiplier,
             ),
             bbo: crate::base_classes::bbo_store::BboStore::default(),
             trades: crate::base_classes::trades::FixedTrades::<64>::default(),
             tickers: TickerStore::default(),
             symbol,
+            qty_multiplier,
         }
     }
 
@@ -99,7 +110,7 @@ impl<const N: usize> MexcEngine<N> {
                         }
                     }
                 }
-                if mexc::update_bbo_store(&mut f, &mut self.bbo) {
+                if mexc::update_bbo_store(&mut f, &mut self.bbo, self.qty_multiplier) {
                     let entry = self.bbo.get(&self.symbol).copied().or_else(|| {
                         self.bbo
                             .last_symbol()
@@ -145,7 +156,7 @@ impl<const N: usize> MexcEngine<N> {
                         }
                     }
                 }
-                let new_trades = mexc::update_trades(&mut f, &mut self.trades);
+                let new_trades = mexc::update_trades(&mut f, &mut self.trades, self.qty_multiplier);
                 if new_trades > 0 {
                     for trade in self.trades.iter_last(new_trades) {
                         let trade_ts = trade.ts;
@@ -198,7 +209,9 @@ impl<const N: usize> MexcEngine<N> {
                         }
                     }
                 }
-                if let Some((_, ticker)) = mexc::update_tickers(&mut f, &mut self.tickers) {
+                if let Some((_, ticker)) =
+                    mexc::update_tickers(&mut f, &mut self.tickers, self.qty_multiplier)
+                {
                     let mut st = lock_state();
                     let entry = &mut st.mexc.ticker;
 

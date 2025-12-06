@@ -31,8 +31,10 @@ use crate::exchanges::bitget::BitgetHandler;
 use crate::exchanges::bybit::BybitHandler;
 use crate::exchanges::gate::{GateHandler, canonical_contract_symbol};
 use crate::exchanges::lighter::{LighterHandler, LighterMarketMeta, fetch_market_meta_async};
-use crate::exchanges::mexc::MexcHandler;
-use crate::exchanges::okx::OkxHandler;
+use crate::exchanges::mexc::{
+    MexcContractMeta, MexcHandler, fetch_contract_meta as fetch_mexc_contract_meta,
+};
+use crate::exchanges::okx::{OkxHandler, OkxInstrumentMeta, fetch_instrument_meta};
 
 #[cfg(feature = "gate_exec")]
 use crate::execution::{GateWsConfig, GateWsGateway};
@@ -161,36 +163,6 @@ async fn bitget_symbol_supported(symbol: &str) -> bool {
     found
 }
 
-async fn okx_symbol_supported(inst_id: &str) -> bool {
-    let url =
-        format!("https://www.okx.com/api/v5/public/instruments?instType=SWAP&instId={inst_id}");
-    let client = reqwest::Client::new();
-    let resp = match client.get(url).send().await {
-        Ok(resp) => resp,
-        Err(_) => return true,
-    };
-    if !resp.status().is_success() {
-        return false;
-    }
-    let value: serde_json::Value = match resp.json().await {
-        Ok(json) => json,
-        Err(_) => return true,
-    };
-    if value
-        .get("code")
-        .and_then(|code| code.as_str())
-        .unwrap_or("")
-        != "0"
-    {
-        return false;
-    }
-    value
-        .get("data")
-        .and_then(|data| data.as_array())
-        .map(|entries| !entries.is_empty())
-        .unwrap_or(false)
-}
-
 #[cfg(feature = "gate_exec")]
 fn spawn_gate_user_trades_listener(
     api_key: String,
@@ -264,11 +236,19 @@ pub fn spawn_state_engine(
         let gate_symbol = gate_contract.clone();
         let lighter_symbol = crate::exchanges::lighter::rest::normalize_symbol(&symbol);
         let rt = Runtime::new().expect("tokio rt");
-        let (gate_contract_meta, bybit_supported, bitget_supported, okx_supported, lighter_meta): (
+        let (
+            gate_contract_meta,
+            bybit_supported,
+            bitget_supported,
+            okx_meta_result,
+            mexc_meta_result,
+            lighter_meta,
+        ): (
             Option<crate::exchanges::gate::GateContractMeta>,
             bool,
             bool,
-            bool,
+            Result<Option<OkxInstrumentMeta>, reqwest::Error>,
+            Result<Option<MexcContractMeta>, reqwest::Error>,
             Option<LighterMarketMeta>,
         ) = rt.block_on(async {
             let gate_meta = crate::exchanges::gate::fetch_contract_meta_async(&gate_contract);
@@ -288,9 +268,16 @@ pub fn spawn_state_engine(
             };
             let okx_fut = async {
                 if okx_auto {
-                    okx_symbol_supported(&okx_inst_id).await
+                    fetch_instrument_meta(&okx_inst_id).await
                 } else {
-                    true
+                    Ok(None)
+                }
+            };
+            let mexc_fut = async {
+                if feeds.mexc.initial_enabled() || mexc_auto {
+                    fetch_mexc_contract_meta(&mexc_symbol).await
+                } else {
+                    Ok(None)
                 }
             };
             let lighter_fut = async {
@@ -300,7 +287,14 @@ pub fn spawn_state_engine(
                     None
                 }
             };
-            tokio::join!(gate_meta, bybit_fut, bitget_fut, okx_fut, lighter_fut)
+            tokio::join!(
+                gate_meta,
+                bybit_fut,
+                bitget_fut,
+                okx_fut,
+                mexc_fut,
+                lighter_fut
+            )
         });
 
         let bybit_supported = if bybit_auto {
@@ -338,16 +332,37 @@ pub fn spawn_state_engine(
         } else {
             true
         };
-        let okx_supported = if okx_auto {
-            if !okx_supported {
-                eprintln!(
-                    "OKX instrument {} not found; disabling OKX feeds (auto mode)",
-                    okx_inst_id
-                );
+        let (okx_supported, okx_meta) = if okx_auto {
+            match okx_meta_result {
+                Ok(Some(meta)) => (true, Some(meta)),
+                Ok(None) => {
+                    eprintln!(
+                        "OKX instrument {} not found; disabling OKX feeds (auto mode)",
+                        okx_inst_id
+                    );
+                    (false, None)
+                }
+                Err(err) => {
+                    eprintln!(
+                        "OKX instrument lookup failed for {}: {}; keeping OKX enabled with default sizing",
+                        okx_inst_id, err
+                    );
+                    (true, None)
+                }
             }
-            okx_supported
         } else {
-            true
+            (true, None)
+        };
+
+        let (mexc_supported, mexc_meta) = match mexc_meta_result {
+            Ok(meta) => (true, meta),
+            Err(err) => {
+                eprintln!(
+                    "MEXC contract lookup failed for {}: {}; keeping MEXC enabled with default sizing",
+                    mexc_symbol, err
+                );
+                (true, None)
+            }
         };
 
         let lighter_supported = if lighter_auto {
@@ -373,8 +388,6 @@ pub fn spawn_state_engine(
         } else {
             false
         };
-
-        let mexc_supported = if mexc_auto { true } else { true };
 
         let mut bybit_c = if feeds.bybit.initial_enabled() && bybit_supported {
             let (consumer, _jh) = spawn_ws_worker::<BybitHandler, N>(
@@ -490,10 +503,10 @@ pub fn spawn_state_engine(
             .map(|consumer| bitget::BitgetEngine::new(bitget_symbol.clone(), consumer));
         let mut okx_engine = okx_c
             .take()
-            .map(|consumer| okx::OkxEngine::new(okx_inst_id.clone(), consumer));
-        let mut mexc_engine = mexc_c
-            .take()
-            .map(|consumer| mexc::MexcEngine::new(mexc_symbol.clone(), consumer));
+            .map(|consumer| okx::OkxEngine::new(okx_inst_id.clone(), consumer, okx_meta.clone()));
+        let mut mexc_engine = mexc_c.take().map(|consumer| {
+            mexc::MexcEngine::new(mexc_symbol.clone(), consumer, mexc_meta.clone())
+        });
         let mut lighter_engine = lighter_c.take().map(|(consumer, meta)| {
             lighter::LighterEngine::new(lighter_symbol.clone(), meta, consumer)
         });

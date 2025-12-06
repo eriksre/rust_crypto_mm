@@ -49,7 +49,6 @@ def load_dataframe(path: Path) -> pd.DataFrame:
         "reference_ts_ns",
         "reference_price",
         "size",
-        "quantity",
         "reprice_latency_us",
         "cancel_latency_us",
         "quote_latency_us",
@@ -59,16 +58,6 @@ def load_dataframe(path: Path) -> pd.DataFrame:
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    # Normalise trade size: if there is an alternative quantity column but no
-    # explicit 'size', create a unified 'size' column so downstream plotting
-    # (trade triangles, fills) can scale markers dynamically.
-    if "size" not in df.columns:
-        for alt in ("quantity", "qty", "amount"):
-            if alt in df.columns:
-                df[alt] = pd.to_numeric(df[alt], errors="coerce")
-                df["size"] = df[alt]
-                break
 
     for col in ("exchange", "feed", "event_type", "side", "reference_source"):
         if col in df.columns:
@@ -526,9 +515,9 @@ def main() -> None:
     df = load_dataframe(csv_path)
     market_df, quotes_df, cancels_df, fills_df, reports_df = split_frames(df, args.exchange)
 
-    lifecycles = build_quote_lifecycles(quotes_df, cancels_df, fills_df, reports_df)
-
     if args.show_quotes:
+
+        lifecycles = build_quote_lifecycles(quotes_df, cancels_df, fills_df, reports_df)
         fig, (ax_price, ax_latency) = plt.subplots(
             2,
             1,
@@ -555,8 +544,6 @@ def main() -> None:
     else:
         fig, ax_price = plt.subplots(figsize=(14, 6))
         plot_market(ax_price, market_df)
-        plot_quote_bars(ax_price, lifecycles)
-        plot_fills(ax_price, fills_df)
         ax_price.set_title("Market feeds (orderbook / BBO / trades only)")
         ax_price.set_ylabel("Price")
         ax_price.grid(True, alpha=0.3)

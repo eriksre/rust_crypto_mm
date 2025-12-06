@@ -81,7 +81,11 @@ fn value_to_u64<'a>(value: &'a Value, keys: &[&str]) -> Option<u64> {
     None
 }
 
-pub fn update_tickers(s: &str, store: &mut TickerStore) -> Option<(String, TickerSnapshot)> {
+pub fn update_tickers(
+    s: &str,
+    store: &mut TickerStore,
+    qty_multiplier: f64,
+) -> Option<(String, TickerSnapshot)> {
     let raw: Value = serde_json::from_str(s).ok()?;
     if raw.get("channel").and_then(|v| v.as_str()) != Some("futures.tickers") {
         return None;
@@ -142,7 +146,7 @@ pub fn update_tickers(s: &str, store: &mut TickerStore) -> Option<(String, Ticke
     }
 
     if let Some(last_size) = value_to_f64(data_obj, &["last_size", "last_qty"]) {
-        snapshot.ticker.last_qty = (last_size * QTY_SCALE).round() as Qty;
+        snapshot.ticker.last_qty = (last_size * qty_multiplier * QTY_SCALE).round() as Qty;
     }
 
     if let Some(ts_ms) = value_to_u64(data_obj, &["time_ms", "ts"]) {
@@ -183,7 +187,7 @@ mod tests {
         }"#;
 
         let mut store = TickerStore::default();
-        let (_, snap) = update_tickers(json, &mut store).expect("ticker parsed");
+        let (_, snap) = update_tickers(json, &mut store, 1.0).expect("ticker parsed");
 
         assert_eq!(
             snap.ticker.last_px,
@@ -217,14 +221,14 @@ mod tests {
             }
         }"#;
         let mut store = BboStore::default();
-        assert!(update_bbo_store(json, &mut store));
+        assert!(update_bbo_store(json, &mut store, 1.0));
         let mid = store.mid_price_f64_for("BTC_USDT").unwrap();
         assert!((mid - 110756.85).abs() < 1e-6);
     }
 }
 
 // Update BBO store for Gate from futures.book_ticker
-pub fn update_bbo_store(s: &str, store: &mut BboStore) -> bool {
+pub fn update_bbo_store(s: &str, store: &mut BboStore, qty_multiplier: f64) -> bool {
     if let Ok(raw) = serde_json::from_str::<Value>(s) {
         if raw.get("channel").and_then(|v| v.as_str()) == Some("futures.book_ticker") {
             if let Some(obj) = first_result_object(&raw) {
@@ -268,7 +272,15 @@ pub fn update_bbo_store(s: &str, store: &mut BboStore) -> bool {
                         .or_else(|| find_json_string(s, "symbol"))
                         .or_else(|| find_json_string(s, "s"));
                     if let Some(symbol) = symbol {
-                        store.update(symbol, b, bid_qty, a, ask_qty, ts_ns, system_ts_ns);
+                        store.update(
+                            symbol,
+                            b,
+                            bid_qty * qty_multiplier,
+                            a,
+                            ask_qty * qty_multiplier,
+                            ts_ns,
+                            system_ts_ns,
+                        );
                         return true;
                     }
                 }
@@ -279,7 +291,11 @@ pub fn update_bbo_store(s: &str, store: &mut BboStore) -> bool {
 }
 
 // Update trades store for Gate from futures.trades
-pub fn update_trades<const N: usize>(s: &str, trades: &mut FixedTrades<N>) -> usize {
+pub fn update_trades<const N: usize>(
+    s: &str,
+    trades: &mut FixedTrades<N>,
+    qty_multiplier: f64,
+) -> usize {
     if let Ok(raw) = serde_json::from_str::<Value>(s) {
         if raw.get("channel").and_then(|v| v.as_str()) == Some("futures.trades") {
             let mut inserted = 0usize;
@@ -304,7 +320,7 @@ pub fn update_trades<const N: usize>(s: &str, trades: &mut FixedTrades<N>) -> us
                         .unwrap_or(0.0);
                     if let Some(px) = price {
                         let px_i = (px * PRICE_SCALE).round() as Price;
-                        let qty_i = (size * QTY_SCALE).round() as Qty;
+                        let qty_i = (size * qty_multiplier * QTY_SCALE).round() as Qty;
                         let ts_ms = entry
                             .get("create_time_ms")
                             .or_else(|| entry.get("t"))

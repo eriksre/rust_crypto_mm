@@ -42,7 +42,7 @@ fn as_u64(value: &Value) -> Option<u64> {
     }
 }
 
-pub fn update_bbo_store(frame: &mut MexcFrame, store: &mut BboStore) -> bool {
+pub fn update_bbo_store(frame: &mut MexcFrame, store: &mut BboStore, _qty_multiplier: f64) -> bool {
     // Mexc BBO updates are intentionally disabled; uncomment the block below to restore them.
     /*
     if !matches!(frame.channel(), Some("push.ticker")) {
@@ -79,7 +79,11 @@ pub fn update_bbo_store(frame: &mut MexcFrame, store: &mut BboStore) -> bool {
     false
 }
 
-pub fn update_trades<const N: usize>(frame: &mut MexcFrame, trades: &mut FixedTrades<N>) -> usize {
+pub fn update_trades<const N: usize>(
+    frame: &mut MexcFrame,
+    trades: &mut FixedTrades<N>,
+    qty_multiplier: f64,
+) -> usize {
     if !matches!(frame.channel(), Some("push.deal")) {
         return 0;
     }
@@ -106,7 +110,7 @@ pub fn update_trades<const N: usize>(frame: &mut MexcFrame, trades: &mut FixedTr
             continue;
         }
         let px_i = (price.unwrap() * PRICE_SCALE).round() as Price;
-        let qty_i = (qty.unwrap() * QTY_SCALE).round() as Qty;
+        let qty_i = (qty.unwrap() * qty_multiplier * QTY_SCALE).round() as Qty;
         let seq = trade.get("t").and_then(as_u64).unwrap_or_else(|| ts_ms);
         let is_buyer_maker = side.unwrap_or(0) != 1;
         let record = Trade::new(
@@ -126,6 +130,7 @@ pub fn update_trades<const N: usize>(frame: &mut MexcFrame, trades: &mut FixedTr
 pub fn update_tickers(
     frame: &mut MexcFrame,
     store: &mut TickerStore,
+    qty_multiplier: f64,
 ) -> Option<(String, TickerSnapshot)> {
     if !matches!(frame.channel(), Some("push.ticker")) {
         return None;
@@ -161,6 +166,10 @@ pub fn update_tickers(
     }
     if let Some(oi) = data.get("holdVol").and_then(as_f64) {
         snapshot.open_interest = Some(oi);
+    }
+
+    if let Some(last_qty) = data.get("lastVol").and_then(as_f64) {
+        snapshot.ticker.last_qty = (last_qty * qty_multiplier * QTY_SCALE).round() as Qty;
     }
 
     if let (Some(oi), Some(mark)) = (snapshot.open_interest, snapshot.mark_px) {
@@ -255,7 +264,7 @@ mod tests {
         let mut frame = frame_from_str(SAMPLE_PUSH_DEAL_BATCH);
         let mut trades = FixedTrades::<64>::default();
 
-        let inserted = update_trades(&mut frame, &mut trades);
+        let inserted = update_trades(&mut frame, &mut trades, 1.0);
         let expected = serde_json::from_str::<serde_json::Value>(SAMPLE_PUSH_DEAL_BATCH)
             .unwrap()
             .get("data")
@@ -288,7 +297,7 @@ mod tests {
         let mut frame = frame_from_str(SAMPLE_PUSH_DEAL_SMALL);
         let mut trades = FixedTrades::<16>::default();
 
-        let inserted = update_trades(&mut frame, &mut trades);
+        let inserted = update_trades(&mut frame, &mut trades, 1.0);
         assert_eq!(inserted, 7);
 
         let trades_vec: Vec<_> = trades.iter_last(inserted).collect();

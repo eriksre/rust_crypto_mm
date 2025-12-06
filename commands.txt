@@ -1,5 +1,8 @@
 taskset -c 0 chrt -f 99 cargo run --release --bin gate_runner --features gate_exec
 
+taskset -c 0 chrt -f 99 cargo run --release --bin gate_runner --features gate_exec -- --config config/lighter_mvp.yaml
+
+
 run the file with cpu core pinning
 
 

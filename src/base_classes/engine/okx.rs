@@ -6,7 +6,7 @@ use crate::base_classes::state::{SNAPSHOT_DEPTH, TradeDirection, TradeEvent};
 use crate::base_classes::tickers::TickerStore;
 use crate::collectors::okx;
 use crate::exchanges::endpoints::OkxWs;
-use crate::exchanges::okx::OkxFrame;
+use crate::exchanges::okx::{OkxFrame, OkxInstrumentMeta};
 
 use super::demean_controller::DemeanController;
 use super::helpers::{
@@ -21,10 +21,19 @@ pub struct OkxEngine<const N: usize> {
     trades: crate::base_classes::trades::FixedTrades<64>,
     tickers: TickerStore,
     inst_id: String,
+    qty_multiplier: f64,
 }
 
 impl<const N: usize> OkxEngine<N> {
-    pub fn new(inst_id: String, consumer: Consumer<OkxFrame, N>) -> Self {
+    pub fn new(
+        inst_id: String,
+        consumer: Consumer<OkxFrame, N>,
+        meta: Option<OkxInstrumentMeta>,
+    ) -> Self {
+        let qty_multiplier = meta
+            .as_ref()
+            .and_then(|m| m.qty_multiplier())
+            .unwrap_or(1.0);
         Self {
             consumer,
             pending: None,
@@ -32,11 +41,13 @@ impl<const N: usize> OkxEngine<N> {
                 &inst_id,
                 crate::exchanges::okx::OkxBook::<1024>::PRICE_SCALE,
                 crate::exchanges::okx::OkxBook::<1024>::QTY_SCALE,
+                qty_multiplier,
             ),
             bbo: crate::base_classes::bbo_store::BboStore::default(),
             trades: crate::base_classes::trades::FixedTrades::<64>::default(),
             tickers: TickerStore::default(),
             inst_id,
+            qty_multiplier,
         }
     }
 
@@ -109,7 +120,7 @@ impl<const N: usize> OkxEngine<N> {
                         _ => {}
                     }
                 }
-                if okx::update_bbo_store(&mut f, &mut self.bbo) {
+                if okx::update_bbo_store(&mut f, &mut self.bbo, self.qty_multiplier) {
                     if let Some(mid) = self
                         .bbo
                         .mid_price_f64_for(&self.inst_id)
@@ -166,7 +177,7 @@ impl<const N: usize> OkxEngine<N> {
                         }
                     }
                 }
-                let new_trades = okx::update_trades(&mut f, &mut self.trades);
+                let new_trades = okx::update_trades(&mut f, &mut self.trades, self.qty_multiplier);
                 if new_trades > 0 {
                     for trade in self.trades.iter_last(new_trades) {
                         let trade_ts = trade.ts;
@@ -220,7 +231,9 @@ impl<const N: usize> OkxEngine<N> {
                         }
                     }
                 }
-                if let Some((_, ticker)) = okx::update_tickers(&mut f, &mut self.tickers) {
+                if let Some((_, ticker)) =
+                    okx::update_tickers(&mut f, &mut self.tickers, self.qty_multiplier)
+                {
                     let mut st = lock_state();
                     let entry = &mut st.okx.ticker;
                     let price_scale = okx::PRICE_SCALE;

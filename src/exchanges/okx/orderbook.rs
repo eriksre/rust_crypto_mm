@@ -77,6 +77,7 @@ pub struct OkxBook<const N: usize> {
     book: ArrayOrderBook<N>,
     price_scale: f64,
     qty_scale: f64,
+    qty_multiplier: f64,
     last_books_seq: u64,
     last_bbo_seq: u64,
     initialized: bool,
@@ -89,12 +90,13 @@ impl<const N: usize> OkxBook<N> {
     pub const PRICE_SCALE: f64 = 100_000.0;
     pub const QTY_SCALE: f64 = 1_000_000.0;
 
-    pub fn new(inst_id: &str, price_scale: f64, qty_scale: f64) -> Self {
+    pub fn new(inst_id: &str, price_scale: f64, qty_scale: f64, qty_multiplier: f64) -> Self {
         Self {
             inst_id: inst_id.to_string(),
             book: ArrayOrderBook::new(),
             price_scale,
             qty_scale,
+            qty_multiplier,
             last_books_seq: 0,
             last_bbo_seq: 0,
             initialized: false,
@@ -107,7 +109,7 @@ impl<const N: usize> OkxBook<N> {
     #[inline(always)]
     fn conv(&self, px: f64, qty: f64) -> (Price, Qty) {
         let price = (px * self.price_scale).round() as Price;
-        let qty = (qty * self.qty_scale).round() as Qty;
+        let qty = (qty * self.qty_multiplier * self.qty_scale).round() as Qty;
         (price, qty)
     }
 

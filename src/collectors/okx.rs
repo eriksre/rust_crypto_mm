@@ -41,6 +41,7 @@ pub const QTY_SCALE: f64 = OkxBook::<1>::QTY_SCALE;
 pub fn update_tickers(
     frame: &mut OkxFrame,
     store: &mut TickerStore,
+    qty_multiplier: f64,
 ) -> Option<(String, TickerSnapshot)> {
     let raw = frame.json()?;
     let channel = raw
@@ -69,7 +70,7 @@ pub fn update_tickers(
         snapshot.ticker.last_px = (last_px * PRICE_SCALE).round() as Price;
     }
     if let Some(last_sz) = value_to_f64(payload, &["lastSz"]) {
-        snapshot.ticker.last_qty = (last_sz * QTY_SCALE).round() as Qty;
+        snapshot.ticker.last_qty = (last_sz * qty_multiplier * QTY_SCALE).round() as Qty;
     }
     if let Some(bid_px) = value_to_f64(payload, &["bidPx"]) {
         snapshot.ticker.best_bid = (bid_px * PRICE_SCALE).round() as Price;
@@ -101,7 +102,7 @@ pub fn update_tickers(
     Some((inst_id.to_string(), stored))
 }
 
-pub fn update_bbo_store(frame: &mut OkxFrame, store: &mut BboStore) -> bool {
+pub fn update_bbo_store(frame: &mut OkxFrame, store: &mut BboStore, qty_multiplier: f64) -> bool {
     let raw = match frame.json() {
         Some(v) => v,
         None => return false,
@@ -152,11 +153,23 @@ pub fn update_bbo_store(frame: &mut OkxFrame, store: &mut BboStore) -> bool {
         .and_then(|v| value_to_u64_raw(v))
         .unwrap_or(0);
     let ts_ns = ms_to_ns(ts_ms);
-    store.update(inst_id, bid_px, bid_qty, ask_px, ask_qty, ts_ns, None);
+    store.update(
+        inst_id,
+        bid_px,
+        bid_qty * qty_multiplier,
+        ask_px,
+        ask_qty * qty_multiplier,
+        ts_ns,
+        None,
+    );
     true
 }
 
-pub fn update_trades<const N: usize>(frame: &mut OkxFrame, trades: &mut FixedTrades<N>) -> usize {
+pub fn update_trades<const N: usize>(
+    frame: &mut OkxFrame,
+    trades: &mut FixedTrades<N>,
+    qty_multiplier: f64,
+) -> usize {
     let raw = match frame.json() {
         Some(v) => v,
         None => return 0,
@@ -195,7 +208,7 @@ pub fn update_trades<const N: usize>(frame: &mut OkxFrame, trades: &mut FixedTra
             continue;
         }
         let px_i = (price.unwrap() * PRICE_SCALE).round() as Price;
-        let qty_i = (size.unwrap() * QTY_SCALE).round() as Qty;
+        let qty_i = (size.unwrap() * qty_multiplier * QTY_SCALE).round() as Qty;
         let ts_ns = ms_to_ns(ts_ms.unwrap());
         let seq = entry
             .get("tradeId")

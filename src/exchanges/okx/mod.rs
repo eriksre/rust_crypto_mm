@@ -6,7 +6,9 @@
 
 pub mod orderbook;
 pub mod parser;
+pub mod rest;
 
 // Re-export commonly used types
 pub use orderbook::OkxBook;
 pub use parser::*;
+pub use rest::*;

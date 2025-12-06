@@ -90,6 +90,7 @@ pub struct GateBook<const N: usize> {
     book: ArrayOrderBook<N>,
     price_scale: f64,
     qty_scale: f64,
+    qty_multiplier: f64,
     last_ts: u64,
     last_depth_id: Option<u64>,
     initialized: bool,
@@ -99,12 +100,13 @@ impl<const N: usize> GateBook<N> {
     pub const PRICE_SCALE: f64 = 100_000.0;
     pub const QTY_SCALE: f64 = 1_000_000.0;
 
-    pub fn new(contract: &str, price_scale: f64, qty_scale: f64) -> Self {
+    pub fn new(contract: &str, price_scale: f64, qty_scale: f64, qty_multiplier: f64) -> Self {
         Self {
             contract: contract.to_string(),
             book: ArrayOrderBook::new(),
             price_scale,
             qty_scale,
+            qty_multiplier,
             last_ts: 0,
             last_depth_id: None,
             initialized: false,
@@ -112,10 +114,15 @@ impl<const N: usize> GateBook<N> {
     }
 
     #[inline(always)]
+    pub fn set_qty_multiplier(&mut self, qty_multiplier: f64) {
+        self.qty_multiplier = qty_multiplier;
+    }
+
+    #[inline(always)]
     fn conv(&self, px: f64, qty: f64) -> (Price, Qty) {
         (
             (px * self.price_scale).round() as Price,
-            (qty * self.qty_scale).round() as Qty,
+            (qty * self.qty_multiplier * self.qty_scale).round() as Qty,
         )
     }
 

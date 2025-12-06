@@ -4,6 +4,8 @@
 
 pub mod orderbook;
 pub mod parser;
+pub mod rest;
 
 pub use orderbook::{MexcBook, MexcDepthMsg};
 pub use parser::{MexcFrame, MexcHandler};
+pub use rest::*;

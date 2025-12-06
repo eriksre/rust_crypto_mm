@@ -35,6 +35,7 @@ pub struct MexcBook<const N: usize> {
     book: ArrayOrderBook<N>,
     price_scale: f64,
     qty_scale: f64,
+    qty_multiplier: f64,
     last_seq: u64,
     initialized: bool,
     last_system_ts_ns: Option<Ts>,
@@ -44,12 +45,13 @@ impl<const N: usize> MexcBook<N> {
     pub const PRICE_SCALE: f64 = 100_000.0;
     pub const QTY_SCALE: f64 = 1_000_000.0;
 
-    pub fn new(symbol: &str, price_scale: f64, qty_scale: f64) -> Self {
+    pub fn new(symbol: &str, price_scale: f64, qty_scale: f64, qty_multiplier: f64) -> Self {
         Self {
             symbol: symbol.to_string(),
             book: ArrayOrderBook::new(),
             price_scale,
             qty_scale,
+            qty_multiplier,
             last_seq: 0,
             initialized: false,
             last_system_ts_ns: None,
@@ -67,7 +69,7 @@ impl<const N: usize> MexcBook<N> {
     #[inline(always)]
     fn conv(&self, px: f64, qty: f64) -> (Price, Qty) {
         let price = (px * self.price_scale).round() as Price;
-        let qty = (qty * self.qty_scale).round() as Qty;
+        let qty = (qty * self.qty_multiplier * self.qty_scale).round() as Qty;
         (price, qty)
     }
 
