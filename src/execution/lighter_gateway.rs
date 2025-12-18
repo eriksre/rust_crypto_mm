@@ -889,6 +889,8 @@ pub struct LighterGateway {
     next_client_index: Mutex<i64>,
     next_nonce: Mutex<Option<i64>>,
     nonce_lock: AsyncMutex<()>,
+    last_send_ms: Mutex<u64>,
+    min_send_interval_ms: u64,
     pending_reports: Mutex<Vec<ExecutionReport>>,
     orders: Mutex<HashMap<ClientOrderId, OrderState>>,
 }
@@ -919,6 +921,10 @@ impl LighterGateway {
 
         let http = Client::builder().timeout(Duration::from_secs(10)).build()?;
         let api_base = Url::parse(&base_url)?;
+        let min_send_interval_ms = std::env::var("LIGHTER_SEND_MIN_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(75);
         let gw = Self {
             signer: signer,
             creds,
@@ -930,6 +936,8 @@ impl LighterGateway {
             next_client_index: Mutex::new(1),
             next_nonce: Mutex::new(None),
             nonce_lock: AsyncMutex::new(()),
+            last_send_ms: Mutex::new(0),
+            min_send_interval_ms,
             pending_reports: Mutex::new(Vec::new()),
             orders: Mutex::new(HashMap::new()),
         };
@@ -965,19 +973,40 @@ impl LighterGateway {
         Ok(fresh)
     }
 
-    async fn allocate_nonces(&self, count: usize) -> Result<Vec<i64>> {
+    async fn peek_nonces(&self, count: usize) -> Result<(i64, Vec<i64>)> {
         if count == 0 {
-            return Ok(Vec::new());
+            return Ok((0, Vec::new()));
         }
         let _ = self.ensure_nonce_seed().await?;
-        let mut guard = self.next_nonce.lock();
+        let guard = self.next_nonce.lock();
         let start = guard.expect("nonce seed must be set");
         let mut nonces = Vec::with_capacity(count);
         for i in 0..count {
             nonces.push(start + i as i64);
         }
+        Ok((start, nonces))
+    }
+
+    fn commit_nonces(&self, start: i64, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let mut guard = self.next_nonce.lock();
         *guard = Some(start + count as i64);
-        Ok(nonces)
+    }
+
+    async fn throttle_send(&self) {
+        let min_gap = self.min_send_interval_ms.max(1);
+        let now = current_unix_ms();
+        let wait_ms = {
+            let last = *self.last_send_ms.lock();
+            let target = last.saturating_add(min_gap);
+            target.saturating_sub(now)
+        };
+        if wait_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+        }
+        *self.last_send_ms.lock() = current_unix_ms() as u64;
     }
 
     fn to_price_int(&self, px: f64) -> Result<u32> {
@@ -998,7 +1027,7 @@ impl LighterGateway {
         Ok((size * self.size_scale).round() as i64)
     }
 
-    async fn send_batch(&self, txs: Vec<(SignedTx, ClientOrderId)>) -> Result<Vec<OrderAck>> {
+    async fn send_batch(&self, txs: &[(SignedTx, ClientOrderId)]) -> Result<Vec<OrderAck>> {
         if txs.is_empty() {
             return Ok(Vec::new());
         }
@@ -1016,45 +1045,97 @@ impl LighterGateway {
             tx_types_json,
             tx_infos_json.len()
         );
+        let fallback_hashes = txs
+            .iter()
+            .map(|(tx, _)| tx.tx_hash.as_ref().cloned())
+            .collect::<Vec<_>>();
+        let client_ids = txs
+            .iter()
+            .map(|(_, id)| id.clone())
+            .collect::<Vec<_>>();
 
-        let resp = self
-            .http
-            .post(self.api_base.join("api/v1/sendTxBatch")?)
-            .form(&[("tx_types", tx_types_json), ("tx_infos", tx_infos_json)])
-            .send()
-            .await
-            .context("sendTxBatch request failed")?;
+        let mut sleep_ms: u64 = 150;
+        for attempt in 0..8 {
+            self.throttle_send().await;
+            let resp = self
+                .http
+                .post(self.api_base.join("api/v1/sendTxBatch")?)
+                .form(&[("tx_types", tx_types_json.clone()), ("tx_infos", tx_infos_json.clone())])
+                .send()
+                .await
+                .context("sendTxBatch request failed")?;
 
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            bail!("sendTxBatch failed HTTP {} body: {}", status, body);
-        }
-        let payload: SendTxBatchResponse = serde_json::from_str(&body)
-            .context(format!("invalid sendTxBatch JSON body: {}", body))?;
-        if payload.code != 200 {
-            bail!(
-                "sendTxBatch error {}: {} (body={})",
-                payload.code,
-                payload.message.unwrap_or_default(),
-                body
+            let status = resp.status();
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+            let body = resp.text().await.unwrap_or_default();
+
+            if status.is_success() {
+                let payload: SendTxBatchResponse = serde_json::from_str(&body)
+                    .context(format!("invalid sendTxBatch JSON body: {}", body))?;
+                if payload.code != 200 {
+                    let msg = payload.message.unwrap_or_default();
+                    if is_lighter_rate_limited(&msg) || payload.code == 23000 {
+                        // Sometimes rate-limits come back as 200+code=23000.
+                        let wait = retry_after
+                            .map(|s| (s.saturating_mul(1000)).min(5_000))
+                            .unwrap_or_else(|| (sleep_ms + (current_unix_ms() as u64 % 73)).min(5_000));
+                        eprintln!(
+                            "[lighter-send] sendTxBatch rate-limited attempt={} waiting_ms={} (code={} msg={})",
+                            attempt + 1,
+                            wait,
+                            payload.code,
+                            msg
+                        );
+                        tokio::time::sleep(Duration::from_millis(wait)).await;
+                        sleep_ms = (sleep_ms.saturating_mul(2)).min(5_000);
+                        continue;
+                    }
+                    bail!("sendTxBatch error {}: {} (body={})", payload.code, msg, body);
+                }
+
+                let mut acks = Vec::with_capacity(client_ids.len());
+                for (idx, client_id) in client_ids.iter().cloned().enumerate() {
+                    let exch = payload
+                        .tx_hash
+                        .get(idx)
+                        .or(fallback_hashes.get(idx).and_then(|h| h.as_ref()))
+                        .cloned()
+                        .map(ExchangeOrderId);
+                    acks.push(OrderAck {
+                        client_order_id: client_id,
+                        exchange_order_id: exch,
+                    });
+                }
+                return Ok(acks);
+            }
+
+            let retryable = status.as_u16() == 429
+                || status.as_u16() == 500
+                || status.as_u16() == 502
+                || status.as_u16() == 503
+                || status.as_u16() == 504;
+            if !retryable {
+                bail!("sendTxBatch failed HTTP {} body: {}", status, body);
+            }
+
+            let wait = retry_after
+                .map(|s| (s.saturating_mul(1000)).min(5_000))
+                .unwrap_or_else(|| (sleep_ms + (current_unix_ms() as u64 % 73)).min(5_000));
+            eprintln!(
+                "[lighter-send] sendTxBatch retryable attempt={} status={} waiting_ms={} (body_len={})",
+                attempt + 1,
+                status,
+                wait,
+                body.len()
             );
+            tokio::time::sleep(Duration::from_millis(wait)).await;
+            sleep_ms = (sleep_ms.saturating_mul(2)).min(5_000);
         }
-
-        let mut acks = Vec::with_capacity(txs.len());
-        for ((tx, client_id), idx) in txs.into_iter().zip(0..) {
-            let exch = payload
-                .tx_hash
-                .get(idx)
-                .or(tx.tx_hash.as_ref())
-                .cloned()
-                .map(ExchangeOrderId);
-            acks.push(OrderAck {
-                client_order_id: client_id,
-                exchange_order_id: exch.clone(),
-            });
-        }
-        Ok(acks)
+        bail!("sendTxBatch retry exhausted (HTTP 429/5xx)")
     }
 
     fn is_nonce_error(err: &anyhow::Error) -> bool {
@@ -1313,7 +1394,7 @@ impl ExecutionGateway for LighterGateway {
         }
         let _nonce_lock = self.nonce_lock.lock().await;
         for attempt in 0..2 {
-            let nonces = self.allocate_nonces(intents.len()).await?;
+            let (start_nonce, nonces) = self.peek_nonces(intents.len()).await?;
             let mut txs = Vec::with_capacity(intents.len());
             for (intent, nonce) in intents.iter().zip(nonces.into_iter()) {
                 let px = self.to_price_int(intent.price)?;
@@ -1347,8 +1428,9 @@ impl ExecutionGateway for LighterGateway {
 
                 txs.push((signed, intent.client_order_id.clone()));
             }
-            match self.send_batch(txs).await {
+            match self.send_batch(&txs).await {
                 Ok(acks) => {
+                    self.commit_nonces(start_nonce, intents.len());
                     // optimistic new reports only after successful send
                     let ts = Some(current_unix_ms());
                     for (intent, ack) in intents.iter().zip(acks.iter()) {
@@ -1382,85 +1464,90 @@ impl ExecutionGateway for LighterGateway {
             return Ok(());
         }
         let _nonce_lock = self.nonce_lock.lock().await;
-        // ensure we have order_index for each
-        let missing_index = {
-            let orders = self.orders.lock();
-            orders
-                .iter()
-                .filter(|(id, st)| ids.contains(id) && st.order_index.is_none())
-                .count()
-        };
-        if missing_index > 0 {
-            let actives = self.fetch_active_orders().await.unwrap_or_default();
-            let mut map = self.orders.lock();
-            for entry in actives {
-                if let (Some(coi), Some(idx)) = (entry.client_order_index, entry.order_index) {
-                    for state in map.values_mut() {
-                        if state.client_order_index == coi {
-                            state.order_index = Some(idx);
+        for attempt in 0..2 {
+            // ensure we have order_index for each
+            let missing_index = {
+                let orders = self.orders.lock();
+                orders
+                    .iter()
+                    .filter(|(id, st)| ids.contains(id) && st.order_index.is_none())
+                    .count()
+            };
+            if missing_index > 0 {
+                let actives = self.fetch_active_orders().await.unwrap_or_default();
+                let mut map = self.orders.lock();
+                for entry in actives {
+                    if let (Some(coi), Some(idx)) = (entry.client_order_index, entry.order_index) {
+                        for state in map.values_mut() {
+                            if state.client_order_index == coi {
+                                state.order_index = Some(idx);
+                            }
                         }
                     }
                 }
             }
-        }
 
-        let orders_snapshot = {
-            let guard = self.orders.lock();
-            ids.iter()
-                .map(|id| {
-                    let state = guard
-                        .get(id)
-                        .ok_or_else(|| anyhow!("unknown order {}", id.0))?;
-                    let order_index = state
-                        .order_index
-                        .or(Some(state.client_order_index))
-                        .ok_or_else(|| anyhow!("missing order_index for {}", id.0))?;
-                    Ok((id.clone(), order_index))
-                })
-                .collect::<Result<Vec<_>>>()?
-        };
-        let nonces = self.allocate_nonces(orders_snapshot.len()).await?;
+            let orders_snapshot = {
+                let guard = self.orders.lock();
+                ids.iter()
+                    .map(|id| {
+                        let state = guard
+                            .get(id)
+                            .ok_or_else(|| anyhow!("unknown order {}", id.0))?;
+                        let order_index = state
+                            .order_index
+                            .or(Some(state.client_order_index))
+                            .ok_or_else(|| anyhow!("missing order_index for {}", id.0))?;
+                        Ok((id.clone(), order_index))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            };
+            let (start_nonce, nonces) = self.peek_nonces(orders_snapshot.len()).await?;
 
-        let mut txs = Vec::with_capacity(orders_snapshot.len());
-        for ((id, order_index), nonce) in orders_snapshot.into_iter().zip(nonces.into_iter()) {
-            let signed = self
-                .signer
-                .sign_cancel(
-                    self.market_index,
-                    order_index,
-                    nonce,
-                    self.creds.api_key_index,
-                    self.creds.account_index,
-                )
-                .await?;
-            txs.push((signed, id));
-        }
-        match self.send_batch(txs).await {
-            Ok(_) => {
-                // optimistic cancel reports
-                let mut reports = Vec::new();
-                let ts = Some(current_unix_ms());
-                for id in ids {
-                    reports.push(ExecutionReport {
-                        client_order_id: id.clone(),
-                        exchange_order_id: None,
-                        status: OrderStatus::Canceled,
-                        filled_qty: 0.0,
-                        avg_fill_price: None,
-                        ts,
-                    });
-                }
-                let mut pending = self.pending_reports.lock();
-                pending.extend(reports);
-                Ok(())
+            let mut txs = Vec::with_capacity(orders_snapshot.len());
+            for ((id, order_index), nonce) in orders_snapshot.into_iter().zip(nonces.into_iter()) {
+                let signed = self
+                    .signer
+                    .sign_cancel(
+                        self.market_index,
+                        order_index,
+                        nonce,
+                        self.creds.api_key_index,
+                        self.creds.account_index,
+                    )
+                    .await?;
+                txs.push((signed, id));
             }
-            Err(err) => {
-                if Self::is_nonce_error(&err) {
-                    let _ = self.refresh_nonce_from_server().await?;
+            match self.send_batch(&txs).await {
+                Ok(_) => {
+                    self.commit_nonces(start_nonce, txs.len());
+                    // optimistic cancel reports
+                    let mut reports = Vec::new();
+                    let ts = Some(current_unix_ms());
+                    for id in ids {
+                        reports.push(ExecutionReport {
+                            client_order_id: id.clone(),
+                            exchange_order_id: None,
+                            status: OrderStatus::Canceled,
+                            filled_qty: 0.0,
+                            avg_fill_price: None,
+                            ts,
+                        });
+                    }
+                    let mut pending = self.pending_reports.lock();
+                    pending.extend(reports);
+                    return Ok(());
                 }
-                Err(err)
+                Err(err) => {
+                    if attempt == 0 && Self::is_nonce_error(&err) {
+                        let _ = self.refresh_nonce_from_server().await?;
+                        continue;
+                    }
+                    return Err(err);
+                }
             }
         }
+        bail!("unexpected cancel retry exhaustion")
     }
 
     async fn poll_reports(&self) -> Result<Vec<ExecutionReport>> {
