@@ -875,7 +875,7 @@ impl LighterGateway {
 
         let http = Client::builder().timeout(Duration::from_secs(10)).build()?;
         let api_base = Url::parse(&base_url)?;
-        Ok(Self {
+        let gw = Self {
             signer: signer,
             creds,
             market_index: market_index as u8,
@@ -888,7 +888,11 @@ impl LighterGateway {
             nonce_lock: AsyncMutex::new(()),
             pending_reports: Mutex::new(Vec::new()),
             orders: Mutex::new(HashMap::new()),
-        })
+        };
+        // Seed nonces once at startup to avoid hot-looping nextNonce under load.
+        // If the endpoint is temporarily rate-limited, this will back off and retry.
+        let _ = gw.ensure_nonce_seed().await?;
+        Ok(gw)
     }
 
     fn client_order_index(&self) -> i64 {
@@ -902,14 +906,16 @@ impl LighterGateway {
         if let Some(n) = *self.next_nonce.lock() {
             return Ok(n);
         }
-        let fresh = self.fetch_nonce().await?;
+        let fresh = self.fetch_nonce_with_backoff("seed").await?;
+        eprintln!("[lighter-nonce] seeded nonce={}", fresh);
         let mut guard = self.next_nonce.lock();
         *guard = Some(fresh);
         Ok(fresh)
     }
 
     async fn refresh_nonce_from_server(&self) -> Result<i64> {
-        let fresh = self.fetch_nonce().await?;
+        let fresh = self.fetch_nonce_with_backoff("refresh").await?;
+        eprintln!("[lighter-nonce] refreshed nonce={}", fresh);
         let mut guard = self.next_nonce.lock();
         *guard = Some(fresh);
         Ok(fresh)
@@ -1058,10 +1064,12 @@ impl LighterGateway {
             .send()
             .await
             .context("nextNonce request failed")?;
-        if !resp.status().is_success() {
-            bail!("nextNonce HTTP {}", resp.status());
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            bail!("nextNonce HTTP {} body: {}", status, body);
         }
-        let data: NextNonceResponse = resp.json().await.context("invalid nextNonce json")?;
+        let data: NextNonceResponse = serde_json::from_str(&body).context("invalid nextNonce json")?;
         if data.code != 200 {
             bail!(
                 "nextNonce error {}: {}",
@@ -1071,6 +1079,77 @@ impl LighterGateway {
         }
         data.nonce
             .ok_or_else(|| anyhow!("nextNonce response missing nonce"))
+    }
+
+    async fn fetch_nonce_with_backoff(&self, ctx: &str) -> Result<i64> {
+        // nextNonce can be rate-limited (HTTP 429) if callers hot-loop when the nonce isn't seeded.
+        // We back off aggressively to avoid hammering the endpoint.
+        let mut sleep_ms: u64 = 200;
+        for attempt in 0..10 {
+            let resp = self
+                .http
+                .get(self.api_base.join("api/v1/nextNonce")?)
+                .query(&[
+                    ("account_index", self.creds.account_index.to_string()),
+                    ("api_key_index", self.creds.api_key_index.to_string()),
+                ])
+                .send()
+                .await
+                .context("nextNonce request failed")?;
+
+            let status = resp.status();
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+
+            let body = resp.text().await.unwrap_or_default();
+            if status.is_success() {
+                let data: NextNonceResponse =
+                    serde_json::from_str(&body).context("invalid nextNonce json")?;
+                if data.code != 200 {
+                    bail!(
+                        "nextNonce error {}: {}",
+                        data.code,
+                        data.message.unwrap_or_default()
+                    );
+                }
+                return data
+                    .nonce
+                    .ok_or_else(|| anyhow!("nextNonce response missing nonce"));
+            }
+
+            // Retry on rate limiting and transient gateway errors.
+            let retryable = status.as_u16() == 429
+                || status.as_u16() == 500
+                || status.as_u16() == 502
+                || status.as_u16() == 503
+                || status.as_u16() == 504;
+            if !retryable {
+                bail!("nextNonce HTTP {} body: {}", status, body);
+            }
+
+            let wait = if let Some(secs) = retry_after {
+                // Respect server hint, but cap it.
+                (secs.saturating_mul(1000)).min(5_000)
+            } else {
+                // Exponential backoff + deterministic jitter.
+                let jitter = (current_unix_ms() as u64 % 73).min(72);
+                (sleep_ms + jitter).min(5_000)
+            };
+            eprintln!(
+                "[lighter-nonce] nextNonce {} attempt={} status={} waiting_ms={} (body_len={})",
+                ctx,
+                attempt + 1,
+                status,
+                wait,
+                body.len()
+            );
+            tokio::time::sleep(Duration::from_millis(wait)).await;
+            sleep_ms = (sleep_ms.saturating_mul(2)).min(5_000);
+        }
+        bail!("nextNonce {}: retry exhausted (HTTP 429/5xx)", ctx)
     }
 
     async fn fetch_active_orders(&self) -> Result<Vec<LighterOrderEntry>> {

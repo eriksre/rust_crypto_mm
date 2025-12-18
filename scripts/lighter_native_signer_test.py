@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Direct test of the Lighter native signer library (signer-arm64.dylib).
+Direct test of the Lighter native signer library (Linux/macOS).
 
 This script tests the FFI interface directly, bypassing the Python SDK,
 to help debug signing issues.
@@ -9,6 +9,9 @@ Hardcoded for XRP market: Buy 10 @ $1.80
 
 Usage:
   python scripts/lighter_native_signer_test.py
+
+Optional:
+  LIGHTER_SIGNER_LIB=/path/to/signer.so python scripts/lighter_native_signer_test.py
 """
 
 import ctypes
@@ -42,7 +45,19 @@ PRICE_DECIMALS = 6  # From log: price_decimals=6
 SIZE_DECIMALS = 0   # From log: size_decimals=0
 
 HERE = Path(__file__).resolve().parent.parent
-SIGNER_LIB_PATH = HERE / "libs" / "lighter" / "signer-arm64.dylib"
+
+
+def default_signer_path() -> Path:
+    if sys.platform == "darwin":
+        return HERE / "libs" / "lighter" / "signer-arm64.dylib"
+    if sys.platform.startswith("linux"):
+        if os.uname().machine == "aarch64":
+            return HERE / "libs" / "lighter" / "signer-arm64.so"
+        return HERE / "libs" / "lighter" / "signer-amd64.so"
+    return HERE / "libs" / "lighter" / "signer-arm64.dylib"
+
+
+SIGNER_LIB_PATH = Path(os.getenv("LIGHTER_SIGNER_LIB", str(default_signer_path())))
 
 
 class SignedTxResponse(Structure):
@@ -91,6 +106,15 @@ def scale(value: Decimal, decimals: int) -> int:
     return int((value * factor).to_integral_value(rounding=ROUND_DOWN))
 
 
+def has_symbol(lib: ctypes.CDLL, name: str) -> bool:
+    try:
+        getattr(lib, name)
+        return True
+    except AttributeError:
+        return False
+
+
+
 def fetch_market_meta(base_url: str, symbol: str) -> dict:
     """Fetch market metadata from Lighter API."""
     resp = requests.get(f"{base_url.rstrip('/')}/api/v1/orderBooks", timeout=10)
@@ -120,12 +144,16 @@ def main():
     
     # Check signer library exists
     if not SIGNER_LIB_PATH.exists():
-        # Try amd64 version
-        alt_path = HERE / "libs" / "lighter" / "signer-amd64.so"
-        if alt_path.exists():
-            lib_path = str(alt_path)
-        else:
+        # Try a couple of predictable fallbacks
+        candidates = [
+            HERE / "libs" / "lighter" / "signer-arm64.so",
+            HERE / "libs" / "lighter" / "signer-amd64.so",
+            HERE / "libs" / "lighter" / "signer-arm64.dylib",
+        ]
+        found = next((p for p in candidates if p.exists()), None)
+        if not found:
             raise SystemExit(f"Signer library not found at {SIGNER_LIB_PATH}")
+        lib_path = str(found)
     else:
         lib_path = str(SIGNER_LIB_PATH)
     
@@ -139,42 +167,59 @@ def main():
     print("Signer library loaded successfully!")
     
     # Define function signatures
-    # CreateClient(url *C.char, private_key *C.char, chain_id C.int, 
+    # CreateClient(url *C.char, private_key *C.char, chain_id C.int,
     #              api_key_idx C.int, account_idx C.longlong) *C.char
     lib.CreateClient.argtypes = [c_char_p, c_char_p, c_int, c_int, c_longlong]
     lib.CreateClient.restype = c_char_p
-    
-    # SwitchAPIKey(api_key_idx C.int) *C.char
-    lib.SwitchAPIKey.argtypes = [c_int]
-    lib.SwitchAPIKey.restype = c_char_p
-    
+
     # CheckClient(api_key_idx C.int, account_idx C.longlong) *C.char
     lib.CheckClient.argtypes = [c_int, c_longlong]
     lib.CheckClient.restype = c_char_p
-    
-    # SignCreateOrder(market_index, client_order_index, base_amount, price, 
-    #                 is_ask, order_type, tif, reduce_only, trigger_price,
-    #                 order_expiry, nonce, api_key_idx, account_idx) SignedTxResponse
-    lib.SignCreateOrder.argtypes = [
-        c_int,      # market_index
-        c_longlong, # client_order_index
-        c_longlong, # base_amount
-        c_int,      # price
-        c_int,      # is_ask
-        c_int,      # order_type
-        c_int,      # tif
-        c_int,      # reduce_only
-        c_int,      # trigger_price
-        c_longlong, # order_expiry
-        c_longlong, # nonce
-        c_int,      # api_key_idx
-        c_longlong, # account_idx
-    ]
-    lib.SignCreateOrder.restype = SignedTxResponse
-    
-    # CreateAuthToken(deadline_ms C.longlong) StrOrErr
-    lib.CreateAuthToken.argtypes = [c_longlong]
-    lib.CreateAuthToken.restype = StrOrErr
+
+    abi = "v0" if has_symbol(lib, "SwitchAPIKey") else "v1"
+    print(f"Detected signer ABI: {abi}")
+
+    if abi == "v0":
+        lib.SwitchAPIKey.argtypes = [c_int]
+        lib.SwitchAPIKey.restype = c_char_p
+
+        lib.SignCreateOrder.argtypes = [
+            c_int,      # market_index
+            c_longlong, # client_order_index
+            c_longlong, # base_amount
+            c_int,      # price
+            c_int,      # is_ask
+            c_int,      # order_type
+            c_int,      # tif
+            c_int,      # reduce_only
+            c_int,      # trigger_price
+            c_longlong, # order_expiry
+            c_longlong, # nonce
+        ]
+        lib.SignCreateOrder.restype = StrOrErr
+
+        lib.CreateAuthToken.argtypes = [c_longlong]
+        lib.CreateAuthToken.restype = StrOrErr
+    else:
+        lib.SignCreateOrder.argtypes = [
+            c_int,      # market_index
+            c_longlong, # client_order_index
+            c_longlong, # base_amount
+            c_int,      # price
+            c_int,      # is_ask
+            c_int,      # order_type
+            c_int,      # tif
+            c_int,      # reduce_only
+            c_int,      # trigger_price
+            c_longlong, # order_expiry
+            c_longlong, # nonce
+            c_int,      # api_key_idx
+            c_longlong, # account_idx
+        ]
+        lib.SignCreateOrder.restype = SignedTxResponse
+
+        lib.CreateAuthToken.argtypes = [c_longlong, c_int, c_longlong]
+        lib.CreateAuthToken.restype = StrOrErr
 
     # Fetch market metadata to verify
     print(f"\nFetching market metadata for {MARKET_SYMBOL}...")
@@ -213,13 +258,14 @@ def main():
             raise SystemExit(f"CreateClient failed: {err_str}")
     print("CreateClient: OK")
     
-    # Switch API key
-    err = lib.SwitchAPIKey(API_KEY_INDEX)
-    if err:
-        err_str = err.decode('utf-8') if err else ""
-        if err_str:
-            raise SystemExit(f"SwitchAPIKey failed: {err_str}")
-    print("SwitchAPIKey: OK")
+    # Switch API key (older signer only)
+    if abi == "v0":
+        err = lib.SwitchAPIKey(API_KEY_INDEX)
+        if err:
+            err_str = err.decode('utf-8') if err else ""
+            if err_str:
+                raise SystemExit(f"SwitchAPIKey failed: {err_str}")
+        print("SwitchAPIKey: OK")
     
     # Check client
     err = lib.CheckClient(API_KEY_INDEX, ACCOUNT_INDEX)
@@ -232,7 +278,11 @@ def main():
     # Create auth token (test)
     print(f"\n=== Testing Auth Token ===")
     deadline_ms = int(time.time() * 1000) + 600000  # 10 minutes from now
-    auth_result = lib.CreateAuthToken(deadline_ms)
+    auth_result = (
+        lib.CreateAuthToken(deadline_ms)
+        if abi == "v0"
+        else lib.CreateAuthToken(deadline_ms, API_KEY_INDEX, ACCOUNT_INDEX)
+    )
     if auth_result.err:
         err_str = auth_result.err.decode('utf-8') if auth_result.err else ""
         if err_str:
@@ -262,72 +312,97 @@ def main():
     print(f"  api_key_idx: {API_KEY_INDEX}")
     print(f"  account_idx: {ACCOUNT_INDEX}")
     
-    result = lib.SignCreateOrder(
-        market_id,           # market_index
-        client_order_index,  # client_order_index
-        size_int,            # base_amount
-        price_int,           # price
-        0,                   # is_ask (0 = buy)
-        0,                   # order_type (0 = limit)
-        2,                   # tif (2 = post_only)
-        0,                   # reduce_only
-        0,                   # trigger_price
-        -1,                  # order_expiry
-        -1,                  # nonce (-1 = auto)
-        API_KEY_INDEX,       # api_key_idx
-        ACCOUNT_INDEX,       # account_idx
-    )
+    if abi == "v0":
+        result = lib.SignCreateOrder(
+            market_id,           # market_index
+            client_order_index,  # client_order_index
+            size_int,            # base_amount
+            price_int,           # price
+            0,                   # is_ask (0 = buy)
+            0,                   # order_type (0 = limit)
+            2,                   # tif (2 = post_only)
+            0,                   # reduce_only
+            0,                   # trigger_price
+            -1,                  # order_expiry
+            -1,                  # nonce (-1 = auto)
+        )
+    else:
+        result = lib.SignCreateOrder(
+            market_id,           # market_index
+            client_order_index,  # client_order_index
+            size_int,            # base_amount
+            price_int,           # price
+            0,                   # is_ask (0 = buy)
+            0,                   # order_type (0 = limit)
+            2,                   # tif (2 = post_only)
+            0,                   # reduce_only
+            0,                   # trigger_price
+            -1,                  # order_expiry
+            -1,                  # nonce (-1 = auto)
+            API_KEY_INDEX,       # api_key_idx
+            ACCOUNT_INDEX,       # account_idx
+        )
     
     print(f"\n=== SignCreateOrder Result ===")
-    print(f"tx_type: {result.tx_type}")
-    
-    if result.err:
-        err_str = result.err.decode('utf-8') if result.err else ""
-        print(f"ERROR: {err_str if err_str else '(empty error string)'}")
+    if abi == "v0":
+        if result.err:
+            err_str = result.err.decode('utf-8') if result.err else ""
+            print(f"ERROR: {err_str if err_str else '(empty error string)'}")
+            tx_info = ""
+        else:
+            tx_info = result.str_ptr.decode('utf-8') if result.str_ptr else ""
+        tx_type = 14
+        tx_hash = ""
+        msg_to_sign = ""
     else:
-        tx_info = result.tx_info.decode('utf-8') if result.tx_info else ""
+        tx_type = int(result.tx_type) if result.tx_type else 0
+        if result.err:
+            err_str = result.err.decode('utf-8') if result.err else ""
+            print(f"ERROR: {err_str if err_str else '(empty error string)'}")
+            tx_info = ""
+        else:
+            tx_info = result.tx_info.decode('utf-8') if result.tx_info else ""
         tx_hash = result.tx_hash.decode('utf-8') if result.tx_hash else ""
         msg_to_sign = result.message_to_sign.decode('utf-8') if result.message_to_sign else ""
-        
-        print(f"tx_info length: {len(tx_info)}")
-        print(f"tx_hash: {tx_hash}")
-        if tx_info:
-            print(f"tx_info (first 100 chars): {tx_info[:100]}...")
-        if msg_to_sign:
-            print(f"message_to_sign: {msg_to_sign[:100]}...")
-        
-        if tx_info:
-            # Now submit the batch
-            print(f"\n=== Submitting to sendTxBatch ===")
-            
-            # For a single order, tx_types is just "14" (create order)
-            # For batch, it would be "14,14" for two creates
-            tx_types = "14"
-            tx_infos = tx_info
-            
-            submit_url = f"{BASE_URL}/api/v1/sendTxBatch"
-            print(f"POST {submit_url}")
-            print(f"tx_types: {tx_types}")
-            print(f"tx_infos length: {len(tx_infos)}")
-            
-            resp = requests.post(
-                submit_url,
-                data={"tx_types": tx_types, "tx_infos": tx_infos},
-                timeout=30
-            )
-            
-            print(f"\nResponse status: {resp.status_code}")
-            print(f"Response body: {resp.text}")
-            
-            if resp.status_code == 200:
-                data = resp.json()
-                if data.get("code") == 200:
-                    print("\n✓ Order submitted successfully!")
-                    print(f"tx_hash: {data.get('tx_hash', [])}")
-                else:
-                    print(f"\n✗ Order failed: {data.get('message', 'unknown error')}")
+
+    print(f"tx_type: {tx_type if tx_type else 14}")
+    print(f"tx_info length: {len(tx_info)}")
+    print(f"tx_hash: {tx_hash}")
+    if tx_info:
+        print(f"tx_info (first 100 chars): {tx_info[:100]}...")
+    if msg_to_sign:
+        print(f"message_to_sign: {msg_to_sign[:100]}...")
+
+    if tx_info:
+        import json
+
+        print(f"\n=== Submitting to sendTxBatch ===")
+        submit_url = f"{BASE_URL}/api/v1/sendTxBatch"
+        tx_types = json.dumps([tx_type if tx_type else 14])
+        tx_infos = json.dumps([tx_info])
+
+        print(f"POST {submit_url}")
+        print(f"tx_types: {tx_types}")
+        print(f"tx_infos length: {len(tx_infos)}")
+
+        resp = requests.post(
+            submit_url,
+            data={"tx_types": tx_types, "tx_infos": tx_infos},
+            timeout=30
+        )
+
+        print(f"\nResponse status: {resp.status_code}")
+        print(f"Response body: {resp.text}")
+
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("code") == 200:
+                print("\n✓ Order submitted successfully!")
+                print(f"tx_hash: {data.get('tx_hash', [])}")
             else:
-                print(f"\n✗ HTTP error: {resp.status_code}")
+                print(f"\n✗ Order failed: {data.get('message', 'unknown error')}")
+        else:
+            print(f"\n✗ HTTP error: {resp.status_code}")
 
     print("\n" + "=" * 60)
     print("Test complete!")
@@ -336,4 +411,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

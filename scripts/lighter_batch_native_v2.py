@@ -43,6 +43,15 @@ class StrOrErr(Structure):
         ("err", c_char_p),
     ]
 
+class SignedTxResponse(Structure):
+    _fields_ = [
+        ("tx_type", ctypes.c_uint8),
+        ("tx_info", c_char_p),
+        ("tx_hash", c_char_p),
+        ("message_to_sign", c_char_p),
+        ("err", c_char_p),
+    ]
+
 
 def load_env():
     env_path = HERE / ".env"
@@ -88,6 +97,10 @@ def fetch_nonce() -> int:
 
 def find_signer_lib() -> str:
     """Find the signer library - prefer the one bundled with the SDK."""
+    override = os.getenv("LIGHTER_SIGNER_LIB")
+    if override:
+        return override
+
     # Check SDK location first (this is what works!)
     venv_path = HERE / ".venv" / "lib"
     if venv_path.exists():
@@ -96,6 +109,9 @@ def find_signer_lib() -> str:
                 sdk_signer = pydir / "site-packages" / "lighter" / "signers" / "signer-arm64.dylib"
                 if sdk_signer.exists():
                     return str(sdk_signer)
+                sdk_signer_so_arm = pydir / "site-packages" / "lighter" / "signers" / "signer-arm64.so"
+                if sdk_signer_so_arm.exists():
+                    return str(sdk_signer_so_arm)
                 sdk_signer_so = pydir / "site-packages" / "lighter" / "signers" / "signer-amd64.so"
                 if sdk_signer_so.exists():
                     return str(sdk_signer_so)
@@ -104,6 +120,9 @@ def find_signer_lib() -> str:
     lib_arm = HERE / "libs" / "lighter" / "signer-arm64.dylib"
     if lib_arm.exists():
         return str(lib_arm)
+    lib_arm_so = HERE / "libs" / "lighter" / "signer-arm64.so"
+    if lib_arm_so.exists():
+        return str(lib_arm_so)
     lib_amd = HERE / "libs" / "lighter" / "signer-amd64.so"
     if lib_amd.exists():
         return str(lib_amd)
@@ -117,29 +136,51 @@ def load_signer(lib_path: str):
     
     lib.CreateClient.argtypes = [c_char_p, c_char_p, c_int, c_int, c_longlong]
     lib.CreateClient.restype = c_char_p
-    
-    lib.SwitchAPIKey.argtypes = [c_int]
-    lib.SwitchAPIKey.restype = c_char_p
-    
+
     lib.CheckClient.argtypes = [c_int, c_longlong]
     lib.CheckClient.restype = c_char_p
-    
-    # SDK uses 11 parameters for SignCreateOrder, NOT 13!
-    # api_key_idx and account_idx are NOT passed - they're set in CreateClient
-    lib.SignCreateOrder.argtypes = [
-        c_int,       # market_index
-        c_longlong,  # client_order_index
-        c_longlong,  # base_amount
-        c_int,       # price
-        c_int,       # is_ask
-        c_int,       # order_type
-        c_int,       # time_in_force
-        c_int,       # reduce_only
-        c_int,       # trigger_price
-        c_longlong,  # order_expiry
-        c_longlong,  # nonce
-    ]
-    lib.SignCreateOrder.restype = StrOrErr  # SDK returns StrOrErr, not SignedTxResponse
+
+    # ABI detection:
+    # - older signer exports SwitchAPIKey and returns StrOrErr from SignCreateOrder (11 args)
+    # - newer lighter-go signer does NOT export SwitchAPIKey and returns SignedTxResponse (13 args incl api_key_idx/account_idx)
+    has_switch = hasattr(lib, "SwitchAPIKey")
+    if has_switch:
+        lib.SwitchAPIKey.argtypes = [c_int]
+        lib.SwitchAPIKey.restype = c_char_p
+
+        lib.SignCreateOrder.argtypes = [
+            c_int,       # market_index
+            c_longlong,  # client_order_index
+            c_longlong,  # base_amount
+            c_int,       # price
+            c_int,       # is_ask
+            c_int,       # order_type
+            c_int,       # time_in_force
+            c_int,       # reduce_only
+            c_int,       # trigger_price
+            c_longlong,  # order_expiry
+            c_longlong,  # nonce
+        ]
+        lib.SignCreateOrder.restype = StrOrErr
+        lib._lighter_abi = "v0"
+    else:
+        lib.SignCreateOrder.argtypes = [
+            c_int,       # market_index
+            c_longlong,  # client_order_index
+            c_longlong,  # base_amount
+            c_int,       # price
+            c_int,       # is_ask
+            c_int,       # order_type
+            c_int,       # time_in_force
+            c_int,       # reduce_only
+            c_int,       # trigger_price
+            c_longlong,  # order_expiry
+            c_longlong,  # nonce
+            c_int,       # api_key_idx
+            c_longlong,  # account_idx
+        ]
+        lib.SignCreateOrder.restype = SignedTxResponse
+        lib._lighter_abi = "v1"
     
     return lib
 
@@ -175,13 +216,13 @@ def main():
         if s:
             raise SystemExit(f"CreateClient failed: {s}")
     print("✓ CreateClient OK")
-
-    err = lib.SwitchAPIKey(API_KEY_INDEX)
-    if err:
-        s = err.decode() if err else ""
-        if s:
-            raise SystemExit(f"SwitchAPIKey failed: {s}")
-    print("✓ SwitchAPIKey OK")
+    if getattr(lib, "_lighter_abi", "v0") == "v0":
+        err = lib.SwitchAPIKey(API_KEY_INDEX)
+        if err:
+            s = err.decode() if err else ""
+            if s:
+                raise SystemExit(f"SwitchAPIKey failed: {s}")
+        print("✓ SwitchAPIKey OK")
 
     err = lib.CheckClient(API_KEY_INDEX, ACCOUNT_INDEX)
     if err:
@@ -236,34 +277,56 @@ def main():
         print(f"  order_expiry={order_expiry_ms}")
 
         # SDK uses 11 params - no api_key_idx or account_idx!
-        result = lib.SignCreateOrder(
-            market_id,           # market_index
-            client_order_idx,    # client_order_index
-            size_int,            # base_amount
-            price_int,           # price
-            0,                   # is_ask (0=buy)
-            0,                   # order_type (limit)
-            2,                   # tif (post_only)
-            0,                   # reduce_only
-            0,                   # trigger_price
-            order_expiry_ms,     # order_expiry
-            current_nonce,       # nonce
-        )
+        if getattr(lib, "_lighter_abi", "v0") == "v0":
+            result = lib.SignCreateOrder(
+                market_id,
+                client_order_idx,
+                size_int,
+                price_int,
+                0,
+                0,
+                2,
+                0,
+                0,
+                order_expiry_ms,
+                current_nonce,
+            )
+            if result.err:
+                err_str = result.err.decode() if result.err else ""
+                print(f"  ✗ SignCreateOrder failed: {err_str if err_str else '(empty error)'}")
+                continue
+            tx_info = result.str.decode() if result.str else ""
+            tx_type = 14
+        else:
+            result = lib.SignCreateOrder(
+                market_id,
+                client_order_idx,
+                size_int,
+                price_int,
+                0,
+                0,
+                2,
+                0,
+                0,
+                order_expiry_ms,
+                current_nonce,
+                API_KEY_INDEX,
+                ACCOUNT_INDEX,
+            )
+            if result.err:
+                err_str = result.err.decode() if result.err else ""
+                print(f"  ✗ SignCreateOrder failed: {err_str if err_str else '(empty error)'}")
+                continue
+            tx_info = result.tx_info.decode() if result.tx_info else ""
+            tx_type = int(result.tx_type) if result.tx_type else 14
 
-        # SDK returns StrOrErr with .str and .err fields
-        if result.err:
-            err_str = result.err.decode() if result.err else ""
-            print(f"  ✗ SignCreateOrder failed: {err_str if err_str else '(empty error)'}")
-            continue
-
-        tx_info = result.str.decode() if result.str else ""
         if not tx_info:
-            print(f"  ✗ SignCreateOrder returned empty tx_info")
+            print("  ✗ SignCreateOrder returned empty tx_info")
             continue
 
         print(f"  ✓ Signed! tx_info_len={len(tx_info)}")
         print(f"  tx_info: {tx_info[:100]}...")
-        signed_txs.append((14, tx_info))  # 14 = create order tx type
+        signed_txs.append((tx_type, tx_info))
 
     if not signed_txs:
         print("\n✗ No orders signed successfully")
@@ -308,4 +371,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
