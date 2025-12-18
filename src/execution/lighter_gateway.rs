@@ -93,11 +93,21 @@ struct SignerResp {
     err: *mut c_char,
 }
 
+#[repr(C)]
+// Matches newer lighter-go sharedlib SignedTxResponse (tx_type + tx_info + optional tx_hash/message + err).
+struct SignedTxRespV1 {
+    tx_type: u8,
+    tx_info: *mut c_char,
+    tx_hash: *mut c_char,
+    message_to_sign: *mut c_char,
+    err: *mut c_char,
+}
+
 type CreateClientFn =
     unsafe extern "C" fn(*const c_char, *const c_char, c_int, c_int, c_longlong) -> *mut c_char;
 type SwitchApiKeyFn = unsafe extern "C" fn(c_int) -> *mut c_char;
-// The native signer uses 11 args for create order and 3 for cancel (matching the Python SDK).
-type SignCreateOrderFn = unsafe extern "C" fn(
+// ABI v0 (older signer): 11 args for create order and 3 for cancel (matching the Python SDK bundled here).
+type SignCreateOrderFnV0 = unsafe extern "C" fn(
     c_int,      // market_index
     c_longlong, // client_order_index
     c_longlong, // base_amount
@@ -110,18 +120,57 @@ type SignCreateOrderFn = unsafe extern "C" fn(
     c_longlong, // order_expiry
     c_longlong, // nonce
 ) -> SignerResp;
-type SignCancelOrderFn = unsafe extern "C" fn(c_int, c_longlong, c_longlong) -> SignerResp;
-type CreateAuthTokenFn = unsafe extern "C" fn(c_longlong) -> SignerResp;
+
+type SignCancelOrderFnV0 = unsafe extern "C" fn(c_int, c_longlong, c_longlong) -> SignerResp;
+type CreateAuthTokenFnV0 = unsafe extern "C" fn(c_longlong) -> SignerResp;
+
+// ABI v1 (newer lighter-go sharedlib): extra (api_key_idx, account_idx) args and a richer return type.
+type SignCreateOrderFnV1 = unsafe extern "C" fn(
+    c_int,      // market_index
+    c_longlong, // client_order_index
+    c_longlong, // base_amount
+    c_int,      // price
+    c_int,      // is_ask
+    c_int,      // order_type
+    c_int,      // time_in_force
+    c_int,      // reduce_only
+    c_int,      // trigger_price
+    c_longlong, // order_expiry
+    c_longlong, // nonce
+    c_int,      // api_key_idx
+    c_longlong, // account_idx
+) -> SignedTxRespV1;
+
+type SignCancelOrderFnV1 = unsafe extern "C" fn(
+    c_int,      // market_index
+    c_longlong, // order_index
+    c_longlong, // nonce
+    c_int,      // api_key_idx
+    c_longlong, // account_idx
+) -> SignedTxRespV1;
+
+type CreateAuthTokenFnV1 = unsafe extern "C" fn(c_longlong, c_int, c_longlong) -> SignerResp;
 type CheckClientFn = unsafe extern "C" fn(c_int, c_longlong) -> *mut c_char;
+
+enum LighterSignerAbi {
+    V0 {
+        switch_api_key: SwitchApiKeyFn,
+        sign_create_order: SignCreateOrderFnV0,
+        sign_cancel_order: SignCancelOrderFnV0,
+        create_auth_token: CreateAuthTokenFnV0,
+    },
+    V1 {
+        sign_create_order: SignCreateOrderFnV1,
+        sign_cancel_order: SignCancelOrderFnV1,
+        create_auth_token: CreateAuthTokenFnV1,
+    },
+}
 
 struct LighterSigner {
     _lib: Library,
     create_client: CreateClientFn,
-    switch_api_key: SwitchApiKeyFn,
-    sign_create_order: SignCreateOrderFn,
-    sign_cancel_order: SignCancelOrderFn,
-    create_auth_token: CreateAuthTokenFn,
     check_client: CheckClientFn,
+    abi: LighterSignerAbi,
 }
 
 impl LighterSigner {
@@ -148,27 +197,54 @@ impl LighterSigner {
         unsafe {
             let create_client: Symbol<CreateClientFn> =
                 lib.get(b"CreateClient\0").context("missing CreateClient")?;
-            let switch_api_key: Symbol<SwitchApiKeyFn> =
-                lib.get(b"SwitchAPIKey\0").context("missing SwitchAPIKey")?;
-            let sign_create_order: Symbol<SignCreateOrderFn> = lib
-                .get(b"SignCreateOrder\0")
-                .context("missing SignCreateOrder")?;
-            let sign_cancel_order: Symbol<SignCancelOrderFn> = lib
-                .get(b"SignCancelOrder\0")
-                .context("missing SignCancelOrder")?;
-            let create_auth_token: Symbol<CreateAuthTokenFn> = lib
-                .get(b"CreateAuthToken\0")
-                .context("missing CreateAuthToken")?;
             let check_client: Symbol<CheckClientFn> =
                 lib.get(b"CheckClient\0").context("missing CheckClient")?;
+
+            // ABI detection:
+            // - Older signer (bundled in this repo as signer-amd64.so) exports SwitchAPIKey and uses v0 signatures.
+            // - Newer lighter-go sharedlib (release artifacts like lighter-signer-linux-arm64.so) does NOT export
+            //   SwitchAPIKey and uses v1 signatures (extra api_key_idx/account_idx + richer return types).
+            let abi = match lib.get::<SwitchApiKeyFn>(b"SwitchAPIKey\0") {
+                Ok(switch_api_key) => {
+                    let sign_create_order: Symbol<SignCreateOrderFnV0> = lib
+                        .get(b"SignCreateOrder\0")
+                        .context("missing SignCreateOrder")?;
+                    let sign_cancel_order: Symbol<SignCancelOrderFnV0> = lib
+                        .get(b"SignCancelOrder\0")
+                        .context("missing SignCancelOrder")?;
+                    let create_auth_token: Symbol<CreateAuthTokenFnV0> = lib
+                        .get(b"CreateAuthToken\0")
+                        .context("missing CreateAuthToken")?;
+                    LighterSignerAbi::V0 {
+                        switch_api_key: *switch_api_key,
+                        sign_create_order: *sign_create_order,
+                        sign_cancel_order: *sign_cancel_order,
+                        create_auth_token: *create_auth_token,
+                    }
+                }
+                Err(_) => {
+                    let sign_create_order: Symbol<SignCreateOrderFnV1> = lib
+                        .get(b"SignCreateOrder\0")
+                        .context("missing SignCreateOrder")?;
+                    let sign_cancel_order: Symbol<SignCancelOrderFnV1> = lib
+                        .get(b"SignCancelOrder\0")
+                        .context("missing SignCancelOrder")?;
+                    let create_auth_token: Symbol<CreateAuthTokenFnV1> = lib
+                        .get(b"CreateAuthToken\0")
+                        .context("missing CreateAuthToken")?;
+                    LighterSignerAbi::V1 {
+                        sign_create_order: *sign_create_order,
+                        sign_cancel_order: *sign_cancel_order,
+                        create_auth_token: *create_auth_token,
+                    }
+                }
+            };
+
             Ok(Self {
                 create_client: *create_client,
-                switch_api_key: *switch_api_key,
-                sign_create_order: *sign_create_order,
-                sign_cancel_order: *sign_cancel_order,
-                create_auth_token: *create_auth_token,
                 check_client: *check_client,
                 _lib: lib,
+                abi,
             })
         }
     }
@@ -212,11 +288,16 @@ impl LighterSigner {
     }
 
     fn switch_api_key(&self, api_key_idx: i32) -> Result<()> {
-        let err_ptr = unsafe { (self.switch_api_key)(api_key_idx as c_int) };
-        if let Some(err) = Self::from_c(err_ptr) {
-            bail!("SwitchAPIKey failed: {err}");
+        match self.abi {
+            LighterSignerAbi::V0 { switch_api_key, .. } => {
+                let err_ptr = unsafe { (switch_api_key)(api_key_idx as c_int) };
+                if let Some(err) = Self::from_c(err_ptr) {
+                    bail!("SwitchAPIKey failed: {err}");
+                }
+                Ok(())
+            }
+            LighterSignerAbi::V1 { .. } => Ok(()),
         }
-        Ok(())
     }
 
     fn check_client(&self, api_key_idx: i32, account_idx: i64) -> Result<()> {
@@ -243,41 +324,92 @@ impl LighterSigner {
         trigger_price: u32,
         order_expiry: i64,
         nonce: i64,
+        api_key_idx: i32,
+        account_idx: i64,
     ) -> Result<SignedTx> {
-        let resp = unsafe {
-            (self.sign_create_order)(
-                market_index as c_int,
-                client_order_index as c_longlong,
-                base_amount as c_longlong,
-                price as c_int,
-                is_ask as c_int,
-                order_type as c_int,
-                tif as c_int,
-                reduce_only as c_int,
-                trigger_price as c_int,
-                order_expiry as c_longlong,
-                nonce as c_longlong,
-            )
-        };
-        if let Some(err) = Self::from_c(resp.err) {
-            let msg = if err.trim().is_empty() {
-                "SignCreateOrder failed: signer returned empty error. Verify account_index/api_key_index/private key, and that the key is funded/authorized."
-                    .to_string()
-            } else {
-                format!("SignCreateOrder failed: {err}")
-            };
-            bail!(msg);
+        match self.abi {
+            LighterSignerAbi::V0 {
+                sign_create_order, ..
+            } => {
+                let resp = unsafe {
+                    (sign_create_order)(
+                        market_index as c_int,
+                        client_order_index as c_longlong,
+                        base_amount as c_longlong,
+                        price as c_int,
+                        is_ask as c_int,
+                        order_type as c_int,
+                        tif as c_int,
+                        reduce_only as c_int,
+                        trigger_price as c_int,
+                        order_expiry as c_longlong,
+                        nonce as c_longlong,
+                    )
+                };
+                if let Some(err) = Self::from_c(resp.err) {
+                    let msg = if err.trim().is_empty() {
+                        "SignCreateOrder failed: signer returned empty error. Verify account_index/api_key_index/private key, and that the key is funded/authorized."
+                            .to_string()
+                    } else {
+                        format!("SignCreateOrder failed: {err}")
+                    };
+                    bail!(msg);
+                }
+                let tx_info = Self::from_c(resp.str_ptr).ok_or_else(|| anyhow!("missing tx_info"))?;
+                if tx_info.trim().is_empty() {
+                    bail!("SignCreateOrder returned empty tx_info");
+                }
+                Ok(SignedTx {
+                    // The v0 signer does not return tx_type; set the expected value explicitly.
+                    tx_type: 14,
+                    tx_info,
+                    tx_hash: None,
+                })
+            }
+            LighterSignerAbi::V1 {
+                sign_create_order, ..
+            } => {
+                let resp = unsafe {
+                    (sign_create_order)(
+                        market_index as c_int,
+                        client_order_index as c_longlong,
+                        base_amount as c_longlong,
+                        price as c_int,
+                        is_ask as c_int,
+                        order_type as c_int,
+                        tif as c_int,
+                        reduce_only as c_int,
+                        trigger_price as c_int,
+                        order_expiry as c_longlong,
+                        nonce as c_longlong,
+                        api_key_idx as c_int,
+                        account_idx as c_longlong,
+                    )
+                };
+                if let Some(err) = Self::from_c(resp.err) {
+                    let msg = if err.trim().is_empty() {
+                        "SignCreateOrder failed: signer returned empty error. Verify account_index/api_key_index/private key, and that the key is funded/authorized."
+                            .to_string()
+                    } else {
+                        format!("SignCreateOrder failed: {err}")
+                    };
+                    bail!(msg);
+                }
+                let tx_info = Self::from_c(resp.tx_info).ok_or_else(|| anyhow!("missing tx_info"))?;
+                if tx_info.trim().is_empty() {
+                    bail!("SignCreateOrder returned empty tx_info");
+                }
+                let tx_hash = Self::from_c(resp.tx_hash).and_then(|s| {
+                    let s = s.trim().to_string();
+                    if s.is_empty() { None } else { Some(s) }
+                });
+                Ok(SignedTx {
+                    tx_type: resp.tx_type,
+                    tx_info,
+                    tx_hash,
+                })
+            }
         }
-        let tx_info = Self::from_c(resp.str_ptr).ok_or_else(|| anyhow!("missing tx_info"))?;
-        if tx_info.trim().is_empty() {
-            bail!("SignCreateOrder returned empty tx_info");
-        }
-        Ok(SignedTx {
-            // The native signer does not return tx_type; set the expected value explicitly.
-            tx_type: 14,
-            tx_info,
-            tx_hash: None,
-        })
     }
 
     fn sign_cancel_order(
@@ -285,31 +417,74 @@ impl LighterSigner {
         market_index: u8,
         order_index: i64,
         nonce: i64,
+        api_key_idx: i32,
+        account_idx: i64,
     ) -> Result<SignedTx> {
-        let resp = unsafe {
-            (self.sign_cancel_order)(
-                market_index as c_int,
-                order_index as c_longlong,
-                nonce as c_longlong,
-            )
-        };
-        if let Some(err) = Self::from_c(resp.err) {
-            bail!("SignCancelOrder failed: {err}");
+        match self.abi {
+            LighterSignerAbi::V0 {
+                sign_cancel_order, ..
+            } => {
+                let resp = unsafe {
+                    (sign_cancel_order)(
+                        market_index as c_int,
+                        order_index as c_longlong,
+                        nonce as c_longlong,
+                    )
+                };
+                if let Some(err) = Self::from_c(resp.err) {
+                    bail!("SignCancelOrder failed: {err}");
+                }
+                let tx_info = Self::from_c(resp.str_ptr).ok_or_else(|| anyhow!("missing tx_info"))?;
+                if tx_info.trim().is_empty() {
+                    bail!("SignCancelOrder returned empty tx_info");
+                }
+                Ok(SignedTx {
+                    tx_type: 15,
+                    tx_info,
+                    tx_hash: None,
+                })
+            }
+            LighterSignerAbi::V1 {
+                sign_cancel_order, ..
+            } => {
+                let resp = unsafe {
+                    (sign_cancel_order)(
+                        market_index as c_int,
+                        order_index as c_longlong,
+                        nonce as c_longlong,
+                        api_key_idx as c_int,
+                        account_idx as c_longlong,
+                    )
+                };
+                if let Some(err) = Self::from_c(resp.err) {
+                    bail!("SignCancelOrder failed: {err}");
+                }
+                let tx_info = Self::from_c(resp.tx_info).ok_or_else(|| anyhow!("missing tx_info"))?;
+                if tx_info.trim().is_empty() {
+                    bail!("SignCancelOrder returned empty tx_info");
+                }
+                let tx_hash = Self::from_c(resp.tx_hash).and_then(|s| {
+                    let s = s.trim().to_string();
+                    if s.is_empty() { None } else { Some(s) }
+                });
+                Ok(SignedTx {
+                    tx_type: resp.tx_type,
+                    tx_info,
+                    tx_hash,
+                })
+            }
         }
-        let tx_info = Self::from_c(resp.str_ptr).ok_or_else(|| anyhow!("missing tx_info"))?;
-        if tx_info.trim().is_empty() {
-            bail!("SignCancelOrder returned empty tx_info");
-        }
-        Ok(SignedTx {
-            // The native signer does not return tx_type; set cancel explicitly.
-            tx_type: 15,
-            tx_info,
-            tx_hash: None,
-        })
     }
 
-    fn auth_token(&self, deadline_ms: i64) -> Result<String> {
-        let resp = unsafe { (self.create_auth_token)(deadline_ms as c_longlong) };
+    fn auth_token(&self, deadline_ms: i64, api_key_idx: i32, account_idx: i64) -> Result<String> {
+        let resp = match self.abi {
+            LighterSignerAbi::V0 { create_auth_token, .. } => unsafe {
+                (create_auth_token)(deadline_ms as c_longlong)
+            },
+            LighterSignerAbi::V1 { create_auth_token, .. } => unsafe {
+                (create_auth_token)(deadline_ms as c_longlong, api_key_idx as c_int, account_idx as c_longlong)
+            },
+        };
         if let Some(err) = Self::from_c(resp.err) {
             bail!("CreateAuthToken failed: {err}");
         }
@@ -370,6 +545,8 @@ enum SignerRequest {
     },
     Auth {
         deadline_ms: i64,
+        api_key_idx: i32,
+        account_idx: i64,
         resp: oneshot::Sender<Result<String>>,
     },
 }
@@ -443,21 +620,26 @@ impl SignerHandle {
                             api_key_idx,
                             account_idx
                         );
-                        let res = signer.check_client(api_key_idx, account_idx).and_then(|_| {
-                            signer.sign_create_order(
-                                market_index,
-                                client_order_index,
-                                base_amount,
-                                price,
-                                is_ask,
-                                order_type,
-                                tif,
-                                reduce_only,
-                                trigger_price,
-                                order_expiry,
-                                nonce,
-                            )
-                        });
+                        let res = signer
+                            .switch_api_key(api_key_idx)
+                            .and_then(|_| signer.check_client(api_key_idx, account_idx))
+                            .and_then(|_| {
+                                signer.sign_create_order(
+                                    market_index,
+                                    client_order_index,
+                                    base_amount,
+                                    price,
+                                    is_ask,
+                                    order_type,
+                                    tif,
+                                    reduce_only,
+                                    trigger_price,
+                                    order_expiry,
+                                    nonce,
+                                    api_key_idx,
+                                    account_idx,
+                                )
+                            });
                         if let Err(ref err) = res {
                             eprintln!("[lighter-sign-thread] create error: {err}");
                         }
@@ -475,16 +657,22 @@ impl SignerHandle {
                             "[lighter-sign-thread] cancel mid={} order_idx={} ak_idx={} acct={}",
                             market_index, order_index, api_key_idx, account_idx
                         );
-                        let res = signer.check_client(api_key_idx, account_idx).and_then(|_| {
-                            signer.sign_cancel_order(market_index, order_index, nonce)
-                        });
+                        let res = signer
+                            .switch_api_key(api_key_idx)
+                            .and_then(|_| signer.check_client(api_key_idx, account_idx))
+                            .and_then(|_| signer.sign_cancel_order(market_index, order_index, nonce, api_key_idx, account_idx));
                         if let Err(ref err) = res {
                             eprintln!("[lighter-sign-thread] cancel error: {err}");
                         }
                         let _ = resp.send(res);
                     }
-                    SignerRequest::Auth { deadline_ms, resp } => {
-                        let _ = resp.send(signer.auth_token(deadline_ms));
+                    SignerRequest::Auth {
+                        deadline_ms,
+                        api_key_idx,
+                        account_idx,
+                        resp,
+                    } => {
+                        let _ = resp.send(signer.auth_token(deadline_ms, api_key_idx, account_idx));
                     }
                 }
             }
@@ -569,8 +757,10 @@ impl SignerHandle {
             .await
             .map_err(|e| anyhow!("signer thread dropped: {e}"))?;
         if let Ok(ref mut tx) = res {
-            // Force the expected tx_type for create order (14) in case the signer returns 0.
-            tx.tx_type = 14;
+            // Force the expected tx_type for create order (14) only if the signer returned 0.
+            if tx.tx_type == 0 {
+                tx.tx_type = 14;
+            }
             eprintln!(
                 "[lighter-sign] sign_order success tx_type={} tx_info_len={}",
                 tx.tx_type,
@@ -611,7 +801,9 @@ impl SignerHandle {
             .await
             .map_err(|e| anyhow!("signer thread dropped: {e}"))?;
         if let Ok(ref mut tx) = res {
-            tx.tx_type = 15; // cancel
+            if tx.tx_type == 0 {
+                tx.tx_type = 15; // cancel
+            }
             eprintln!(
                 "[lighter-sign] sign_cancel success tx_type={} tx_info_len={}",
                 tx.tx_type,
@@ -626,11 +818,13 @@ impl SignerHandle {
         res
     }
 
-    async fn auth_token(&self, deadline_ms: i64) -> Result<String> {
+    async fn auth_token(&self, deadline_ms: i64, api_key_idx: i32, account_idx: i64) -> Result<String> {
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(SignerRequest::Auth {
                 deadline_ms,
+                api_key_idx,
+                account_idx,
                 resp: resp_tx,
             })
             .map_err(|e| anyhow!("failed to enqueue signer request: {e}"))?;
@@ -848,7 +1042,9 @@ impl LighterGateway {
     async fn fetch_auth_token(&self) -> Result<String> {
         // default 10 minute auth token from signer
         let deadline = (current_unix_ms() as i64) + 10 * 60 * 1000;
-        self.signer.auth_token(deadline).await
+        self.signer
+            .auth_token(deadline, self.creds.api_key_index, self.creds.account_index)
+            .await
     }
 
     async fn fetch_nonce(&self) -> Result<i64> {
