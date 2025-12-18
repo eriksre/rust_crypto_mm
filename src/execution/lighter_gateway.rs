@@ -492,6 +492,42 @@ impl LighterSigner {
     }
 }
 
+fn is_lighter_rate_limited(msg: &str) -> bool {
+    msg.contains("Too Many Requests")
+        || msg.contains("\"code\":23000")
+        || msg.contains("HTTP 429")
+        || msg.contains("status=429")
+}
+
+fn check_client_with_backoff(
+    signer: &LighterSigner,
+    api_key_idx: i32,
+    account_idx: i64,
+) -> Result<()> {
+    let mut sleep_ms: u64 = 200;
+    for attempt in 0..8 {
+        match signer.check_client(api_key_idx, account_idx) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                let msg = err.to_string();
+                if !is_lighter_rate_limited(&msg) {
+                    return Err(err);
+                }
+                let wait = sleep_ms.min(5_000);
+                eprintln!(
+                    "[lighter-sign] CheckClient rate-limited attempt={} waiting_ms={} (msg={})",
+                    attempt + 1,
+                    wait,
+                    msg
+                );
+                std::thread::sleep(Duration::from_millis(wait));
+                sleep_ms = sleep_ms.saturating_mul(2).min(5_000);
+            }
+        }
+    }
+    bail!("CheckClient retry exhausted (rate-limited)")
+}
+
 struct SignedTx {
     tx_type: u8,
     tx_info: String,
@@ -590,7 +626,9 @@ impl SignerHandle {
                                 account_idx,
                             )
                             .and_then(|_| signer.switch_api_key(api_key_idx))
-                            .and_then(|_| signer.check_client(api_key_idx, account_idx));
+                            // CheckClient performs an HTTP call and is rate-limited.
+                            // Do it at init time only, with backoff.
+                            .and_then(|_| check_client_with_backoff(&signer, api_key_idx, account_idx));
                         let _ = resp.send(res);
                     }
                     SignerRequest::SignCreate {
@@ -622,7 +660,6 @@ impl SignerHandle {
                         );
                         let res = signer
                             .switch_api_key(api_key_idx)
-                            .and_then(|_| signer.check_client(api_key_idx, account_idx))
                             .and_then(|_| {
                                 signer.sign_create_order(
                                     market_index,
@@ -659,8 +696,15 @@ impl SignerHandle {
                         );
                         let res = signer
                             .switch_api_key(api_key_idx)
-                            .and_then(|_| signer.check_client(api_key_idx, account_idx))
-                            .and_then(|_| signer.sign_cancel_order(market_index, order_index, nonce, api_key_idx, account_idx));
+                            .and_then(|_| {
+                                signer.sign_cancel_order(
+                                    market_index,
+                                    order_index,
+                                    nonce,
+                                    api_key_idx,
+                                    account_idx,
+                                )
+                            });
                         if let Err(ref err) = res {
                             eprintln!("[lighter-sign-thread] cancel error: {err}");
                         }
