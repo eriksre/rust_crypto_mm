@@ -1143,7 +1143,7 @@ async fn setup_lighter_gateway(
             signer_path = alt;
         } else {
             bail!(
-                "Lighter signer library not found at {} (alt tried: {}); please place signer-amd64.so (Linux) or signer-arm64.dylib (macOS) there",
+                "Lighter signer library not found at {} (alt tried: {}); please place signer-amd64.so (Linux x86_64), signer-arm64.so (Linux aarch64), or signer-arm64.dylib (macOS) there",
                 creds.signer_lib,
                 alt
             );

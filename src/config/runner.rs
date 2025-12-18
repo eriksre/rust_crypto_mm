@@ -135,6 +135,8 @@ pub fn load_gate_credentials(config: &RunnerConfig) -> Result<GateCredentials> {
 fn default_signer_lib_path() -> String {
     if cfg!(target_os = "macos") {
         "libs/lighter/signer-arm64.dylib".to_string()
+    } else if cfg!(target_arch = "aarch64") {
+        "libs/lighter/signer-arm64.so".to_string()
     } else {
         "libs/lighter/signer-amd64.so".to_string()
     }
