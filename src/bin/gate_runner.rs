@@ -1132,20 +1132,35 @@ async fn setup_lighter_gateway(
 ) -> Result<LighterGateway> {
     let mut signer_path = creds.signer_lib.clone();
     if !Path::new(&signer_path).exists() {
-        let alt = if signer_path.ends_with(".dylib") {
-            signer_path.trim_end_matches(".dylib").to_string() + ".so"
-        } else if signer_path.ends_with(".so") {
-            signer_path.trim_end_matches(".so").to_string() + ".dylib"
+        let mut candidates: Vec<String> = vec![];
+
+        // If the configured path is missing, try a couple of predictable alternatives.
+        // IMPORTANT: do not try to load a macOS .dylib on Linux (it will error with "invalid ELF header").
+        if cfg!(target_os = "macos") {
+            if signer_path.ends_with(".so") {
+                candidates.push(signer_path.trim_end_matches(".so").to_string() + ".dylib");
+            }
         } else {
-            signer_path.clone()
-        };
-        if Path::new(&alt).exists() {
-            signer_path = alt;
+            if signer_path.ends_with(".dylib") {
+                candidates.push(signer_path.trim_end_matches(".dylib").to_string() + ".so");
+            }
+            // If the user hardcoded the wrong arch name, try swapping it.
+            if cfg!(target_arch = "aarch64") {
+                candidates.push(signer_path.replace("amd64", "arm64").replace(".dylib", ".so"));
+            } else if cfg!(target_arch = "x86_64") {
+                candidates.push(signer_path.replace("arm64", "amd64").replace(".dylib", ".so"));
+            }
+        }
+
+        if let Some(found) = candidates.iter().find(|p| Path::new(p.as_str()).exists()) {
+            signer_path = found.clone();
         } else {
             bail!(
-                "Lighter signer library not found at {} (alt tried: {}); please place signer-amd64.so (Linux x86_64), signer-arm64.so (Linux aarch64), or signer-arm64.dylib (macOS) there",
+                "Lighter signer library not found at {} (candidates tried: {:?}); \
+                 please provide the correct native signer for this OS/arch: \
+                 signer-amd64.so (Linux x86_64), signer-arm64.so (Linux aarch64), signer-arm64.dylib (macOS)",
                 creds.signer_lib,
-                alt
+                candidates
             );
         }
     }

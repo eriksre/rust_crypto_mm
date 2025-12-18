@@ -126,6 +126,22 @@ struct LighterSigner {
 
 impl LighterSigner {
     fn load(lib_path: &str) -> Result<Self> {
+        // Avoid a confusing libloading error when the wrong file type is configured
+        // (e.g. a macOS .dylib on Linux => "invalid ELF header").
+        if !cfg!(target_os = "macos") {
+            let header = std::fs::read(lib_path)
+                .ok()
+                .and_then(|b| if b.len() >= 4 { Some([b[0], b[1], b[2], b[3]]) } else { None });
+            if let Some(h) = header {
+                // 0x7F 'E' 'L' 'F'
+                if h != [0x7F, 0x45, 0x4C, 0x46] {
+                    bail!(
+                        "Lighter signer at {lib_path} is not an ELF shared object; \
+                         on Linux you need a .so built for your architecture (e.g. signer-arm64.so for aarch64)"
+                    );
+                }
+            }
+        }
         let lib = unsafe { Library::new(lib_path) }
             .with_context(|| format!("failed to load Lighter signer library at {lib_path}"))?;
 
