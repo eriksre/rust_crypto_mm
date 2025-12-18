@@ -2,8 +2,11 @@ strategy:
   venue: lighter
   symbol: BTC_USDT
   size: min
+  quote_mode: bbo
+  offset_bps: 0
+  cancel_on_cross: true
   spread_bps: 30.0
-  reprice_bps: 4.0
+  reprice_bps: 2.0
   debounce_ms: 50
   cancel_buffer_ms: 50
 feeds:
@@ -18,7 +21,7 @@ risk:
   max_order_notional: 400.0
   max_position_notional: 500.0
 mode:
-  dry_run: true
+  dry_run: false
   log_fills: false
   debug_prints: true
   demean_prices: false

@@ -2422,8 +2422,8 @@ def plot_results(
     lighter_ask = np.where(is_target_plot, p["ask_px_1"].to_numpy(dtype=np.float64), np.nan) if "ask_px_1" in p.columns else np.full(len(p), np.nan, dtype=np.float64)
     lighter_bid = pd.Series(lighter_bid).ffill().to_numpy(dtype=np.float64)
     lighter_ask = pd.Series(lighter_ask).ffill().to_numpy(dtype=np.float64)
-    ax0.step(p["t_dt"], lighter_bid, where="post", label="Lighter bid (ffill)", linewidth=1.0, alpha=0.9, color="blue")
-    ax0.step(p["t_dt"], lighter_ask, where="post", label="Lighter ask (ffill)", linewidth=1.0, alpha=0.6, color="blue")
+    ax0.step(p["t_dt"], lighter_bid, where="post", label="Lighter bid (ffill)", linewidth=1.0, alpha=0.95, color="C0")
+    ax0.step(p["t_dt"], lighter_ask, where="post", label="Lighter ask (ffill)", linewidth=1.0, alpha=0.35, color="C0")
 
     # Model nowcast quotes (t), plotted causally at Lighter update instants.
     if "pred_bid" in p.columns and "pred_ask" in p.columns:
@@ -2433,8 +2433,8 @@ def plot_results(
         pre_ask = p["pred_ask_pre_target"].to_numpy(dtype=np.float64) if "pred_ask_pre_target" in p.columns else None
         pred_bid_plot = _causal_at_target(pred_bid, pre_bid)
         pred_ask_plot = _causal_at_target(pred_ask, pre_ask)
-        ax0.step(p["t_dt"], pred_bid_plot, where="post", label="Model bid (t)", linewidth=1.3, alpha=0.9, color="red")
-        ax0.step(p["t_dt"], pred_ask_plot, where="post", label="Model ask (t)", linewidth=1.3, alpha=0.6, color="red")
+        ax0.step(p["t_dt"], pred_bid_plot, where="post", label="Model bid (t)", linewidth=1.4, alpha=0.9, color="C3")
+        ax0.step(p["t_dt"], pred_ask_plot, where="post", label="Model ask (t)", linewidth=1.4, alpha=0.9, color="C4")
 
     # Model horizon quotes (t+h) if available.
     if has_h and horizon_tag is not None:
@@ -2449,8 +2449,8 @@ def plot_results(
             ask_pre_h = p[ask_pre_h_col].to_numpy(dtype=np.float64) if ask_pre_h_col in p.columns else None
             bid_h_plot = _causal_at_target(bid_h, bid_pre_h)
             ask_h_plot = _causal_at_target(ask_h, ask_pre_h)
-            ax0.step(p["t_dt"], bid_h_plot, where="post", label=f"Model bid (t+{horizon_ms:g}ms)", linewidth=1.3, alpha=0.85, color="orange")
-            ax0.step(p["t_dt"], ask_h_plot, where="post", label=f"Model ask (t+{horizon_ms:g}ms)", linewidth=1.3, alpha=0.55, color="orange")
+            ax0.step(p["t_dt"], bid_h_plot, where="post", label=f"Model bid (t+{horizon_ms:g}ms)", linewidth=1.3, alpha=0.9, color="C2")
+            ax0.step(p["t_dt"], ask_h_plot, where="post", label=f"Model ask (t+{horizon_ms:g}ms)", linewidth=1.3, alpha=0.9, color="C8")
 
     # If horizon is enabled, overlay the realized Lighter bid/ask at t+h on the same time axis (t).
     if has_h:
@@ -2462,8 +2462,8 @@ def plot_results(
             a_l = lighter_updates["ask_px_1"].to_numpy(dtype=np.float64)
             realized_bid_h = _future_value_at_or_after(t_l, b_l, t_ns_plot + horizon_ns)
             realized_ask_h = _future_value_at_or_after(t_l, a_l, t_ns_plot + horizon_ns)
-            ax0.step(p["t_dt"], realized_bid_h, where="post", label=f"Realized bid at t+{horizon_ms:g}ms", linewidth=1.2, alpha=0.75, color="black")
-            ax0.step(p["t_dt"], realized_ask_h, where="post", label=f"Realized ask at t+{horizon_ms:g}ms", linewidth=1.2, alpha=0.55, color="black")
+            ax0.step(p["t_dt"], realized_bid_h, where="post", label=f"Realized bid at t+{horizon_ms:g}ms", linewidth=1.2, alpha=0.85, color="C7")
+            ax0.step(p["t_dt"], realized_ask_h, where="post", label=f"Realized ask at t+{horizon_ms:g}ms", linewidth=1.2, alpha=0.55, color="C7")
 
     split_dt = pd.to_datetime(split_ns, unit="ns", utc=True)
     ax0.axvline(split_dt, color="k", linestyle="--", linewidth=1.0, alpha=0.7, label="train/test split")

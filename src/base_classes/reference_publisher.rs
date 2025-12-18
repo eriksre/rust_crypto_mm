@@ -68,6 +68,8 @@ impl ReferencePublisher {
         self.last_key = Some(key);
         let event = ReferenceEvent {
             price: candidate.price,
+            best_bid: candidate.best_bid,
+            best_ask: candidate.best_ask,
             ts_ns: candidate.ts_ns,
             source: candidate.source,
             received_at: candidate.received_at.unwrap_or_else(Instant::now),
@@ -87,6 +89,8 @@ impl ReferencePublisher {
         let mut best: Option<Candidate> = None;
 
         let mut consider = |price: Option<f64>,
+                            best_bid: Option<f64>,
+                            best_ask: Option<f64>,
                             seq: u64,
                             ts: Option<u64>,
                             idx: u8,
@@ -112,6 +116,8 @@ impl ReferencePublisher {
 
             let cand = Candidate {
                 price: px,
+                best_bid: best_bid.filter(|b| b.is_finite() && *b > 0.0),
+                best_ask: best_ask.filter(|a| a.is_finite() && *a > 0.0),
                 seq,
                 ts_ns: ts,
                 source_idx: idx,
@@ -131,6 +137,8 @@ impl ReferencePublisher {
         // Gate.io sources (no adjustment needed)
         consider(
             st.gate.bbo.price,
+            st.gate.bbo.bid_levels[0].map(|lvl| lvl.0),
+            st.gate.bbo.ask_levels[0].map(|lvl| lvl.0),
             st.gate.bbo.seq,
             st.gate.bbo.ts_ns,
             0,
@@ -139,6 +147,8 @@ impl ReferencePublisher {
         );
         consider(
             st.gate.orderbook.price,
+            st.gate.orderbook.bid_levels[0].map(|lvl| lvl.0),
+            st.gate.orderbook.ask_levels[0].map(|lvl| lvl.0),
             st.gate.orderbook.seq,
             st.gate.orderbook.ts_ns,
             1,
@@ -147,6 +157,8 @@ impl ReferencePublisher {
         );
         consider(
             st.gate.trade.price,
+            None,
+            None,
             st.gate.trade.seq,
             st.gate.trade.ts_ns,
             2,
@@ -157,6 +169,8 @@ impl ReferencePublisher {
         // Bybit sources (adjusted)
         consider(
             Self::adjust_price(st.bybit.bbo.price, &st.demean.bybit),
+            Self::adjust_price(st.bybit.bbo.bid_levels[0].map(|lvl| lvl.0), &st.demean.bybit),
+            Self::adjust_price(st.bybit.bbo.ask_levels[0].map(|lvl| lvl.0), &st.demean.bybit),
             st.bybit.bbo.seq,
             st.bybit.bbo.ts_ns,
             3,
@@ -165,6 +179,8 @@ impl ReferencePublisher {
         );
         consider(
             Self::adjust_price(st.bybit.trade.price, &st.demean.bybit),
+            None,
+            None,
             st.bybit.trade.seq,
             st.bybit.trade.ts_ns,
             4,
@@ -175,6 +191,14 @@ impl ReferencePublisher {
         // Binance sources (adjusted)
         consider(
             Self::adjust_price(st.binance.bbo.price, &st.demean.binance),
+            Self::adjust_price(
+                st.binance.bbo.bid_levels[0].map(|lvl| lvl.0),
+                &st.demean.binance,
+            ),
+            Self::adjust_price(
+                st.binance.bbo.ask_levels[0].map(|lvl| lvl.0),
+                &st.demean.binance,
+            ),
             st.binance.bbo.seq,
             st.binance.bbo.ts_ns,
             5,
@@ -183,6 +207,8 @@ impl ReferencePublisher {
         );
         consider(
             Self::adjust_price(st.binance.trade.price, &st.demean.binance),
+            None,
+            None,
             st.binance.trade.seq,
             st.binance.trade.ts_ns,
             6,
@@ -193,6 +219,8 @@ impl ReferencePublisher {
         // Bitget sources (adjusted)
         consider(
             Self::adjust_price(st.bitget.bbo.price, &st.demean.bitget),
+            Self::adjust_price(st.bitget.bbo.bid_levels[0].map(|lvl| lvl.0), &st.demean.bitget),
+            Self::adjust_price(st.bitget.bbo.ask_levels[0].map(|lvl| lvl.0), &st.demean.bitget),
             st.bitget.bbo.seq,
             st.bitget.bbo.ts_ns,
             7,
@@ -201,6 +229,8 @@ impl ReferencePublisher {
         );
         consider(
             Self::adjust_price(st.bitget.trade.price, &st.demean.bitget),
+            None,
+            None,
             st.bitget.trade.seq,
             st.bitget.trade.ts_ns,
             8,
@@ -211,6 +241,8 @@ impl ReferencePublisher {
         // OKX sources (adjusted)
         consider(
             Self::adjust_price(st.okx.bbo.price, &st.demean.okx),
+            Self::adjust_price(st.okx.bbo.bid_levels[0].map(|lvl| lvl.0), &st.demean.okx),
+            Self::adjust_price(st.okx.bbo.ask_levels[0].map(|lvl| lvl.0), &st.demean.okx),
             st.okx.bbo.seq,
             st.okx.bbo.ts_ns,
             9,
@@ -219,6 +251,8 @@ impl ReferencePublisher {
         );
         consider(
             Self::adjust_price(st.okx.trade.price, &st.demean.okx),
+            None,
+            None,
             st.okx.trade.seq,
             st.okx.trade.ts_ns,
             10,
@@ -229,6 +263,8 @@ impl ReferencePublisher {
         // MEXC sources (adjusted)
         consider(
             Self::adjust_price(st.mexc.bbo.price, &st.demean.mexc),
+            Self::adjust_price(st.mexc.bbo.bid_levels[0].map(|lvl| lvl.0), &st.demean.mexc),
+            Self::adjust_price(st.mexc.bbo.ask_levels[0].map(|lvl| lvl.0), &st.demean.mexc),
             st.mexc.bbo.seq,
             st.mexc.bbo.ts_ns,
             11,
@@ -237,6 +273,8 @@ impl ReferencePublisher {
         );
         consider(
             Self::adjust_price(st.mexc.trade.price, &st.demean.mexc),
+            None,
+            None,
             st.mexc.trade.seq,
             st.mexc.trade.ts_ns,
             12,
@@ -247,6 +285,14 @@ impl ReferencePublisher {
         // Lighter sources (adjusted)
         consider(
             Self::adjust_price(st.lighter.bbo.price, &st.demean.lighter),
+            Self::adjust_price(
+                st.lighter.bbo.bid_levels[0].map(|lvl| lvl.0),
+                &st.demean.lighter,
+            ),
+            Self::adjust_price(
+                st.lighter.bbo.ask_levels[0].map(|lvl| lvl.0),
+                &st.demean.lighter,
+            ),
             st.lighter.bbo.seq,
             st.lighter.bbo.ts_ns,
             13,
@@ -255,6 +301,8 @@ impl ReferencePublisher {
         );
         consider(
             Self::adjust_price(st.lighter.trade.price, &st.demean.lighter),
+            None,
+            None,
             st.lighter.trade.seq,
             st.lighter.trade.ts_ns,
             14,
@@ -337,6 +385,8 @@ struct RevisionKey {
 #[derive(Clone, Debug)]
 struct Candidate {
     price: f64,
+    best_bid: Option<f64>,
+    best_ask: Option<f64>,
     seq: u64,
     ts_ns: Option<u64>,
     source_idx: u8,

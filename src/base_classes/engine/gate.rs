@@ -84,14 +84,18 @@ impl<const N: usize> GateEngine<N> {
                             match feed_gate.evaluate(ExchangeFeed::Gate, FeedKind::OrderBook, ob_ts)
                             {
                                 GateDecision::Accept => {
+                                    let (bid_vec, ask_vec) =
+                                        self.book.top_levels_f64(SNAPSHOT_DEPTH);
+                                    let best_bid = bid_vec.first().map(|lvl| lvl.0);
+                                    let best_ask = ask_vec.first().map(|lvl| lvl.0);
                                     fast_sender.send(
                                         mid,
+                                        best_bid,
+                                        best_ask,
                                         "gate_orderbook",
                                         Some(ob_ts),
                                         f.recv_instant,
                                     );
-                                    let (bid_vec, ask_vec) =
-                                        self.book.top_levels_f64(SNAPSHOT_DEPTH);
                                     let bid_levels = levels_to_array(&bid_vec);
                                     let ask_levels = levels_to_array(&ask_vec);
                                     {
@@ -140,7 +144,6 @@ impl<const N: usize> GateEngine<N> {
                         let system_ts_ns = entry.and_then(|e| e.system_ts_ns);
                         match feed_gate.evaluate(ExchangeFeed::Gate, FeedKind::Bbo, bbo_ts) {
                             GateDecision::Accept => {
-                                fast_sender.send(mid, "gate_bbo", Some(bbo_ts), f.recv_instant);
                                 let (bid_levels, ask_levels) = if let Some(e) = entry {
                                     (
                                         level_from_option(Some((e.bid_px, e.bid_qty))),
@@ -150,6 +153,16 @@ impl<const N: usize> GateEngine<N> {
                                     let (bid_vec, ask_vec) = self.book.top_levels_f64(1);
                                     (levels_to_array(&bid_vec), levels_to_array(&ask_vec))
                                 };
+                                let best_bid = bid_levels[0].map(|lvl| lvl.0);
+                                let best_ask = ask_levels[0].map(|lvl| lvl.0);
+                                fast_sender.send(
+                                    mid,
+                                    best_bid,
+                                    best_ask,
+                                    "gate_bbo",
+                                    Some(bbo_ts),
+                                    f.recv_instant,
+                                );
                                 let recv_instant = f.recv_instant;
                                 {
                                     let mut st = lock_state();
@@ -190,7 +203,14 @@ impl<const N: usize> GateEngine<N> {
                         match feed_gate.evaluate(ExchangeFeed::Gate, FeedKind::Trades, trade_ts) {
                             GateDecision::Accept => {
                                 let px = (trade.px as f64) / gate::PRICE_SCALE;
-                                fast_sender.send(px, "gate_trade", Some(trade_ts), f.recv_instant);
+                                fast_sender.send(
+                                    px,
+                                    None,
+                                    None,
+                                    "gate_trade",
+                                    Some(trade_ts),
+                                    f.recv_instant,
+                                );
                                 let direction = if trade.is_buyer_maker {
                                     TradeDirection::Sell
                                 } else {

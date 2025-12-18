@@ -534,19 +534,13 @@ async fn handle_market_update(
     let latency_debug = latency_debug_enabled();
     let now = Instant::now();
     let reference_age = now.saturating_duration_since(reference.received_at);
-    let meta = ReferenceMeta {
-        source: reference.source.clone(),
-        ts_ns: reference.ts_ns,
-        received_at: reference.received_at,
-    };
     let lock_start = Instant::now();
     let mut strategy_guard = strategy.lock();
     let lock_acquired = Instant::now();
     let lock_wait = lock_start.elapsed();
     let queue_delay = lock_start.saturating_duration_since(reference.received_at);
     let dispatch_delay = lock_start.saturating_duration_since(dispatched_at);
-    let cancels =
-        strategy_guard.on_market_update(reference.price, Some(meta.clone()), reference.received_at);
+    let cancels = strategy_guard.on_market_update(&reference);
     let state_metrics = strategy_guard.state_metrics();
     let after_update = Instant::now();
     let strat_dur = lock_start.elapsed();

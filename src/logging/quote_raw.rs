@@ -353,14 +353,8 @@ async fn handle_market_update(
     let latency_debug = latency_debug_enabled();
     let now = Instant::now();
     let reference_age = now.saturating_duration_since(reference.received_at);
-    let meta = ReferenceMeta {
-        source: reference.source.clone(),
-        ts_ns: reference.ts_ns,
-        received_at: reference.received_at,
-    };
     let strat_start = Instant::now();
-    let cancels =
-        strategy.on_market_update(reference.price, Some(meta.clone()), reference.received_at);
+    let cancels = strategy.on_market_update(&reference);
     let strat_dur = strat_start.elapsed();
 
     if latency_debug && (reference_age > REF_WARN || strat_dur > STAGE_WARN) {

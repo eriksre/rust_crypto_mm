@@ -52,11 +52,21 @@ impl FastEventSender {
         Self { tx }
     }
 
-    fn send(&self, price: f64, source: &'static str, ts: Option<u64>, recv_at: Instant) {
+    fn send(
+        &self,
+        price: f64,
+        best_bid: Option<f64>,
+        best_ask: Option<f64>,
+        source: &'static str,
+        ts: Option<u64>,
+        recv_at: Instant,
+    ) {
         if let Some(tx) = self.tx.as_ref() {
             if price.is_finite() && price > 0.0 {
                 let _ = tx.send(ReferenceEvent {
                     price,
+                    best_bid: best_bid.filter(|b| b.is_finite() && *b > 0.0),
+                    best_ask: best_ask.filter(|a| a.is_finite() && *a > 0.0),
                     ts_ns: ts,
                     source: source.to_string(),
                     received_at: recv_at,
