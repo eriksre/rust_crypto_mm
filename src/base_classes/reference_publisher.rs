@@ -8,24 +8,29 @@ use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::base_classes::reference::ReferenceEvent;
-use crate::base_classes::state::{ExchangeAdjustment, GlobalState, state};
+use crate::base_classes::state::{ExchangeAdjustment, GlobalState, TradeDirection, state};
+use crate::pricing::{LighterPricingModel, PricingModelConfig, PricingObservation};
 
 /// Publishes reference price events by selecting the best candidate from all exchanges.
 pub struct ReferencePublisher {
     tx: Option<UnboundedSender<ReferenceEvent>>,
     last_key: Option<RevisionKey>,
     channel_closed: bool,
+    model: Option<LighterPricingModel>,
 }
 
 impl ReferencePublisher {
     /// Creates a new reference publisher.
     /// If `tx` is None, the publisher is a no-op (useful for testing).
     #[inline]
-    pub fn new(tx: Option<UnboundedSender<ReferenceEvent>>) -> Self {
+    pub fn new(tx: Option<UnboundedSender<ReferenceEvent>>, model_cfg: Option<PricingModelConfig>) -> Self {
+        let model = model_cfg
+            .and_then(|cfg| if cfg.enabled { Some(LighterPricingModel::new(cfg)) } else { None });
         Self {
             tx,
             last_key: None,
             channel_closed: false,
+            model,
         }
     }
 
@@ -66,12 +71,41 @@ impl ReferencePublisher {
         }
 
         self.last_key = Some(key);
+
+        let mut price = candidate.price;
+        let mut best_bid = candidate.best_bid;
+        let mut best_ask = candidate.best_ask;
+        let mut source = candidate.source.clone();
+        let mut ts_ns = candidate.ts_ns;
+
+        if let Some(model) = self.model.as_mut() {
+            let obs = PricingObservation {
+                exchange: candidate.exchange.to_string(),
+                feed: candidate.feed.to_string(),
+                price: candidate.price,
+                bid_levels: candidate.bid_levels,
+                ask_levels: candidate.ask_levels,
+                wire_ts_ns: candidate.ts_ns,
+                source_engine_ts_ns: candidate.source_engine_ts_ns,
+                source_system_ts_ns: candidate.source_system_ts_ns,
+                direction: candidate.direction,
+                size: candidate.size,
+            };
+            if let Some(out) = model.update(&obs) {
+                price = out.fair_mid;
+                best_bid = out.quote_bid;
+                best_ask = out.quote_ask;
+                source = format!("model:{}", candidate.source);
+                ts_ns = candidate.ts_ns;
+            }
+        }
+
         let event = ReferenceEvent {
-            price: candidate.price,
-            best_bid: candidate.best_bid,
-            best_ask: candidate.best_ask,
-            ts_ns: candidate.ts_ns,
-            source: candidate.source,
+            price,
+            best_bid,
+            best_ask,
+            ts_ns,
+            source,
             received_at: candidate.received_at.unwrap_or_else(Instant::now),
         };
 
@@ -91,10 +125,18 @@ impl ReferencePublisher {
         let mut consider = |price: Option<f64>,
                             best_bid: Option<f64>,
                             best_ask: Option<f64>,
+                            bid_levels: [Option<(f64, f64)>; crate::base_classes::state::SNAPSHOT_DEPTH],
+                            ask_levels: [Option<(f64, f64)>; crate::base_classes::state::SNAPSHOT_DEPTH],
+                            direction: Option<TradeDirection>,
+                            size: Option<f64>,
                             seq: u64,
                             ts: Option<u64>,
+                            source_engine_ts_ns: Option<u64>,
+                            source_system_ts_ns: Option<u64>,
                             idx: u8,
                             source: String,
+                            exchange: &'static str,
+                            feed: &'static str,
                             received_at: Option<Instant>| {
             // Validate inputs
             if seq == 0 {
@@ -118,10 +160,18 @@ impl ReferencePublisher {
                 price: px,
                 best_bid: best_bid.filter(|b| b.is_finite() && *b > 0.0),
                 best_ask: best_ask.filter(|a| a.is_finite() && *a > 0.0),
+                bid_levels,
+                ask_levels,
+                direction,
+                size,
                 seq,
                 ts_ns: ts,
+                source_engine_ts_ns,
+                source_system_ts_ns,
                 source_idx: idx,
                 source,
+                exchange,
+                feed,
                 received_at,
             };
 
@@ -139,30 +189,54 @@ impl ReferencePublisher {
             st.gate.bbo.price,
             st.gate.bbo.bid_levels[0].map(|lvl| lvl.0),
             st.gate.bbo.ask_levels[0].map(|lvl| lvl.0),
+            st.gate.bbo.bid_levels,
+            st.gate.bbo.ask_levels,
+            st.gate.bbo.direction,
+            st.gate.bbo.size,
             st.gate.bbo.seq,
             st.gate.bbo.ts_ns,
+            st.gate.bbo.source_engine_ts_ns,
+            st.gate.bbo.source_system_ts_ns,
             0,
             "gate_bbo".to_string(),
+            "gate",
+            "bbo",
             st.gate.bbo.received_at,
         );
         consider(
             st.gate.orderbook.price,
             st.gate.orderbook.bid_levels[0].map(|lvl| lvl.0),
             st.gate.orderbook.ask_levels[0].map(|lvl| lvl.0),
+            st.gate.orderbook.bid_levels,
+            st.gate.orderbook.ask_levels,
+            st.gate.orderbook.direction,
+            st.gate.orderbook.size,
             st.gate.orderbook.seq,
             st.gate.orderbook.ts_ns,
+            st.gate.orderbook.source_engine_ts_ns,
+            st.gate.orderbook.source_system_ts_ns,
             1,
             "gate_ob".to_string(),
+            "gate",
+            "orderbook",
             st.gate.orderbook.received_at,
         );
         consider(
             st.gate.trade.price,
             None,
             None,
+            st.gate.trade.bid_levels,
+            st.gate.trade.ask_levels,
+            st.gate.trade.direction,
+            st.gate.trade.size,
             st.gate.trade.seq,
             st.gate.trade.ts_ns,
+            st.gate.trade.source_engine_ts_ns,
+            st.gate.trade.source_system_ts_ns,
             2,
             "gate_trade".to_string(),
+            "gate",
+            "trade",
             st.gate.trade.received_at,
         );
 
@@ -171,20 +245,36 @@ impl ReferencePublisher {
             Self::adjust_price(st.bybit.bbo.price, &st.demean.bybit),
             Self::adjust_price(st.bybit.bbo.bid_levels[0].map(|lvl| lvl.0), &st.demean.bybit),
             Self::adjust_price(st.bybit.bbo.ask_levels[0].map(|lvl| lvl.0), &st.demean.bybit),
+            Self::adjust_levels(st.bybit.bbo.bid_levels, &st.demean.bybit),
+            Self::adjust_levels(st.bybit.bbo.ask_levels, &st.demean.bybit),
+            st.bybit.bbo.direction,
+            st.bybit.bbo.size,
             st.bybit.bbo.seq,
             st.bybit.bbo.ts_ns,
+            st.bybit.bbo.source_engine_ts_ns,
+            st.bybit.bbo.source_system_ts_ns,
             3,
             Self::label("bybit_bbo", &st.demean.bybit),
+            "bybit",
+            "bbo",
             st.bybit.bbo.received_at,
         );
         consider(
             Self::adjust_price(st.bybit.trade.price, &st.demean.bybit),
             None,
             None,
+            Self::adjust_levels(st.bybit.trade.bid_levels, &st.demean.bybit),
+            Self::adjust_levels(st.bybit.trade.ask_levels, &st.demean.bybit),
+            st.bybit.trade.direction,
+            st.bybit.trade.size,
             st.bybit.trade.seq,
             st.bybit.trade.ts_ns,
+            st.bybit.trade.source_engine_ts_ns,
+            st.bybit.trade.source_system_ts_ns,
             4,
             Self::label("bybit_trade", &st.demean.bybit),
+            "bybit",
+            "trade",
             st.bybit.trade.received_at,
         );
 
@@ -199,20 +289,36 @@ impl ReferencePublisher {
                 st.binance.bbo.ask_levels[0].map(|lvl| lvl.0),
                 &st.demean.binance,
             ),
+            Self::adjust_levels(st.binance.bbo.bid_levels, &st.demean.binance),
+            Self::adjust_levels(st.binance.bbo.ask_levels, &st.demean.binance),
+            st.binance.bbo.direction,
+            st.binance.bbo.size,
             st.binance.bbo.seq,
             st.binance.bbo.ts_ns,
+            st.binance.bbo.source_engine_ts_ns,
+            st.binance.bbo.source_system_ts_ns,
             5,
             Self::label("binance_bbo", &st.demean.binance),
+            "binance",
+            "bbo",
             st.binance.bbo.received_at,
         );
         consider(
             Self::adjust_price(st.binance.trade.price, &st.demean.binance),
             None,
             None,
+            Self::adjust_levels(st.binance.trade.bid_levels, &st.demean.binance),
+            Self::adjust_levels(st.binance.trade.ask_levels, &st.demean.binance),
+            st.binance.trade.direction,
+            st.binance.trade.size,
             st.binance.trade.seq,
             st.binance.trade.ts_ns,
+            st.binance.trade.source_engine_ts_ns,
+            st.binance.trade.source_system_ts_ns,
             6,
             Self::label("binance_trade", &st.demean.binance),
+            "binance",
+            "trade",
             st.binance.trade.received_at,
         );
 
@@ -221,20 +327,36 @@ impl ReferencePublisher {
             Self::adjust_price(st.bitget.bbo.price, &st.demean.bitget),
             Self::adjust_price(st.bitget.bbo.bid_levels[0].map(|lvl| lvl.0), &st.demean.bitget),
             Self::adjust_price(st.bitget.bbo.ask_levels[0].map(|lvl| lvl.0), &st.demean.bitget),
+            Self::adjust_levels(st.bitget.bbo.bid_levels, &st.demean.bitget),
+            Self::adjust_levels(st.bitget.bbo.ask_levels, &st.demean.bitget),
+            st.bitget.bbo.direction,
+            st.bitget.bbo.size,
             st.bitget.bbo.seq,
             st.bitget.bbo.ts_ns,
+            st.bitget.bbo.source_engine_ts_ns,
+            st.bitget.bbo.source_system_ts_ns,
             7,
             Self::label("bitget_bbo", &st.demean.bitget),
+            "bitget",
+            "bbo",
             st.bitget.bbo.received_at,
         );
         consider(
             Self::adjust_price(st.bitget.trade.price, &st.demean.bitget),
             None,
             None,
+            Self::adjust_levels(st.bitget.trade.bid_levels, &st.demean.bitget),
+            Self::adjust_levels(st.bitget.trade.ask_levels, &st.demean.bitget),
+            st.bitget.trade.direction,
+            st.bitget.trade.size,
             st.bitget.trade.seq,
             st.bitget.trade.ts_ns,
+            st.bitget.trade.source_engine_ts_ns,
+            st.bitget.trade.source_system_ts_ns,
             8,
             Self::label("bitget_trade", &st.demean.bitget),
+            "bitget",
+            "trade",
             st.bitget.trade.received_at,
         );
 
@@ -243,20 +365,36 @@ impl ReferencePublisher {
             Self::adjust_price(st.okx.bbo.price, &st.demean.okx),
             Self::adjust_price(st.okx.bbo.bid_levels[0].map(|lvl| lvl.0), &st.demean.okx),
             Self::adjust_price(st.okx.bbo.ask_levels[0].map(|lvl| lvl.0), &st.demean.okx),
+            Self::adjust_levels(st.okx.bbo.bid_levels, &st.demean.okx),
+            Self::adjust_levels(st.okx.bbo.ask_levels, &st.demean.okx),
+            st.okx.bbo.direction,
+            st.okx.bbo.size,
             st.okx.bbo.seq,
             st.okx.bbo.ts_ns,
+            st.okx.bbo.source_engine_ts_ns,
+            st.okx.bbo.source_system_ts_ns,
             9,
             Self::label("okx_bbo", &st.demean.okx),
+            "okx",
+            "bbo",
             st.okx.bbo.received_at,
         );
         consider(
             Self::adjust_price(st.okx.trade.price, &st.demean.okx),
             None,
             None,
+            Self::adjust_levels(st.okx.trade.bid_levels, &st.demean.okx),
+            Self::adjust_levels(st.okx.trade.ask_levels, &st.demean.okx),
+            st.okx.trade.direction,
+            st.okx.trade.size,
             st.okx.trade.seq,
             st.okx.trade.ts_ns,
+            st.okx.trade.source_engine_ts_ns,
+            st.okx.trade.source_system_ts_ns,
             10,
             Self::label("okx_trade", &st.demean.okx),
+            "okx",
+            "trade",
             st.okx.trade.received_at,
         );
 
@@ -265,24 +403,64 @@ impl ReferencePublisher {
             Self::adjust_price(st.mexc.bbo.price, &st.demean.mexc),
             Self::adjust_price(st.mexc.bbo.bid_levels[0].map(|lvl| lvl.0), &st.demean.mexc),
             Self::adjust_price(st.mexc.bbo.ask_levels[0].map(|lvl| lvl.0), &st.demean.mexc),
+            Self::adjust_levels(st.mexc.bbo.bid_levels, &st.demean.mexc),
+            Self::adjust_levels(st.mexc.bbo.ask_levels, &st.demean.mexc),
+            st.mexc.bbo.direction,
+            st.mexc.bbo.size,
             st.mexc.bbo.seq,
             st.mexc.bbo.ts_ns,
+            st.mexc.bbo.source_engine_ts_ns,
+            st.mexc.bbo.source_system_ts_ns,
             11,
             Self::label("mexc_bbo", &st.demean.mexc),
+            "mexc",
+            "bbo",
             st.mexc.bbo.received_at,
         );
         consider(
             Self::adjust_price(st.mexc.trade.price, &st.demean.mexc),
             None,
             None,
+            Self::adjust_levels(st.mexc.trade.bid_levels, &st.demean.mexc),
+            Self::adjust_levels(st.mexc.trade.ask_levels, &st.demean.mexc),
+            st.mexc.trade.direction,
+            st.mexc.trade.size,
             st.mexc.trade.seq,
             st.mexc.trade.ts_ns,
+            st.mexc.trade.source_engine_ts_ns,
+            st.mexc.trade.source_system_ts_ns,
             12,
             Self::label("mexc_trade", &st.demean.mexc),
+            "mexc",
+            "trade",
             st.mexc.trade.received_at,
         );
 
         // Lighter sources (adjusted)
+        consider(
+            Self::adjust_price(st.lighter.orderbook.price, &st.demean.lighter),
+            Self::adjust_price(
+                st.lighter.orderbook.bid_levels[0].map(|lvl| lvl.0),
+                &st.demean.lighter,
+            ),
+            Self::adjust_price(
+                st.lighter.orderbook.ask_levels[0].map(|lvl| lvl.0),
+                &st.demean.lighter,
+            ),
+            Self::adjust_levels(st.lighter.orderbook.bid_levels, &st.demean.lighter),
+            Self::adjust_levels(st.lighter.orderbook.ask_levels, &st.demean.lighter),
+            st.lighter.orderbook.direction,
+            st.lighter.orderbook.size,
+            st.lighter.orderbook.seq,
+            st.lighter.orderbook.ts_ns,
+            st.lighter.orderbook.source_engine_ts_ns,
+            st.lighter.orderbook.source_system_ts_ns,
+            13,
+            Self::label("lighter_ob", &st.demean.lighter),
+            "lighter",
+            "orderbook",
+            st.lighter.orderbook.received_at,
+        );
         consider(
             Self::adjust_price(st.lighter.bbo.price, &st.demean.lighter),
             Self::adjust_price(
@@ -293,20 +471,36 @@ impl ReferencePublisher {
                 st.lighter.bbo.ask_levels[0].map(|lvl| lvl.0),
                 &st.demean.lighter,
             ),
+            Self::adjust_levels(st.lighter.bbo.bid_levels, &st.demean.lighter),
+            Self::adjust_levels(st.lighter.bbo.ask_levels, &st.demean.lighter),
+            st.lighter.bbo.direction,
+            st.lighter.bbo.size,
             st.lighter.bbo.seq,
             st.lighter.bbo.ts_ns,
-            13,
+            st.lighter.bbo.source_engine_ts_ns,
+            st.lighter.bbo.source_system_ts_ns,
+            14,
             Self::label("lighter_bbo", &st.demean.lighter),
+            "lighter",
+            "bbo",
             st.lighter.bbo.received_at,
         );
         consider(
             Self::adjust_price(st.lighter.trade.price, &st.demean.lighter),
             None,
             None,
+            Self::adjust_levels(st.lighter.trade.bid_levels, &st.demean.lighter),
+            Self::adjust_levels(st.lighter.trade.ask_levels, &st.demean.lighter),
+            st.lighter.trade.direction,
+            st.lighter.trade.size,
             st.lighter.trade.seq,
             st.lighter.trade.ts_ns,
-            14,
+            st.lighter.trade.source_engine_ts_ns,
+            st.lighter.trade.source_system_ts_ns,
+            15,
             Self::label("lighter_trade", &st.demean.lighter),
+            "lighter",
+            "trade",
             st.lighter.trade.received_at,
         );
 
@@ -345,6 +539,24 @@ impl ReferencePublisher {
         } else {
             Some(px)
         }
+    }
+
+    #[inline]
+    fn adjust_level(
+        level: Option<(f64, f64)>,
+        adj: &ExchangeAdjustment,
+    ) -> Option<(f64, f64)> {
+        let (px, sz) = level?;
+        let adjusted = Self::adjust_price(Some(px), adj)?;
+        Some((adjusted, sz))
+    }
+
+    #[inline]
+    fn adjust_levels(
+        levels: [Option<(f64, f64)>; crate::base_classes::state::SNAPSHOT_DEPTH],
+        adj: &ExchangeAdjustment,
+    ) -> [Option<(f64, f64)>; crate::base_classes::state::SNAPSHOT_DEPTH] {
+        levels.map(|lvl| Self::adjust_level(lvl, adj))
     }
 
     /// Creates a label for the source, appending "_adj" if adjustment is active.
@@ -387,9 +599,17 @@ struct Candidate {
     price: f64,
     best_bid: Option<f64>,
     best_ask: Option<f64>,
+    bid_levels: [Option<(f64, f64)>; crate::base_classes::state::SNAPSHOT_DEPTH],
+    ask_levels: [Option<(f64, f64)>; crate::base_classes::state::SNAPSHOT_DEPTH],
+    direction: Option<TradeDirection>,
+    size: Option<f64>,
     seq: u64,
     ts_ns: Option<u64>,
+    source_engine_ts_ns: Option<u64>,
+    source_system_ts_ns: Option<u64>,
     source_idx: u8,
     source: String,
+    exchange: &'static str,
+    feed: &'static str,
     received_at: Option<Instant>,
 }

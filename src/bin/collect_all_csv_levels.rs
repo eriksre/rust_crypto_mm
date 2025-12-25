@@ -71,7 +71,7 @@ fn main() {
         .unwrap_or_else(|| "all_exchanges_depth.csv".to_string());
 
     configure_feed_overrides(FeedToggles::default());
-    let _engine = spawn_state_engine(symbol.clone(), None, None);
+    let _engine = spawn_state_engine(symbol.clone(), None, None, None);
 
     eprintln!(
         "Collecting orderbook top levels + trades for {symbol} to {out_path}. Ctrl-C to stop.",

@@ -286,6 +286,7 @@ async fn main() -> Result<()> {
         config.strategy.symbol.clone(),
         Some(reference_tx),
         Some(fast_ref_tx),
+        config.pricing_model.clone(),
     );
     debug.info(|| {
         format!(
@@ -548,7 +549,6 @@ async fn handle_market_update(
         None
     } else {
         let send_start = Instant::now();
-        strategy_guard.record_cancel_submission(send_start);
         Some(send_start)
     };
     let after_record = Instant::now();
@@ -744,7 +744,7 @@ async fn handle_quote_tick(
         let intents = plan.intents.clone();
         let send_start = Instant::now();
         let sent_ts = SystemTime::now();
-        let debounce_budget = Duration::from_millis(config_ref.strategy.debounce_ms.max(1));
+        let debounce_budget = Duration::from_millis(config_ref.strategy.min_rest_ms.max(1));
         let (reference_instant, timer_wait) = if let Some(meta) = ref_meta.as_ref() {
             let age = plan.planned_at.saturating_duration_since(meta.received_at);
             if age <= debounce_budget {

@@ -26,6 +26,7 @@ use crate::base_classes::feed_gate::FeedTimestampGate;
 use crate::base_classes::reference::ReferenceEvent;
 use crate::base_classes::reference_publisher::ReferencePublisher;
 use crate::base_classes::ws::{FeedSignal, spawn_ws_worker};
+use crate::pricing::PricingModelConfig;
 use crate::exchanges::binance::BinanceHandler;
 use crate::exchanges::bitget::BitgetHandler;
 use crate::exchanges::bybit::BybitHandler;
@@ -220,10 +221,11 @@ pub fn spawn_state_engine(
     symbol: String,
     reference_tx: Option<UnboundedSender<ReferenceEvent>>,
     fast_tx: Option<UnboundedSender<ReferenceEvent>>,
+    pricing_model: Option<PricingModelConfig>,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let feeds = current_feeds();
-        let mut publisher = ReferencePublisher::new(reference_tx);
+        let mut publisher = ReferencePublisher::new(reference_tx, pricing_model);
         let fast_sender = FastEventSender::new(fast_tx);
         const N: usize = 1 << 15;
         let wake_signal = FeedSignal::new();

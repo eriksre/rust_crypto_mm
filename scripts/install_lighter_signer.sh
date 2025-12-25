@@ -55,18 +55,10 @@ release_json() {
 }
 
 url_from_release() {
-  python3 - "$ASSET" <<'PY'
-import json
-import sys
-
-asset = sys.argv[1]
-d = json.load(sys.stdin)
-for a in d.get("assets", []):
-    if a.get("name") == asset:
-        print(a["browser_download_url"])
-        raise SystemExit(0)
-raise SystemExit(f"asset not found in release: {asset}")
-PY
+  python3 -c 'import json,sys; asset=sys.argv[1]; d=json.load(sys.stdin); \
+assets=d.get("assets", []); \
+print(next((a["browser_download_url"] for a in assets if a.get("name")==asset), ""), end="")' "$ASSET" | \
+  awk 'NF{print; exit} END{if(NF==0){exit 1}}'
 }
 
 mkdir -p "$(dirname "${OUT}")"
@@ -83,4 +75,3 @@ echo "[lighter-signer] installed -> ${OUT}"
 if command -v file >/dev/null 2>&1; then
   file "${OUT}" || true
 fi
-

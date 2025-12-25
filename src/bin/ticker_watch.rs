@@ -11,7 +11,7 @@ fn main() {
         .unwrap_or_else(|| "BTCUSDT".to_string());
 
     configure_feed_overrides(FeedToggles::default());
-    let _engine = spawn_state_engine(symbol.clone(), None, None);
+    let _engine = spawn_state_engine(symbol.clone(), None, None, None);
     println!("Watching ticker updates for {symbol}. Ctrl-C to exit.\n");
 
     let mut last_seq = ExchangeSeqs::default();

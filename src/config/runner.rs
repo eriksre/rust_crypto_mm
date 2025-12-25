@@ -7,6 +7,7 @@ use serde::Deserialize;
 use crate::base_classes::feed_config::FeedToggles;
 use crate::execution::types::Venue;
 use crate::execution::{GateCredentials, LighterCredentials};
+use crate::pricing::PricingModelConfig;
 use crate::strategy::QuoteConfig;
 
 fn default_true() -> bool {
@@ -97,6 +98,8 @@ pub struct RunnerConfig {
     pub settle: Option<String>,
     #[serde(default)]
     pub feeds: FeedToggles,
+    #[serde(default)]
+    pub pricing_model: Option<PricingModelConfig>,
 }
 
 pub fn load_runner_config(path: &str) -> Result<RunnerConfig> {

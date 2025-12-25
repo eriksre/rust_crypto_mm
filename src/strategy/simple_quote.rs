@@ -12,40 +12,59 @@ use crate::execution::{
     ClientOrderId, ExecutionReport, OrderStatus, QuoteIntent, TimeInForce, Venue,
 };
 
-const DEFAULT_REPRICE_BPS: f64 = 2.0;
 const DEFAULT_MIN_TICK: f64 = 1e-8;
-const DEFAULT_DEBOUNCE_MS: u64 = 50;
-const DEFAULT_CANCEL_BUFFER_MS: u64 = 50;
-
-fn default_cancel_on_cross() -> bool {
-    false
-}
-
-fn default_reprice_bps() -> f64 {
-    DEFAULT_REPRICE_BPS
-}
+const DEFAULT_MIN_HALF_SPREAD_BPS: f64 = 15.0;
+const DEFAULT_VOL_EWMA_ALPHA: f64 = 0.2;
+const DEFAULT_VOL_MULTIPLIER: f64 = 1.5;
+const DEFAULT_FEE_BPS: f64 = 1.0;
+const DEFAULT_VENUE_BUFFER_BPS: f64 = 1.0;
+const DEFAULT_REPRICE_FRACTION: f64 = 0.25;
+const DEFAULT_MIN_REST_MS: u64 = 500;
+const DEFAULT_MAX_AGE_MS: u64 = 5_000;
+const DEFAULT_CROSS_GUARD_TICKS: u32 = 1;
 
 fn default_min_tick() -> f64 {
     DEFAULT_MIN_TICK
 }
 
-fn default_debounce_ms() -> u64 {
-    DEFAULT_DEBOUNCE_MS
+fn default_min_half_spread_bps() -> f64 {
+    DEFAULT_MIN_HALF_SPREAD_BPS
 }
 
-fn default_cancel_buffer_ms() -> u64 {
-    DEFAULT_CANCEL_BUFFER_MS
+fn default_vol_ewma_alpha() -> f64 {
+    DEFAULT_VOL_EWMA_ALPHA
 }
 
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum QuoteMode {
-    Mid,
-    Bbo,
+fn default_vol_multiplier() -> f64 {
+    DEFAULT_VOL_MULTIPLIER
 }
 
-fn default_quote_mode() -> QuoteMode {
-    QuoteMode::Mid
+fn default_fee_bps() -> f64 {
+    DEFAULT_FEE_BPS
+}
+
+fn default_venue_buffer_bps() -> f64 {
+    DEFAULT_VENUE_BUFFER_BPS
+}
+
+fn default_reprice_fraction() -> f64 {
+    DEFAULT_REPRICE_FRACTION
+}
+
+fn default_min_rest_ms() -> u64 {
+    DEFAULT_MIN_REST_MS
+}
+
+fn default_max_age_ms() -> u64 {
+    DEFAULT_MAX_AGE_MS
+}
+
+fn default_cross_guard_ticks() -> u32 {
+    DEFAULT_CROSS_GUARD_TICKS
+}
+
+fn default_use_reference_bbo() -> bool {
+    false
 }
 
 #[derive(Debug, Clone)]
@@ -88,25 +107,28 @@ pub struct QuoteConfig {
     pub symbol: String,
     #[serde(deserialize_with = "deserialize_size_spec")]
     pub size: SizeSpec,
-    #[serde(default = "default_quote_mode")]
-    pub quote_mode: QuoteMode,
-    pub spread_bps: f64,
-    #[serde(default)]
-    pub offset_bps: Option<f64>,
-    #[serde(default)]
-    pub bid_offset_bps: Option<f64>,
-    #[serde(default)]
-    pub ask_offset_bps: Option<f64>,
     #[serde(default = "default_min_tick")]
     pub min_tick: f64,
-    #[serde(default = "default_reprice_bps")]
-    pub reprice_bps: f64,
-    #[serde(default = "default_debounce_ms")]
-    pub debounce_ms: u64,
-    #[serde(default = "default_cancel_buffer_ms")]
-    pub cancel_buffer_ms: u64,
-    #[serde(default = "default_cancel_on_cross")]
-    pub cancel_on_cross: bool,
+    #[serde(default = "default_min_half_spread_bps")]
+    pub min_half_spread_bps: f64,
+    #[serde(default = "default_vol_ewma_alpha")]
+    pub volatility_ewma_alpha: f64,
+    #[serde(default = "default_vol_multiplier")]
+    pub volatility_multiplier: f64,
+    #[serde(default = "default_fee_bps")]
+    pub fee_bps: f64,
+    #[serde(default = "default_venue_buffer_bps")]
+    pub venue_buffer_bps: f64,
+    #[serde(default = "default_reprice_fraction")]
+    pub reprice_fraction: f64,
+    #[serde(default = "default_min_rest_ms")]
+    pub min_rest_ms: u64,
+    #[serde(default = "default_max_age_ms")]
+    pub max_age_ms: u64,
+    #[serde(default = "default_cross_guard_ticks")]
+    pub cross_guard_ticks: u32,
+    #[serde(default = "default_use_reference_bbo")]
+    pub use_reference_bbo: bool,
 }
 
 impl QuoteConfig {
@@ -117,20 +139,13 @@ impl QuoteConfig {
                 .ok_or_else(|| anyhow!("exchange minimum size unavailable for this venue")),
         }
     }
+}
 
-    pub fn effective_bid_offset_bps(&self) -> f64 {
-        self.bid_offset_bps
-            .or(self.offset_bps)
-            .unwrap_or(0.0)
-            .max(0.0)
-    }
-
-    pub fn effective_ask_offset_bps(&self) -> f64 {
-        self.ask_offset_bps
-            .or(self.offset_bps)
-            .unwrap_or(0.0)
-            .max(0.0)
-    }
+#[derive(Debug, Clone)]
+struct ActiveQuote {
+    side: Side,
+    price: f64,
+    placed_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -162,17 +177,18 @@ pub struct SimpleQuoteStrategy {
     config: QuoteConfig,
     base_size: f64,
     next_id: u64,
-    last_anchor: Option<f64>,
-    last_refresh_at: Option<Instant>,
     active_orders: Vec<ClientOrderId>,
-    active_quotes: HashMap<ClientOrderId, (Side, f64)>,
+    active_quotes: HashMap<ClientOrderId, ActiveQuote>,
     pending_cancels: HashSet<ClientOrderId>,
     latest_price: Option<f64>,
     latest_best_bid: Option<f64>,
     latest_best_ask: Option<f64>,
     latest_meta: Option<ReferenceMeta>,
     needs_requote: bool,
-    last_cancel_submission_at: Option<Instant>,
+    last_mid: Option<f64>,
+    ewma_abs_ret_bps: Option<f64>,
+    last_bid_action_at: Option<Instant>,
+    last_ask_action_at: Option<Instant>,
 }
 
 impl SimpleQuoteStrategy {
@@ -181,8 +197,6 @@ impl SimpleQuoteStrategy {
             config,
             base_size,
             next_id: 0,
-            last_anchor: None,
-            last_refresh_at: None,
             active_orders: Vec::new(),
             active_quotes: HashMap::new(),
             pending_cancels: HashSet::new(),
@@ -191,7 +205,10 @@ impl SimpleQuoteStrategy {
             latest_best_ask: None,
             latest_meta: None,
             needs_requote: true,
-            last_cancel_submission_at: None,
+            last_mid: None,
+            ewma_abs_ret_bps: None,
+            last_bid_action_at: None,
+            last_ask_action_at: None,
         }
     }
 
@@ -209,6 +226,7 @@ impl SimpleQuoteStrategy {
             return Vec::new();
         }
 
+        let now = reference.received_at;
         self.latest_price = Some(price);
         if let Some(best_bid) = reference
             .best_bid
@@ -228,31 +246,67 @@ impl SimpleQuoteStrategy {
             received_at: reference.received_at,
         });
 
+        self.update_volatility(price);
+
         if self.active_orders.is_empty() {
             self.needs_requote = true;
         }
 
         let mut cancels = Vec::new();
+        let (bid_target, ask_target, half_spread_px) =
+            self.compute_targets(price, self.latest_best_bid, self.latest_best_ask);
+        let reprice_threshold_px = self.reprice_threshold_px(half_spread_px);
+        let max_age = if self.config.max_age_ms == 0 {
+            None
+        } else {
+            Some(Duration::from_millis(self.config.max_age_ms))
+        };
 
-        if self.config.cancel_on_cross {
-            if let (Some(best_bid), Some(best_ask)) = (self.latest_best_bid, self.latest_best_ask)
-            {
-                let crossed = self.prepare_cross_cancels(best_bid, best_ask);
-                if !crossed.is_empty() {
-                    self.needs_requote = true;
-                    cancels.extend(crossed);
+        let quotes_snapshot: Vec<(ClientOrderId, ActiveQuote)> = self
+            .active_quotes
+            .iter()
+            .map(|(id, quote)| (id.clone(), quote.clone()))
+            .collect();
+
+        for (id, quote) in quotes_snapshot {
+            if self.pending_cancels.contains(&id) {
+                continue;
+            }
+            let side = quote.side;
+            let price = quote.price;
+
+            let crossed = match (self.latest_best_bid, self.latest_best_ask) {
+                (Some(best_bid), Some(best_ask)) => {
+                    let guard = self.cross_guard_px();
+                    match side {
+                        Side::Bid => price >= best_ask - guard,
+                        Side::Ask => price <= best_bid + guard,
+                    }
+                }
+                _ => false,
+            };
+
+            let stale = max_age
+                .map(|age| now.saturating_duration_since(quote.placed_at) >= age)
+                .unwrap_or(false);
+
+            let target_price = match side {
+                Side::Bid => bid_target,
+                Side::Ask => ask_target,
+            };
+            let needs_reprice = (target_price - price).abs() >= reprice_threshold_px;
+            let rest_elapsed = self.min_rest_elapsed(now, side);
+
+            if crossed || stale || (needs_reprice && rest_elapsed) {
+                if !self.pending_cancels.contains(&id) {
+                    self.pending_cancels.insert(id.clone());
+                    cancels.push(id.clone());
+                    self.mark_action(side, now);
                 }
             }
         }
 
-        let anchor = self.reference_anchor().unwrap_or(price);
-        if let Some(last_anchor) = self.last_anchor.filter(|p| *p > 0.0) {
-            let change_bps = ((anchor - last_anchor).abs() / last_anchor) * 10_000.0;
-            if change_bps >= self.config.reprice_bps.max(f64::EPSILON) {
-                self.needs_requote = true;
-                cancels.extend(self.prepare_cancels());
-            }
-        } else {
+        if !cancels.is_empty() {
             self.needs_requote = true;
         }
 
@@ -268,14 +322,6 @@ impl SimpleQuoteStrategy {
             return None;
         }
 
-        if !self.cancel_buffer_elapsed(now) {
-            return None;
-        }
-
-        if !self.active_orders.is_empty() && !self.debounce_elapsed(now) {
-            return None;
-        }
-
         let has_unknown_live_orders = self.active_orders.iter().any(|id| {
             !self.pending_cancels.contains(id) && !self.active_quotes.contains_key(id)
         });
@@ -285,8 +331,8 @@ impl SimpleQuoteStrategy {
 
         let (has_bid, has_ask) = self.active_orders.iter().fold((false, false), |acc, id| {
             let (mut bid_seen, mut ask_seen) = acc;
-            if let Some((side, _)) = self.active_quotes.get(id) {
-                match side {
+            if let Some(quote) = self.active_quotes.get(id) {
+                match quote.side {
                     Side::Bid => bid_seen = true,
                     Side::Ask => ask_seen = true,
                 }
@@ -300,18 +346,39 @@ impl SimpleQuoteStrategy {
             return None;
         }
 
-        let mut intents = self.build_intents(price, best_bid, best_ask);
-        intents.retain(|intent| match intent.side {
-            Side::Bid => want_bid,
-            Side::Ask => want_ask,
-        });
+        let (bid_px, ask_px, _) = self.compute_targets(price, best_bid, best_ask);
+        let want_bid = want_bid && self.min_rest_elapsed(now, Side::Bid);
+        let want_ask = want_ask && self.min_rest_elapsed(now, Side::Ask);
+
+        let mut intents = Vec::new();
+        if want_bid {
+            intents.push(QuoteIntent::new(
+                self.config.venue,
+                self.config.symbol.clone(),
+                Side::Bid,
+                bid_px,
+                self.base_size,
+                TimeInForce::PostOnly,
+                self.next_client_id("B"),
+            ));
+        }
+        if want_ask {
+            intents.push(QuoteIntent::new(
+                self.config.venue,
+                self.config.symbol.clone(),
+                Side::Ask,
+                ask_px,
+                self.base_size,
+                TimeInForce::PostOnly,
+                self.next_client_id("S"),
+            ));
+        }
         if intents.is_empty() {
             return None;
         }
-        let anchor = self.reference_anchor().unwrap_or(price);
 
         Some(QuotePlan {
-            reference_price: anchor,
+            reference_price: price,
             reference_best_bid: best_bid,
             reference_best_ask: best_ask,
             cancels: Vec::new(),
@@ -322,8 +389,6 @@ impl SimpleQuoteStrategy {
     }
 
     pub fn commit_plan(&mut self, plan: &QuotePlan) {
-        self.last_anchor = Some(plan.reference_price);
-        self.last_refresh_at = Some(plan.planned_at);
         for intent in &plan.intents {
             if !self
                 .active_orders
@@ -332,14 +397,17 @@ impl SimpleQuoteStrategy {
             {
                 self.active_orders.push(intent.client_order_id.clone());
             }
-            self.active_quotes
-                .insert(intent.client_order_id.clone(), (intent.side, intent.price));
+            self.active_quotes.insert(
+                intent.client_order_id.clone(),
+                ActiveQuote {
+                    side: intent.side,
+                    price: intent.price,
+                    placed_at: plan.planned_at,
+                },
+            );
+            self.mark_action(intent.side, plan.planned_at);
         }
         self.needs_requote = false;
-    }
-
-    pub fn record_cancel_submission(&mut self, when: Instant) {
-        self.last_cancel_submission_at = Some(when);
     }
 
     pub fn state_metrics(&self) -> QuoteStateMetrics {
@@ -387,62 +455,73 @@ impl SimpleQuoteStrategy {
         }
     }
 
-    fn build_intents(
-        &mut self,
+    fn update_volatility(&mut self, mid: f64) {
+        if let Some(prev) = self.last_mid.filter(|v| *v > 0.0) {
+            let change_bps = ((mid - prev).abs() / prev) * 10_000.0;
+            let alpha = self.config.volatility_ewma_alpha.clamp(0.0, 1.0);
+            let next = if let Some(cur) = self.ewma_abs_ret_bps {
+                alpha * change_bps + (1.0 - alpha) * cur
+            } else {
+                change_bps
+            };
+            self.ewma_abs_ret_bps = Some(next);
+        }
+        self.last_mid = Some(mid);
+    }
+
+    fn half_spread_bps(&self) -> f64 {
+        let vol = self.ewma_abs_ret_bps.unwrap_or(0.0).max(0.0);
+        let mut half = self.config.volatility_multiplier.max(0.0) * vol;
+        half += self.config.fee_bps.max(0.0);
+        half += self.config.venue_buffer_bps.max(0.0);
+        half.max(self.config.min_half_spread_bps.max(0.0))
+    }
+
+    fn half_spread_px(&self, mid: f64) -> f64 {
+        let half_bps = self.half_spread_bps();
+        let half = mid * half_bps / 10_000.0;
+        half.max(self.config.min_tick.max(1e-8))
+    }
+
+    fn reprice_threshold_px(&self, half_spread_px: f64) -> f64 {
+        let frac = self.config.reprice_fraction.clamp(0.0, 1.0);
+        (half_spread_px * frac).max(self.config.min_tick.max(1e-8))
+    }
+
+    fn cross_guard_px(&self) -> f64 {
+        self.config.min_tick.max(1e-8) * f64::from(self.config.cross_guard_ticks)
+    }
+
+    fn compute_targets(
+        &self,
         mid: f64,
         best_bid: Option<f64>,
         best_ask: Option<f64>,
-    ) -> Vec<QuoteIntent> {
-        let (bid_px, ask_px) = if self.config.quote_mode == QuoteMode::Bbo {
-            if let (Some(b), Some(a)) = (best_bid, best_ask) {
-                self.quote_levels_from_reference_bbo(b, a)
-            } else {
-                self.quote_levels_from_mid(mid)
+    ) -> (f64, f64, f64) {
+        if self.config.use_reference_bbo {
+            if let (Some(bid), Some(ask)) = (best_bid, best_ask) {
+                if bid.is_finite() && ask.is_finite() && bid > 0.0 && ask > 0.0 && ask > bid {
+                    let (bid_px, ask_px) = self.quote_levels_rounded(bid, ask);
+                    let half = ((ask_px - bid_px) / 2.0).max(self.config.min_tick.max(1e-8));
+                    return (bid_px, ask_px, half);
+                }
             }
-        } else {
-            self.quote_levels_from_mid(mid)
-        };
-
-        let bid = QuoteIntent::new(
-            self.config.venue,
-            self.config.symbol.clone(),
-            Side::Bid,
-            bid_px,
-            self.base_size,
-            TimeInForce::PostOnly,
-            self.next_client_id("B"),
-        );
-        let ask = QuoteIntent::new(
-            self.config.venue,
-            self.config.symbol.clone(),
-            Side::Ask,
-            ask_px,
-            self.base_size,
-            TimeInForce::PostOnly,
-            self.next_client_id("S"),
-        );
-        vec![bid, ask]
-    }
-
-    fn quote_levels_from_mid(&self, mid: f64) -> (f64, f64) {
-        let mut spread = mid * self.config.spread_bps / 10_000.0;
-        if spread < self.config.min_tick {
-            spread = self.config.min_tick;
         }
-        let half = spread / 2.0;
-        self.quote_levels_rounded(mid - half, mid + half)
-    }
 
-    fn quote_levels_from_reference_bbo(&self, best_bid: f64, best_ask: f64) -> (f64, f64) {
-        let bid_offset = self.config.effective_bid_offset_bps() / 10_000.0;
-        let ask_offset = self.config.effective_ask_offset_bps() / 10_000.0;
+        let half = self.half_spread_px(mid);
+        let mut bid_raw = mid - half;
+        let mut ask_raw = mid + half;
 
-        let bid_ref = best_bid.min(best_ask);
-        let ask_ref = best_ask.max(best_bid);
+        if let (Some(bid), Some(ask)) = (best_bid, best_ask) {
+            if bid.is_finite() && ask.is_finite() && bid > 0.0 && ask > 0.0 {
+                let guard = self.cross_guard_px();
+                bid_raw = bid_raw.min(ask - guard);
+                ask_raw = ask_raw.max(bid + guard);
+            }
+        }
 
-        let bid_raw = bid_ref * (1.0 - bid_offset);
-        let ask_raw = ask_ref * (1.0 + ask_offset);
-        self.quote_levels_rounded(bid_raw, ask_raw)
+        let (bid_px, ask_px) = self.quote_levels_rounded(bid_raw, ask_raw);
+        (bid_px, ask_px, half)
     }
 
     fn quote_levels_rounded(&self, bid_raw: f64, ask_raw: f64) -> (f64, f64) {
@@ -469,78 +548,23 @@ impl SimpleQuoteStrategy {
         ))
     }
 
-    fn debounce_duration(&self) -> Duration {
-        Duration::from_millis(self.config.debounce_ms.max(1))
-    }
-
-    fn debounce_elapsed(&self, now: Instant) -> bool {
-        self.last_refresh_at
-            .map(|ts| now.saturating_duration_since(ts) >= self.debounce_duration())
-            .unwrap_or(true)
-    }
-
-    fn cancel_buffer_duration(&self) -> Duration {
-        Duration::from_millis(self.config.cancel_buffer_ms)
-    }
-
-    fn cancel_buffer_elapsed(&self, now: Instant) -> bool {
-        let buffer = self.cancel_buffer_duration();
-        if buffer.is_zero() {
+    fn min_rest_elapsed(&self, now: Instant, side: Side) -> bool {
+        let min_rest = Duration::from_millis(self.config.min_rest_ms);
+        if min_rest.is_zero() {
             return true;
         }
-        self.last_cancel_submission_at
-            .map(|ts| now.saturating_duration_since(ts) >= buffer)
+        let last = match side {
+            Side::Bid => self.last_bid_action_at,
+            Side::Ask => self.last_ask_action_at,
+        };
+        last.map(|ts| now.saturating_duration_since(ts) >= min_rest)
             .unwrap_or(true)
     }
 
-    fn prepare_cancels(&mut self) -> Vec<ClientOrderId> {
-        if self.active_orders.is_empty() {
-            return Vec::new();
+    fn mark_action(&mut self, side: Side, when: Instant) {
+        match side {
+            Side::Bid => self.last_bid_action_at = Some(when),
+            Side::Ask => self.last_ask_action_at = Some(when),
         }
-
-        let mut newly_requested = Vec::with_capacity(self.active_orders.len());
-        for id in &self.active_orders {
-            if !self.pending_cancels.contains(id) {
-                newly_requested.push(id.clone());
-                self.pending_cancels.insert(id.clone());
-            }
-        }
-
-        newly_requested
-    }
-
-    fn reference_anchor(&self) -> Option<f64> {
-        match (self.latest_best_bid, self.latest_best_ask, self.latest_price) {
-            (Some(b), Some(a), _) if b.is_finite() && a.is_finite() && b > 0.0 && a > 0.0 => {
-                Some((a + b) / 2.0)
-            }
-            (_, _, px) => px,
-        }
-    }
-
-    fn prepare_cross_cancels(&mut self, best_bid: f64, best_ask: f64) -> Vec<ClientOrderId> {
-        if self.active_quotes.is_empty() {
-            return Vec::new();
-        }
-
-        let mut newly_requested = Vec::new();
-        for (id, (side, px)) in self.active_quotes.iter() {
-            if self.pending_cancels.contains(id) {
-                continue;
-            }
-            let crossed = match side {
-                Side::Bid => px >= &best_ask,
-                Side::Ask => px <= &best_bid,
-            };
-            if crossed {
-                newly_requested.push(id.clone());
-            }
-        }
-
-        for id in &newly_requested {
-            self.pending_cancels.insert(id.clone());
-        }
-
-        newly_requested
     }
 }

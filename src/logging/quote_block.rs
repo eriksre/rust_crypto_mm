@@ -232,7 +232,12 @@ async fn main() -> Result<()> {
     }
 
     let (reference_tx, mut reference_rx) = mpsc::unbounded_channel();
-    let _engine = spawn_state_engine(config.strategy.symbol.clone(), Some(reference_tx), None);
+    let _engine = spawn_state_engine(
+        config.strategy.symbol.clone(),
+        Some(reference_tx),
+        None,
+        config.pricing_model.clone(),
+    );
     debug.info(|| {
         format!(
             "Gate runner started for {} (dry_run: {})",
@@ -380,7 +385,6 @@ async fn handle_market_update(
             )
         });
         let send_start = Instant::now();
-        strategy.record_cancel_submission(send_start);
         let cancel_internal = send_start.saturating_duration_since(reference.received_at);
         let sent_ts = SystemTime::now();
         if let Some(logger) = logger.as_ref() {
@@ -487,7 +491,7 @@ async fn handle_quote_tick(
         let intents = plan.intents.clone();
         let send_start = Instant::now();
         let sent_ts = SystemTime::now();
-        let debounce_budget = Duration::from_millis(config.strategy.debounce_ms.max(1));
+        let debounce_budget = Duration::from_millis(config.strategy.min_rest_ms.max(1));
         let (reference_instant, timer_wait) = if let Some(meta) = ref_meta.as_ref() {
             let age = plan.planned_at.saturating_duration_since(meta.received_at);
             if age <= debounce_budget {

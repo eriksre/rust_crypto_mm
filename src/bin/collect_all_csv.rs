@@ -70,7 +70,7 @@ fn main() {
     configure_feed_overrides(FeedToggles::default());
 
     // Spawn background engine: producers + processors maintain state. This process only writes snapshots.
-    let _engine = spawn_state_engine(symbol.clone(), None, None);
+    let _engine = spawn_state_engine(symbol.clone(), None, None, None);
 
     eprintln!(
         "Collecting mids + trades for {symbol} to {out_path}. Ctrl-C to stop.",
