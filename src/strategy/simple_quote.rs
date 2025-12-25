@@ -22,6 +22,8 @@ const DEFAULT_REPRICE_FRACTION: f64 = 0.25;
 const DEFAULT_MIN_REST_MS: u64 = 500;
 const DEFAULT_MAX_AGE_MS: u64 = 5_000;
 const DEFAULT_CROSS_GUARD_TICKS: u32 = 1;
+const DEFAULT_REPRICE_MIN_AGE_MS: u64 = 250;
+const DEFAULT_CROSS_GRACE_MS: u64 = 150;
 
 fn default_min_tick() -> f64 {
     DEFAULT_MIN_TICK
@@ -65,6 +67,14 @@ fn default_cross_guard_ticks() -> u32 {
 
 fn default_use_reference_bbo() -> bool {
     false
+}
+
+fn default_reprice_min_age_ms() -> u64 {
+    DEFAULT_REPRICE_MIN_AGE_MS
+}
+
+fn default_cross_grace_ms() -> u64 {
+    DEFAULT_CROSS_GRACE_MS
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +137,10 @@ pub struct QuoteConfig {
     pub max_age_ms: u64,
     #[serde(default = "default_cross_guard_ticks")]
     pub cross_guard_ticks: u32,
+    #[serde(default = "default_reprice_min_age_ms")]
+    pub reprice_min_age_ms: u64,
+    #[serde(default = "default_cross_grace_ms")]
+    pub cross_grace_ms: u64,
     #[serde(default = "default_use_reference_bbo")]
     pub use_reference_bbo: bool,
 }
@@ -146,6 +160,7 @@ struct ActiveQuote {
     side: Side,
     price: f64,
     placed_at: Instant,
+    crossed_since: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -261,12 +276,15 @@ impl SimpleQuoteStrategy {
         } else {
             Some(Duration::from_millis(self.config.max_age_ms))
         };
+        let reprice_min_age = Duration::from_millis(self.config.reprice_min_age_ms);
+        let cross_grace = Duration::from_millis(self.config.cross_grace_ms);
 
         let quotes_snapshot: Vec<(ClientOrderId, ActiveQuote)> = self
             .active_quotes
             .iter()
             .map(|(id, quote)| (id.clone(), quote.clone()))
             .collect();
+        let mut update_crossed: Vec<(ClientOrderId, Option<Instant>)> = Vec::new();
 
         for (id, quote) in quotes_snapshot {
             if self.pending_cancels.contains(&id) {
@@ -286,6 +304,13 @@ impl SimpleQuoteStrategy {
                 _ => false,
             };
 
+            let crossed_since = if crossed {
+                Some(quote.crossed_since.unwrap_or(now))
+            } else {
+                None
+            };
+            update_crossed.push((id.clone(), crossed_since));
+
             let stale = max_age
                 .map(|age| now.saturating_duration_since(quote.placed_at) >= age)
                 .unwrap_or(false);
@@ -296,13 +321,23 @@ impl SimpleQuoteStrategy {
             };
             let needs_reprice = (target_price - price).abs() >= reprice_threshold_px;
             let rest_elapsed = self.min_rest_elapsed(now, side);
+            let age_ok = now.saturating_duration_since(quote.placed_at) >= reprice_min_age;
 
-            if crossed || stale || (needs_reprice && rest_elapsed) {
-                if !self.pending_cancels.contains(&id) {
-                    self.pending_cancels.insert(id.clone());
-                    cancels.push(id.clone());
-                    self.mark_action(side, now);
-                }
+            let cross_ready = match crossed_since {
+                Some(since) => now.saturating_duration_since(since) >= cross_grace,
+                None => false,
+            };
+
+            if stale || (crossed && cross_ready) || (needs_reprice && rest_elapsed && age_ok) {
+                self.pending_cancels.insert(id.clone());
+                cancels.push(id.clone());
+                self.mark_action(side, now);
+            }
+        }
+
+        for (id, crossed_since) in update_crossed {
+            if let Some(quote) = self.active_quotes.get_mut(&id) {
+                quote.crossed_since = crossed_since;
             }
         }
 
@@ -403,6 +438,7 @@ impl SimpleQuoteStrategy {
                     side: intent.side,
                     price: intent.price,
                     placed_at: plan.planned_at,
+                    crossed_since: None,
                 },
             );
             self.mark_action(intent.side, plan.planned_at);

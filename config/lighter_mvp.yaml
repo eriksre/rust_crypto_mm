@@ -12,6 +12,8 @@ strategy:
   min_rest_ms: 500
   max_age_ms: 5000
   cross_guard_ticks: 1
+  reprice_min_age_ms: 250
+  cross_grace_ms: 150
 pricing_model:
   enabled: true
   time_basis: wire
