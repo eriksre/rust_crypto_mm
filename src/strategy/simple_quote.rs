@@ -19,7 +19,7 @@ const DEFAULT_VOL_MULTIPLIER: f64 = 1.5;
 const DEFAULT_FEE_BPS: f64 = 1.0;
 const DEFAULT_VENUE_BUFFER_BPS: f64 = 1.0;
 const DEFAULT_REPRICE_FRACTION: f64 = 0.25;
-const DEFAULT_MIN_REST_MS: u64 = 500;
+const DEFAULT_QUOTE_INTERVAL_MS: u64 = 200;
 const DEFAULT_MAX_AGE_MS: u64 = 5_000;
 const DEFAULT_CROSS_GUARD_TICKS: u32 = 1;
 const DEFAULT_CANCELLATION_DELAY_MS: u64 = 150;
@@ -52,8 +52,8 @@ fn default_reprice_fraction() -> f64 {
     DEFAULT_REPRICE_FRACTION
 }
 
-fn default_min_rest_ms() -> u64 {
-    DEFAULT_MIN_REST_MS
+fn default_quote_interval_ms() -> u64 {
+    DEFAULT_QUOTE_INTERVAL_MS
 }
 
 fn default_max_age_ms() -> u64 {
@@ -116,6 +116,8 @@ pub struct QuoteConfig {
     pub symbol: String,
     #[serde(deserialize_with = "deserialize_size_spec")]
     pub size: SizeSpec,
+    #[serde(default = "default_quote_interval_ms")]
+    pub quote_interval_ms: u64,
     #[serde(default = "default_min_tick")]
     pub min_tick: f64,
     #[serde(default = "default_min_half_spread_bps")]
@@ -130,8 +132,6 @@ pub struct QuoteConfig {
     pub venue_buffer_bps: f64,
     #[serde(default = "default_reprice_fraction")]
     pub reprice_fraction: f64,
-    #[serde(default = "default_min_rest_ms")]
-    pub min_rest_ms: u64,
     #[serde(default = "default_max_age_ms")]
     pub max_age_ms: u64,
     #[serde(default = "default_cross_guard_ticks")]
@@ -201,8 +201,6 @@ pub struct SimpleQuoteStrategy {
     needs_requote: bool,
     last_mid: Option<f64>,
     ewma_abs_ret_bps: Option<f64>,
-    last_bid_action_at: Option<Instant>,
-    last_ask_action_at: Option<Instant>,
 }
 
 impl SimpleQuoteStrategy {
@@ -221,8 +219,6 @@ impl SimpleQuoteStrategy {
             needs_requote: true,
             last_mid: None,
             ewma_abs_ret_bps: None,
-            last_bid_action_at: None,
-            last_ask_action_at: None,
         }
     }
 
@@ -312,8 +308,7 @@ impl SimpleQuoteStrategy {
                 Side::Ask => ask_target,
             };
             let needs_reprice = (target_price - price).abs() >= reprice_threshold_px;
-            let rest_elapsed = self.min_rest_elapsed(now, side);
-            let cancel_candidate = stale || crossed || (needs_reprice && rest_elapsed);
+            let cancel_candidate = stale || crossed || needs_reprice;
             let pending_since = if cancel_candidate && !stale {
                 Some(quote.cancel_pending_since.unwrap_or(now))
             } else {
@@ -446,7 +441,6 @@ impl SimpleQuoteStrategy {
                     cancel_pending_since: None,
                 },
             );
-            self.mark_action(intent.side, plan.planned_at);
         }
         self.needs_requote = false;
     }
@@ -587,25 +581,5 @@ impl SimpleQuoteStrategy {
             side_tag.to_lowercase(),
             self.next_id
         ))
-    }
-
-    fn min_rest_elapsed(&self, now: Instant, side: Side) -> bool {
-        let min_rest = Duration::from_millis(self.config.min_rest_ms);
-        if min_rest.is_zero() {
-            return true;
-        }
-        let last = match side {
-            Side::Bid => self.last_bid_action_at,
-            Side::Ask => self.last_ask_action_at,
-        };
-        last.map(|ts| now.saturating_duration_since(ts) >= min_rest)
-            .unwrap_or(true)
-    }
-
-    fn mark_action(&mut self, side: Side, when: Instant) {
-        match side {
-            Side::Bid => self.last_bid_action_at = Some(when),
-            Side::Ask => self.last_ask_action_at = Some(when),
-        }
     }
 }

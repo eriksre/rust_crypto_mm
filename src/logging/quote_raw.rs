@@ -260,7 +260,8 @@ async fn main() -> Result<()> {
 
     let mut market_timer = interval(Duration::from_millis(20));
     market_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut quote_timer = interval(Duration::from_millis(50));
+    let mut quote_timer =
+        interval(Duration::from_millis(config.strategy.quote_interval_ms.max(1)));
     quote_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let warmup = Duration::from_secs(25);
     let start_time = Instant::now();
@@ -491,7 +492,7 @@ async fn handle_quote_tick(
         let intents = plan.intents.clone();
         let send_start = Instant::now();
         let sent_ts = SystemTime::now();
-        let debounce_budget = Duration::from_millis(config.strategy.min_rest_ms.max(1));
+        let debounce_budget = Duration::from_millis(config.strategy.quote_interval_ms.max(1));
         let (reference_instant, timer_wait) = if let Some(meta) = ref_meta.as_ref() {
             let age = plan.planned_at.saturating_duration_since(meta.received_at);
             if age <= debounce_budget {
