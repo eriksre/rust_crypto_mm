@@ -268,6 +268,7 @@ impl SimpleQuoteStrategy {
         }
 
         let mut cancels = Vec::new();
+        let mut cancel_all = false;
         let (bid_target, ask_target, half_spread_px) =
             self.compute_targets(price, self.latest_best_bid, self.latest_best_ask);
         let reprice_threshold_px = self.reprice_threshold_px(half_spread_px);
@@ -329,15 +330,25 @@ impl SimpleQuoteStrategy {
             };
 
             if stale || (crossed && cross_ready) || (needs_reprice && rest_elapsed && age_ok) {
-                self.pending_cancels.insert(id.clone());
-                cancels.push(id.clone());
-                self.mark_action(side, now);
+                cancel_all = true;
             }
         }
 
         for (id, crossed_since) in update_crossed {
             if let Some(quote) = self.active_quotes.get_mut(&id) {
                 quote.crossed_since = crossed_since;
+            }
+        }
+
+        if cancel_all {
+            // Keep the system two-sided: if we need to reprice any leg, cancel all tracked live
+            // orders so the next quote tick can re-submit both sides together.
+            for id in self.active_quotes.keys().cloned().collect::<Vec<_>>() {
+                if self.pending_cancels.contains(&id) {
+                    continue;
+                }
+                self.pending_cancels.insert(id.clone());
+                cancels.push(id);
             }
         }
 
@@ -382,8 +393,6 @@ impl SimpleQuoteStrategy {
         }
 
         let (bid_px, ask_px, _) = self.compute_targets(price, best_bid, best_ask);
-        let want_bid = want_bid && self.min_rest_elapsed(now, Side::Bid);
-        let want_ask = want_ask && self.min_rest_elapsed(now, Side::Ask);
 
         let mut intents = Vec::new();
         if want_bid {

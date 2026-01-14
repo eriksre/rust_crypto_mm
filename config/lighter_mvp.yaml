@@ -89,8 +89,8 @@ feeds:
   mexc: false
   lighter: true
 risk:
-  max_order_notional: 400.0
-  max_position_notional: 500.0
+  max_order_notional: 200.0
+  max_position_notional: 300.0
 mode:
   dry_run: false
   log_fills: false
