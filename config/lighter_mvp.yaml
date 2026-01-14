@@ -9,12 +9,11 @@ strategy:
   volatility_multiplier: 1.5
   fee_bps: 1.0
   venue_buffer_bps: 1.0
-  reprice_fraction: 0.25
-  min_rest_ms: 1000
+  reprice_fraction: 0.7
+  min_rest_ms: 1500
   max_age_ms: 5000
   cross_guard_ticks: 1
-  reprice_min_age_ms: 250
-  cross_grace_ms: 150
+  cancellation_delay_ms: 130
 pricing_model:
   enabled: true
   time_basis: wire
@@ -69,16 +68,16 @@ pricing_model:
     snap_max_w: 0.9
     snap_age0_ms: 20.0
     snap_age_scale_ms: 10.0
-    snap_min_n: 3
+    snap_min_n: 2
     side_age_tau_ms: 75.0
     dir_vscale_bps_per_s: 50.0
     quote_half_spread_floor_bps: 0.5
     quote_half_spread_cap_bps: 50.0
-    quote_disp0_bps: 1.0
-    quote_disp_mult: 1.0
-    quote_age0_ms: 20.0
+    quote_disp0_bps: 0.5
+    quote_disp_mult: 0.5
+    quote_age0_ms: 100.0
     quote_age_bps_per_100ms: 0.5
-    quote_unc_mult: 1.0
+    quote_unc_mult: 0.5
     lighter_bias_halflife_s: 1.0
     lighter_bias_cap_bps: 10.0
 feeds:
@@ -96,6 +95,7 @@ mode:
   dry_run: false
   log_fills: false
   debug_prints: true
+  markout_prints: false
   demean_prices: false
 logging:
   enabled: true

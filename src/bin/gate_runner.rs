@@ -11,6 +11,7 @@ use rust_test::base_classes::engine::{
     configure_demean_enabled, configure_feed_overrides, spawn_state_engine,
 };
 use rust_test::base_classes::reference::ReferenceEvent;
+use rust_test::base_classes::state::state;
 use rust_test::base_classes::types::Side;
 use rust_test::config::runner::{
     RiskConfig, RunnerConfig, load_gate_credentials, load_lighter_credentials, load_runner_config,
@@ -46,6 +47,17 @@ fn latency_debug_enabled() -> bool {
 
 fn dur_us(d: Duration) -> u128 {
     d.as_micros()
+}
+
+fn lighter_mid_price() -> Option<f64> {
+    let guard = match state().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            eprintln!("WARN: markout state lock poisoned: {}", poisoned);
+            poisoned.into_inner()
+        }
+    };
+    guard.lighter.orderbook.price.filter(|v| v.is_finite() && *v > 0.0)
 }
 
 const REF_WARN: Duration = Duration::from_millis(20);
@@ -870,6 +882,7 @@ async fn process_reports(
         return Ok(());
     }
 
+    let markout_enabled = config.mode.markout_prints;
     for report in &reports {
         {
             let mut strategy = strategy.lock();
@@ -914,6 +927,33 @@ async fn process_reports(
                 });
             }
             InventoryReportOutcome::None => {}
+        }
+
+        if markout_enabled && report.filled_qty > f64::EPSILON {
+            if let Some(fill_price) = report
+                .avg_fill_price
+                .filter(|px| px.is_finite() && *px > 0.0)
+            {
+                let id = report.client_order_id.clone();
+                tokio::spawn(async move {
+                    sleep(Duration::from_secs(1)).await;
+                    match lighter_mid_price() {
+                        Some(mid) => {
+                            let bps = (mid - fill_price) / fill_price * 10_000.0;
+                            println!(
+                                "[markout] id={} fill={:.6} mid_1s={:.6} bps={:.2}",
+                                id.0, fill_price, mid, bps
+                            );
+                        }
+                        None => {
+                            println!(
+                                "[markout] id={} fill={:.6} mid_1s=NA",
+                                id.0, fill_price
+                            );
+                        }
+                    }
+                });
+            }
         }
     }
 

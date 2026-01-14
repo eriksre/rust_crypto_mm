@@ -33,6 +33,8 @@ pub struct ModeConfig {
     pub log_fills: bool,
     #[serde(default)]
     pub debug_prints: bool,
+    #[serde(default)]
+    pub markout_prints: bool,
     #[serde(default = "default_true")]
     pub demean_prices: bool,
 }

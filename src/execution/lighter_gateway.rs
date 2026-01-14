@@ -889,8 +889,6 @@ pub struct LighterGateway {
     next_client_index: Mutex<i64>,
     next_nonce: Mutex<Option<i64>>,
     nonce_lock: AsyncMutex<()>,
-    last_send_ms: Mutex<u64>,
-    min_send_interval_ms: u64,
     pending_reports: Mutex<Vec<ExecutionReport>>,
     orders: Mutex<HashMap<ClientOrderId, OrderState>>,
 }
@@ -921,10 +919,6 @@ impl LighterGateway {
 
         let http = Client::builder().timeout(Duration::from_secs(10)).build()?;
         let api_base = Url::parse(&base_url)?;
-        let min_send_interval_ms = std::env::var("LIGHTER_SEND_MIN_INTERVAL_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(75);
         let gw = Self {
             signer: signer,
             creds,
@@ -936,8 +930,6 @@ impl LighterGateway {
             next_client_index: Mutex::new(1),
             next_nonce: Mutex::new(None),
             nonce_lock: AsyncMutex::new(()),
-            last_send_ms: Mutex::new(0),
-            min_send_interval_ms,
             pending_reports: Mutex::new(Vec::new()),
             orders: Mutex::new(HashMap::new()),
         };
@@ -995,20 +987,6 @@ impl LighterGateway {
         *guard = Some(start + count as i64);
     }
 
-    async fn throttle_send(&self) {
-        let min_gap = self.min_send_interval_ms.max(1);
-        let now = current_unix_ms();
-        let wait_ms = {
-            let last = *self.last_send_ms.lock();
-            let target = last.saturating_add(min_gap);
-            target.saturating_sub(now)
-        };
-        if wait_ms > 0 {
-            tokio::time::sleep(Duration::from_millis(wait_ms)).await;
-        }
-        *self.last_send_ms.lock() = current_unix_ms() as u64;
-    }
-
     fn to_price_int(&self, px: f64) -> Result<u32> {
         if !px.is_finite() || px <= 0.0 {
             bail!("invalid price {px}");
@@ -1056,7 +1034,6 @@ impl LighterGateway {
 
         let mut sleep_ms: u64 = 150;
         for attempt in 0..8 {
-            self.throttle_send().await;
             let resp = self
                 .http
                 .post(self.api_base.join("api/v1/sendTxBatch")?)

@@ -1282,12 +1282,22 @@ impl LighterPricingModel {
         let floor = self.cfg.tuning.quote_half_spread_floor_bps.max(0.0);
         let cap = self.cfg.tuning.quote_half_spread_cap_bps.max(floor);
         let base_hs = base.max(floor);
-        let disp = if disp_bps.is_finite() { disp_bps } else { f64::INFINITY };
-        let age = if age_ms.is_finite() { age_ms } else { 1e9 };
-        let w = w_lighter.clamp(0.0, 1.0);
+        // Treat missing dispersion/age as "no extra widening" rather than forcing max spread.
+        // This prevents quote blowouts when common dispersion can't be computed (e.g., too few fresh venues).
         let disp0 = self.cfg.tuning.quote_disp0_bps.max(0.0);
-        let disp_mult = self.cfg.tuning.quote_disp_mult.max(0.0);
+        let disp = if disp_bps.is_finite() {
+            disp_bps.max(0.0)
+        } else {
+            disp0
+        };
         let age0 = self.cfg.tuning.quote_age0_ms.max(0.0);
+        let age = if age_ms.is_finite() {
+            age_ms.max(0.0)
+        } else {
+            age0
+        };
+        let w = w_lighter.clamp(0.0, 1.0);
+        let disp_mult = self.cfg.tuning.quote_disp_mult.max(0.0);
         let age_mult = self.cfg.tuning.quote_age_bps_per_100ms.max(0.0);
         let unc_mult = self.cfg.tuning.quote_unc_mult.max(0.0);
         let widen_disp = disp_mult * (disp - disp0).max(0.0);

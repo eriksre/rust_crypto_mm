@@ -151,3 +151,8 @@ required-features = ["gate_exec"]
 name = "gate_risk_probe"
 path = "src/bin/gate_risk_probe.rs"
 required-features = ["gate_exec"]
+
+[[bin]]
+name = "price_predictor"
+path = "src/bin/price_predictor.rs"
+required-features = ["gate_exec"]
