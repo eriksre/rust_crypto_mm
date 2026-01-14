@@ -111,11 +111,20 @@ impl<const N: usize> LighterBook<N> {
             None => return false,
         };
 
+        let msg_type = msg.msg_type.as_deref().unwrap_or("");
+        let is_snapshot = !self.initialized
+            || msg_type.starts_with("subscribed")
+            || msg_type.starts_with("snapshot");
+
         let seq = payload.offset.or(msg.offset).or(payload.nonce).unwrap_or(0);
-        if let Some(prev) = self.last_offset {
-            if seq != 0 && seq <= prev {
-                return false;
+        if !is_snapshot {
+            if let Some(prev) = self.last_offset {
+                if seq != 0 && seq <= prev {
+                    return false;
+                }
             }
+        } else {
+            self.last_offset = None;
         }
 
         let ts = payload
@@ -124,13 +133,6 @@ impl<const N: usize> LighterBook<N> {
             .map(Self::ts_from_exchange)
             .unwrap_or(self.last_ts);
         let seq_for_book = if seq == 0 { ts.max(1) } else { seq };
-
-        let is_snapshot = !self.initialized
-            || msg
-                .msg_type
-                .as_deref()
-                .map(|t| t.starts_with("subscribed"))
-                .unwrap_or(false);
 
         let bids = self.parse_levels(&payload.bids);
         let asks = self.parse_levels(&payload.asks);

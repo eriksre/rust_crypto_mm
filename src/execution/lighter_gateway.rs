@@ -1456,21 +1456,48 @@ impl LighterResyncWorker {
                         if let Some((id, state)) = guard.iter_mut().find(|(id, st)| {
                             missing_for_inactive.contains(id) && st.client_order_index == coi
                         }) {
+                            if let Some(price_str) = entry.price.as_ref() {
+                                if let Ok(price) = price_str.parse::<f64>() {
+                                    state.price = price;
+                                }
+                            }
+                            if let Some(size_str) = entry.initial_base_amount.as_ref() {
+                                if let Ok(size_int) = size_str.parse::<f64>() {
+                                    state.size = size_int / self.size_scale;
+                                }
+                            }
+                            LighterGateway::update_from_entry(
+                                self.size_scale,
+                                &entry,
+                                state,
+                                id,
+                                &mut reports,
+                            );
                             let status = entry
                                 .status
                                 .as_deref()
                                 .map(LighterGateway::map_status)
                                 .unwrap_or(OrderStatus::Unknown);
-                            state.status = status.clone();
-                            let remaining = (state.size - state.filled).max(0.0);
-                            reports.push(ExecutionReport {
-                                client_order_id: id.clone(),
-                                exchange_order_id: state.exchange_order_id.clone(),
-                                status,
-                                filled_qty: remaining,
-                                avg_fill_price: Some(state.price),
-                                ts: entry.timestamp.map(|v| v as u64),
-                            });
+                            if status != state.status {
+                                if matches!(
+                                    status,
+                                    OrderStatus::Canceled
+                                        | OrderStatus::Rejected
+                                        | OrderStatus::Filled
+                                ) {
+                                    state.status = status.clone();
+                                    reports.push(ExecutionReport {
+                                        client_order_id: id.clone(),
+                                        exchange_order_id: state.exchange_order_id.clone(),
+                                        status,
+                                        filled_qty: 0.0,
+                                        avg_fill_price: None,
+                                        ts: entry.timestamp.map(|v| v as u64),
+                                    });
+                                } else {
+                                    state.status = status;
+                                }
+                            }
                         }
                     }
                 }
@@ -2052,7 +2079,6 @@ impl LighterGateway {
         let filled_base = Self::parse_f64(entry.filled_base_amount.as_ref());
         let filled_size = filled_base / size_scale;
         if filled_size > state.filled + 1e-9 {
-            let delta = filled_size - state.filled;
             state.filled = filled_size;
             let done = entry
                 .remaining_base_amount
@@ -2070,7 +2096,7 @@ impl LighterGateway {
                 client_order_id: id.clone(),
                 exchange_order_id: state.exchange_order_id.clone(),
                 status,
-                filled_qty: delta,
+                filled_qty: filled_size,
                 avg_fill_price: Some(state.price),
                 ts: entry.timestamp.map(|v| v as u64),
             });

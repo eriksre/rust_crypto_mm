@@ -57,16 +57,19 @@ fn lighter_mid_price() -> Option<f64> {
             poisoned.into_inner()
         }
     };
-    guard
-        .lighter
-        .orderbook
-        .price
-        .filter(|v| v.is_finite() && *v > 0.0)
+    let snap = &guard.lighter.orderbook;
+    let mid = snap.price.filter(|v| v.is_finite() && *v > 0.0)?;
+    let last_recv = snap.received_at?;
+    if last_recv.elapsed() > LIGHTER_MARKOUT_MAX_AGE {
+        return None;
+    }
+    Some(mid)
 }
 
 const REF_WARN: Duration = Duration::from_millis(20);
 const STAGE_WARN: Duration = Duration::from_millis(5);
 const CANCEL_WARN: Duration = Duration::from_micros(500);
+const LIGHTER_MARKOUT_MAX_AGE: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 struct OrderMinima {

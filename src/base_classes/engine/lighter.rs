@@ -55,10 +55,11 @@ impl<const N: usize> LighterEngine<N> {
                     if feed == "orderbook" {
                         if let Some(mid) = self.book.mid_price_f64() {
                             let ob_ts = self.book.last_ts();
+                            let gate_ts = ob_ts.max(ts);
                             match feed_gate.evaluate(
                                 ExchangeFeed::Lighter,
                                 FeedKind::OrderBook,
-                                ob_ts,
+                                gate_ts,
                             ) {
                                 GateDecision::Accept => {
                                     let (bid_vec, ask_vec) =
@@ -107,7 +108,8 @@ impl<const N: usize> LighterEngine<N> {
                 if new_trades > 0 {
                     for trade in self.trades.iter_last(new_trades) {
                         let trade_ts = trade.ts;
-                        match feed_gate.evaluate(ExchangeFeed::Lighter, FeedKind::Trades, trade_ts)
+                        let gate_ts = trade_ts.max(ts);
+                        match feed_gate.evaluate(ExchangeFeed::Lighter, FeedKind::Trades, gate_ts)
                         {
                             GateDecision::Accept => {
                                 let px = (trade.px as f64) / self.price_scale;

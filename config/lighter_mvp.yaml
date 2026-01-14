@@ -89,13 +89,13 @@ feeds:
   mexc: false
   lighter: true
 risk:
-  max_order_notional: 200.0
-  max_position_notional: 300.0
+  max_order_notional: 50.0
+  max_position_notional: 100.0
 mode:
   dry_run: false
   log_fills: false
-  debug_prints: true
-  markout_prints: false
+  debug_prints: false
+  markout_prints: true
   demean_prices: false
 logging:
   enabled: true
