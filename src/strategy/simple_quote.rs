@@ -69,6 +69,10 @@ fn default_use_reference_bbo() -> bool {
     false
 }
 
+fn default_quote_at_reference_bbo() -> bool {
+    false
+}
+
 fn default_reprice_min_age_ms() -> u64 {
     DEFAULT_REPRICE_MIN_AGE_MS
 }
@@ -143,6 +147,8 @@ pub struct QuoteConfig {
     pub cross_grace_ms: u64,
     #[serde(default = "default_use_reference_bbo")]
     pub use_reference_bbo: bool,
+    #[serde(default = "default_quote_at_reference_bbo")]
+    pub quote_at_reference_bbo: bool,
 }
 
 impl QuoteConfig {
@@ -543,7 +549,7 @@ impl SimpleQuoteStrategy {
         best_bid: Option<f64>,
         best_ask: Option<f64>,
     ) -> (f64, f64, f64) {
-        if self.config.use_reference_bbo {
+        if self.config.use_reference_bbo && self.config.quote_at_reference_bbo {
             if let (Some(bid), Some(ask)) = (best_bid, best_ask) {
                 if bid.is_finite() && ask.is_finite() && bid > 0.0 && ask > 0.0 && ask > bid {
                     let (bid_px, ask_px) = self.quote_levels_rounded(bid, ask);

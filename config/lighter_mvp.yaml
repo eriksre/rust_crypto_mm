@@ -3,7 +3,8 @@ strategy:
   symbol: XMR_USDT
   size: min
   use_reference_bbo: true
-  min_half_spread_bps: 5.0
+  quote_at_reference_bbo: false
+  min_half_spread_bps: 3.0
   volatility_ewma_alpha: 0.2
   volatility_multiplier: 1.5
   fee_bps: 1.0
