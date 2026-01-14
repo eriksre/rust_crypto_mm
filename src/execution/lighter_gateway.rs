@@ -611,6 +611,7 @@ fn check_client_with_backoff(
     signer: &LighterSigner,
     api_key_idx: i32,
     account_idx: i64,
+    debug_prints: bool,
 ) -> Result<()> {
     let mut sleep_ms: u64 = 200;
     for attempt in 0..8 {
@@ -622,12 +623,14 @@ fn check_client_with_backoff(
                     return Err(err);
                 }
                 let wait = sleep_ms.min(5_000);
-                eprintln!(
-                    "[lighter-sign] CheckClient rate-limited attempt={} waiting_ms={} (msg={})",
-                    attempt + 1,
-                    wait,
-                    msg
-                );
+                if debug_prints {
+                    eprintln!(
+                        "[lighter-sign] CheckClient rate-limited attempt={} waiting_ms={} (msg={})",
+                        attempt + 1,
+                        wait,
+                        msg
+                    );
+                }
                 std::thread::sleep(Duration::from_millis(wait));
                 sleep_ms = sleep_ms.saturating_mul(2).min(5_000);
             }
@@ -727,10 +730,11 @@ enum SignerRequest {
 #[derive(Clone)]
 struct SignerHandle {
     tx: mpsc::Sender<SignerRequest>,
+    debug_prints: bool,
 }
 
 impl SignerHandle {
-    fn new(lib_path: String) -> Result<Self> {
+    fn new(lib_path: String, debug_prints: bool) -> Result<Self> {
         let (tx, rx) = mpsc::channel::<SignerRequest>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -766,7 +770,12 @@ impl SignerHandle {
                             // CheckClient performs an HTTP call and is rate-limited.
                             // Do it at init time only, with backoff.
                             .and_then(|_| {
-                                check_client_with_backoff(&signer, api_key_idx, account_idx)
+                                check_client_with_backoff(
+                                    &signer,
+                                    api_key_idx,
+                                    account_idx,
+                                    debug_prints,
+                                )
                             });
                         let _ = resp.send(res);
                     }
@@ -786,17 +795,19 @@ impl SignerHandle {
                         account_idx,
                         resp,
                     } => {
-                        eprintln!(
-                            "[lighter-sign-thread] create mid={} client_idx={} base_amt={} price={} is_ask={} tif={} ak_idx={} acct={}",
-                            market_index,
-                            client_order_index,
-                            base_amount,
-                            price,
-                            is_ask,
-                            tif,
-                            api_key_idx,
-                            account_idx
-                        );
+                        if debug_prints {
+                            eprintln!(
+                                "[lighter-sign-thread] create mid={} client_idx={} base_amt={} price={} is_ask={} tif={} ak_idx={} acct={}",
+                                market_index,
+                                client_order_index,
+                                base_amount,
+                                price,
+                                is_ask,
+                                tif,
+                                api_key_idx,
+                                account_idx
+                            );
+                        }
                         let res = signer.switch_api_key(api_key_idx).and_then(|_| {
                             signer.sign_create_order(
                                 market_index,
@@ -827,10 +838,12 @@ impl SignerHandle {
                         account_idx,
                         resp,
                     } => {
-                        eprintln!(
-                            "[lighter-sign-thread] cancel mid={} order_idx={} ak_idx={} acct={}",
-                            market_index, order_index, api_key_idx, account_idx
-                        );
+                        if debug_prints {
+                            eprintln!(
+                                "[lighter-sign-thread] cancel mid={} order_idx={} ak_idx={} acct={}",
+                                market_index, order_index, api_key_idx, account_idx
+                            );
+                        }
                         let res = signer.switch_api_key(api_key_idx).and_then(|_| {
                             signer.sign_cancel_order(
                                 market_index,
@@ -859,7 +872,10 @@ impl SignerHandle {
         ready_rx
             .recv()
             .unwrap_or_else(|_| Err(anyhow!("signer thread failed to start")))?;
-        Ok(Self { tx })
+        Ok(Self {
+            tx,
+            debug_prints,
+        })
     }
 
     async fn init_client(
@@ -902,17 +918,19 @@ impl SignerHandle {
         api_key_idx: i32,
         account_idx: i64,
     ) -> Result<SignedTx> {
-        eprintln!(
-            "[lighter-sign] sign_order mid={} client_idx={} base_amt={} price_int={} is_ask={} tif={} api_key_idx={} account_idx={}",
-            market_index,
-            client_order_index,
-            base_amount,
-            price,
-            is_ask,
-            tif,
-            api_key_idx,
-            account_idx
-        );
+        if self.debug_prints {
+            eprintln!(
+                "[lighter-sign] sign_order mid={} client_idx={} base_amt={} price_int={} is_ask={} tif={} api_key_idx={} account_idx={}",
+                market_index,
+                client_order_index,
+                base_amount,
+                price,
+                is_ask,
+                tif,
+                api_key_idx,
+                account_idx
+            );
+        }
         let (resp_tx, resp_rx) = oneshot::channel();
         self.tx
             .send(SignerRequest::SignCreate {
@@ -940,16 +958,18 @@ impl SignerHandle {
             if tx.tx_type == 0 {
                 tx.tx_type = 14;
             }
-            eprintln!(
-                "[lighter-sign] sign_order success tx_type={} tx_info_len={}",
-                tx.tx_type,
-                tx.tx_info.len()
-            );
-            if tx.tx_info.len() < 32 {
+            if self.debug_prints {
                 eprintln!(
-                    "[lighter-sign] warning: tx_info unusually short: {}",
-                    tx.tx_info
+                    "[lighter-sign] sign_order success tx_type={} tx_info_len={}",
+                    tx.tx_type,
+                    tx.tx_info.len()
                 );
+                if tx.tx_info.len() < 32 {
+                    eprintln!(
+                        "[lighter-sign] warning: tx_info unusually short: {}",
+                        tx.tx_info
+                    );
+                }
             }
         } else {
             eprintln!("[lighter-sign] sign_order failed: {:?}", res.as_ref().err());
@@ -983,11 +1003,13 @@ impl SignerHandle {
             if tx.tx_type == 0 {
                 tx.tx_type = 15; // cancel
             }
-            eprintln!(
-                "[lighter-sign] sign_cancel success tx_type={} tx_info_len={}",
-                tx.tx_type,
-                tx.tx_info.len()
-            );
+            if self.debug_prints {
+                eprintln!(
+                    "[lighter-sign] sign_cancel success tx_type={} tx_info_len={}",
+                    tx.tx_type,
+                    tx.tx_info.len()
+                );
+            }
         } else {
             eprintln!(
                 "[lighter-sign] sign_cancel failed: {:?}",
@@ -1581,13 +1603,15 @@ impl LighterGateway {
         size_decimals: u32,
         debug_prints: bool,
     ) -> Result<Self> {
-        let signer = SignerHandle::new(creds.signer_lib.clone())?;
+        let signer = SignerHandle::new(creds.signer_lib.clone(), debug_prints)?;
         let base_url = creds.base_url.clone();
         // Initialize signer client on its dedicated thread before use
-        eprintln!(
-            "[lighter-sign] init signer base_url={} api_key_idx={} account_idx={}",
-            base_url, creds.api_key_index, creds.account_index
-        );
+        if debug_prints {
+            eprintln!(
+                "[lighter-sign] init signer base_url={} api_key_idx={} account_idx={}",
+                base_url, creds.api_key_index, creds.account_index
+            );
+        }
         signer
             .init_client(
                 base_url.clone(),
