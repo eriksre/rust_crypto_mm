@@ -1,15 +1,15 @@
 strategy:
   venue: lighter
-  symbol: BTC_USDT
+  symbol: XMR_USDT
   size: min
   use_reference_bbo: true
-  min_half_spread_bps: 15.0
+  min_half_spread_bps: 5.0
   volatility_ewma_alpha: 0.2
   volatility_multiplier: 1.5
   fee_bps: 1.0
   venue_buffer_bps: 1.0
   reprice_fraction: 0.25
-  min_rest_ms: 500
+  min_rest_ms: 1000
   max_age_ms: 5000
   cross_guard_ticks: 1
   reprice_min_age_ms: 250
