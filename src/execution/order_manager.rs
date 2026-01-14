@@ -55,6 +55,26 @@ impl OrderManager {
         Ok(())
     }
 
+    pub async fn cancel_and_submit(
+        &self,
+        cancel_ids: Vec<ClientOrderId>,
+        intents: Vec<QuoteIntent>,
+    ) -> Result<Vec<OrderAck>> {
+        let acks = self
+            .gateway
+            .cancel_and_submit(&cancel_ids, &intents)
+            .await?;
+        let mut inflight = self.inflight.lock().await;
+        for id in &cancel_ids {
+            inflight.remove(id);
+        }
+        for intent in intents.into_iter() {
+            inflight.insert(intent.client_order_id.clone(), intent);
+        }
+        self.maybe_persist().await;
+        Ok(acks)
+    }
+
     pub async fn poll_reports(&self) -> Result<Vec<ExecutionReport>> {
         let reports = self.gateway.poll_reports().await?;
         if !reports.is_empty() {

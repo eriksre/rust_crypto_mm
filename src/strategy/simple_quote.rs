@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 use serde::Deserialize;
 
-use crate::base_classes::types::Side;
 use crate::base_classes::reference::ReferenceEvent;
+use crate::base_classes::types::Side;
 use crate::execution::{
     ClientOrderId, ExecutionReport, OrderStatus, QuoteIntent, TimeInForce, Venue,
 };
@@ -194,6 +194,7 @@ pub struct SimpleQuoteStrategy {
     active_orders: Vec<ClientOrderId>,
     active_quotes: HashMap<ClientOrderId, ActiveQuote>,
     pending_cancels: HashSet<ClientOrderId>,
+    scheduled_cancels: HashSet<ClientOrderId>,
     latest_price: Option<f64>,
     latest_best_bid: Option<f64>,
     latest_best_ask: Option<f64>,
@@ -212,6 +213,7 @@ impl SimpleQuoteStrategy {
             active_orders: Vec::new(),
             active_quotes: HashMap::new(),
             pending_cancels: HashSet::new(),
+            scheduled_cancels: HashSet::new(),
             latest_price: None,
             latest_best_bid: None,
             latest_best_ask: None,
@@ -238,16 +240,10 @@ impl SimpleQuoteStrategy {
 
         let now = reference.received_at;
         self.latest_price = Some(price);
-        if let Some(best_bid) = reference
-            .best_bid
-            .filter(|b| b.is_finite() && *b > 0.0)
-        {
+        if let Some(best_bid) = reference.best_bid.filter(|b| b.is_finite() && *b > 0.0) {
             self.latest_best_bid = Some(best_bid);
         }
-        if let Some(best_ask) = reference
-            .best_ask
-            .filter(|a| a.is_finite() && *a > 0.0)
-        {
+        if let Some(best_ask) = reference.best_ask.filter(|a| a.is_finite() && *a > 0.0) {
             self.latest_best_ask = Some(best_ask);
         }
         self.latest_meta = Some(ReferenceMeta {
@@ -282,7 +278,7 @@ impl SimpleQuoteStrategy {
         let mut update_pending: Vec<(ClientOrderId, Option<Instant>)> = Vec::new();
 
         for (id, quote) in quotes_snapshot {
-            if self.pending_cancels.contains(&id) {
+            if self.pending_cancels.contains(&id) || self.scheduled_cancels.contains(&id) {
                 continue;
             }
             let side = quote.side;
@@ -334,12 +330,18 @@ impl SimpleQuoteStrategy {
         if cancel_all {
             // Keep the system two-sided: if we need to reprice any leg, cancel all tracked live
             // orders so the next quote tick can re-submit both sides together.
-            for id in self.active_quotes.keys().cloned().collect::<Vec<_>>() {
-                if self.pending_cancels.contains(&id) {
+            for id in self.active_orders.clone() {
+                if self.pending_cancels.contains(&id) || self.scheduled_cancels.contains(&id) {
                     continue;
                 }
-                self.pending_cancels.insert(id.clone());
-                cancels.push(id);
+                if self.active_quotes.contains_key(&id) {
+                    if self.config.venue == Venue::Lighter {
+                        self.scheduled_cancels.insert(id.clone());
+                    } else {
+                        self.pending_cancels.insert(id.clone());
+                    }
+                    cancels.push(id);
+                }
             }
         }
 
@@ -359,15 +361,21 @@ impl SimpleQuoteStrategy {
             return None;
         }
 
-        let has_unknown_live_orders = self.active_orders.iter().any(|id| {
-            !self.pending_cancels.contains(id) && !self.active_quotes.contains_key(id)
-        });
+        let has_unknown_live_orders = self
+            .active_orders
+            .iter()
+            .any(|id| !self.pending_cancels.contains(id) && !self.active_quotes.contains_key(id));
         if has_unknown_live_orders {
             return None;
         }
 
         let (has_bid, has_ask) = self.active_orders.iter().fold((false, false), |acc, id| {
             let (mut bid_seen, mut ask_seen) = acc;
+            if self.scheduled_cancels.contains(id)
+                || (self.config.venue == Venue::Lighter && self.pending_cancels.contains(id))
+            {
+                return (bid_seen, ask_seen);
+            }
             if let Some(quote) = self.active_quotes.get(id) {
                 match quote.side {
                     Side::Bid => bid_seen = true,
@@ -412,11 +420,18 @@ impl SimpleQuoteStrategy {
             return None;
         }
 
+        let cancels = self
+            .active_orders
+            .iter()
+            .filter(|id| self.scheduled_cancels.contains(*id))
+            .cloned()
+            .collect::<Vec<_>>();
+
         Some(QuotePlan {
             reference_price: price,
             reference_best_bid: best_bid,
             reference_best_ask: best_ask,
-            cancels: Vec::new(),
+            cancels,
             intents,
             planned_at: now,
             reference_meta: self.latest_meta.clone(),
@@ -424,6 +439,10 @@ impl SimpleQuoteStrategy {
     }
 
     pub fn commit_plan(&mut self, plan: &QuotePlan) {
+        for id in &plan.cancels {
+            self.scheduled_cancels.remove(id);
+            self.pending_cancels.insert(id.clone());
+        }
         for intent in &plan.intents {
             if !self
                 .active_orders

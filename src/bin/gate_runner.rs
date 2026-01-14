@@ -57,7 +57,11 @@ fn lighter_mid_price() -> Option<f64> {
             poisoned.into_inner()
         }
     };
-    guard.lighter.orderbook.price.filter(|v| v.is_finite() && *v > 0.0)
+    guard
+        .lighter
+        .orderbook
+        .price
+        .filter(|v| v.is_finite() && *v > 0.0)
 }
 
 const REF_WARN: Duration = Duration::from_millis(20);
@@ -411,8 +415,9 @@ async fn main() -> Result<()> {
     let mut market_timer = interval(Duration::from_millis(20));
     // Skip missed ticks to avoid backlog delaying market updates
     market_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut quote_timer =
-        interval(Duration::from_millis(config.strategy.quote_interval_ms.max(1)));
+    let mut quote_timer = interval(Duration::from_millis(
+        config.strategy.quote_interval_ms.max(1),
+    ));
     // Skip missed ticks so quoting never starves the cancel hot path
     quote_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let warmup = Duration::from_secs(25);
@@ -593,6 +598,21 @@ async fn handle_market_update(
         return Ok(());
     }
 
+    if config_ref.strategy.venue == Venue::Lighter {
+        // On Lighter we batch cancels with the next quote submit via `sendTxBatch`
+        // (cancels then orders), to avoid a cancel→submit gap.
+        debug.info(|| {
+            format!(
+                "repricing {} on {} (ts={:?}); scheduling {} cancels for next batch",
+                config_ref.strategy.symbol,
+                reference.source,
+                reference.ts_ns,
+                cancels.len()
+            )
+        });
+        return Ok(());
+    }
+
     let send_start = send_start_opt.expect("send_start missing with cancels");
     let cancel_internal = send_start.saturating_duration_since(reference.received_at);
     let compute_delay = send_start.saturating_duration_since(lock_start);
@@ -755,6 +775,7 @@ async fn handle_quote_tick(
         };
 
         let intents = plan.intents.clone();
+        let cancels = plan.cancels.clone();
         let send_start = Instant::now();
         let sent_ts = SystemTime::now();
         let debounce_budget = Duration::from_millis(config_ref.strategy.quote_interval_ms.max(1));
@@ -788,6 +809,25 @@ async fn handle_quote_tick(
         }
 
         if let Some(logger) = logger.as_ref() {
+            if !cancels.is_empty() {
+                let reference = ReferenceEvent {
+                    price: plan.reference_price,
+                    best_bid: plan.reference_best_bid,
+                    best_ask: plan.reference_best_ask,
+                    ts_ns: ref_meta.as_ref().and_then(|m| m.ts_ns),
+                    source: ref_meta
+                        .as_ref()
+                        .map(|m| m.source.clone())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    received_at: ref_meta
+                        .as_ref()
+                        .map(|m| m.received_at)
+                        .unwrap_or(plan.planned_at),
+                };
+                for id in &cancels {
+                    logger.log_cancel(id, &reference, quote_internal, send_start, sent_ts);
+                }
+            }
             logger.log_quote_submission(
                 &intents,
                 ref_meta.as_ref(),
@@ -829,6 +869,7 @@ async fn handle_quote_tick(
         }
 
         let intents_for_send = intents.clone();
+        let cancels_for_send = cancels.clone();
         let ref_meta_for_send = ref_meta.clone();
         let config_clone = config.clone();
         let order_manager_clone = order_manager.clone();
@@ -836,7 +877,14 @@ async fn handle_quote_tick(
         let debug_clone = debug.clone();
         tokio::spawn(async move {
             let call_start = Instant::now();
-            match order_manager_clone.submit(intents_for_send.clone()).await {
+            let res = if cancels_for_send.is_empty() {
+                order_manager_clone.submit(intents_for_send.clone()).await
+            } else {
+                order_manager_clone
+                    .cancel_and_submit(cancels_for_send.clone(), intents_for_send.clone())
+                    .await
+            };
+            match res {
                 Ok(acks) => {
                     if latency_debug_enabled() {
                         let call_elapsed = call_start.elapsed();
@@ -861,9 +909,23 @@ async fn handle_quote_tick(
                 }
                 Err(err) => {
                     let err_msg = format!("{:#}", err);
-                    let intents_copy = intents_for_send.clone();
-                    debug_clone
-                        .error(move || format!("submit {:?} failed: {}", intents_copy, err_msg));
+                    if cancels_for_send.is_empty() {
+                        let intents_copy = intents_for_send.clone();
+                        debug_clone.error(move || {
+                            format!("submit {:?} failed: {}", intents_copy, err_msg)
+                        });
+                    } else {
+                        let intents_copy = intents_for_send.clone();
+                        let cancels_copy = cancels_for_send.clone();
+                        debug_clone.error(move || {
+                            format!(
+                                "cancel+submit cancels={} intents={:?} failed: {}",
+                                cancels_copy.len(),
+                                intents_copy,
+                                err_msg
+                            )
+                        });
+                    }
                 }
             }
         });
@@ -947,10 +1009,7 @@ async fn process_reports(
                             );
                         }
                         None => {
-                            println!(
-                                "[markout] id={} fill={:.6} mid_1s=NA",
-                                id.0, fill_price
-                            );
+                            println!("[markout] id={} fill={:.6} mid_1s=NA", id.0, fill_price);
                         }
                     }
                 });
@@ -1167,7 +1226,7 @@ async fn setup_gate_gateway(
 }
 
 async fn setup_lighter_gateway(
-    _config: &RunnerConfig,
+    config: &RunnerConfig,
     creds: &LighterCredentials,
     meta: &lighter_rest::LighterMarketMeta,
 ) -> Result<LighterGateway> {
@@ -1187,9 +1246,17 @@ async fn setup_lighter_gateway(
             }
             // If the user hardcoded the wrong arch name, try swapping it.
             if cfg!(target_arch = "aarch64") {
-                candidates.push(signer_path.replace("amd64", "arm64").replace(".dylib", ".so"));
+                candidates.push(
+                    signer_path
+                        .replace("amd64", "arm64")
+                        .replace(".dylib", ".so"),
+                );
             } else if cfg!(target_arch = "x86_64") {
-                candidates.push(signer_path.replace("arm64", "amd64").replace(".dylib", ".so"));
+                candidates.push(
+                    signer_path
+                        .replace("arm64", "amd64")
+                        .replace(".dylib", ".so"),
+                );
             }
         }
 
@@ -1212,6 +1279,7 @@ async fn setup_lighter_gateway(
         meta.market_id,
         meta.price_decimals,
         meta.size_decimals,
+        config.mode.debug_prints,
     )
     .await
     .map_err(Into::into)

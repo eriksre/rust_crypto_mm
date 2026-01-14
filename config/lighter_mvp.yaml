@@ -10,7 +10,7 @@ strategy:
   fee_bps: 1.0
   venue_buffer_bps: 1.0
   reprice_fraction: 0.7
-  quote_interval_ms: 200
+  quote_interval_ms: 2000
   max_age_ms: 5000
   cross_guard_ticks: 1
   cancellation_delay_ms: 130
