@@ -90,6 +90,21 @@ fn parse_lighter_market_id(map: &serde_json::Map<String, Value>) -> Option<u32> 
 }
 
 fn parse_lighter_position_sign(map: &serde_json::Map<String, Value>) -> Option<f64> {
+    if let Some(sign_val) = map.get("sign") {
+        let sign = sign_val
+            .as_i64()
+            .map(|v| v as f64)
+            .or_else(|| sign_val.as_f64())
+            .or_else(|| sign_val.as_str().and_then(|s| s.parse::<f64>().ok()));
+        if let Some(sign) = sign {
+            if sign < 0.0 {
+                return Some(-1.0);
+            }
+            if sign > 0.0 {
+                return Some(1.0);
+            }
+        }
+    }
     if let Some(flag) = map.get("is_long").and_then(|v| v.as_bool()) {
         return Some(if flag { 1.0 } else { -1.0 });
     }

@@ -24,12 +24,12 @@
 - File writes (logs, caches, exports): treat write/flush errors as errors (no `.ok()`-style swallowing).
 
 4) Retries/reconnects are not “free”
-- Prefer failing with a clear error over silently retrying forever.
+- Fail with a clear error 
+- Do NOT silently retry forever.
 - If retries/reconnects exist, make policy explicit:
-  - bounded attempts or an explicitly documented “run forever” mode
+  - bounded attempts
   - exponential backoff with cap (+ jitter if appropriate)
   - log: reason, attempt number, and next sleep duration
-  - reset backoff only on a clearly successful recovery
 - Do not implement “fallbacks” to alternate endpoints/formats unless the user explicitly asked for it.
 
 5) Configuration must be explicit and auditable
