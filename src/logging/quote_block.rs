@@ -674,7 +674,7 @@ fn filter_intents(
         bail!("invalid reference price {reference_price}");
     }
 
-    let mut running_contracts = current_contracts;
+    let base_contracts = current_contracts;
     let mut allowed = Vec::with_capacity(intents.len());
     let mut skipped = Vec::new();
 
@@ -706,12 +706,12 @@ fn filter_intents(
         if risk.max_position_notional > 0.0 {
             let contracts_as_f64 = contracts as f64;
             let projected_contracts = match intent.side {
-                Side::Bid => running_contracts + contracts_as_f64,
-                Side::Ask => running_contracts - contracts_as_f64,
+                Side::Bid => base_contracts + contracts_as_f64,
+                Side::Ask => base_contracts - contracts_as_f64,
             };
             let basis_price = price.max(reference_price.abs());
             let projected_notional = projected_contracts.abs() * contract_size * basis_price;
-            let current_notional = running_contracts.abs() * contract_size * basis_price;
+            let current_notional = base_contracts.abs() * contract_size * basis_price;
 
             let breaches_limit = projected_notional > risk.max_position_notional;
             let increases_exposure = projected_notional > current_notional + 1e-9;
@@ -726,7 +726,6 @@ fn filter_intents(
                 ));
                 continue;
             }
-            running_contracts = projected_contracts;
         }
 
         allowed.push(intent.clone());
