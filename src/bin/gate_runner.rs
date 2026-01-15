@@ -1,12 +1,12 @@
 #![cfg(feature = "gate_exec")]
 
-use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use parking_lot::Mutex;
+use reqwest::{Client, Url};
 use rust_test::base_classes::engine::{
     configure_demean_enabled, configure_feed_overrides, spawn_state_engine,
 };
@@ -20,11 +20,13 @@ use rust_test::exchanges::gate::rest;
 use rust_test::exchanges::lighter::rest as lighter_rest;
 use rust_test::execution::{
     ClientOrderId, DryRunGateway, ExecutionGateway, ExecutionReport, GateClient, GateCredentials,
-    GateWsConfig, GateWsGateway, InventoryReportOutcome, InventoryTracker, LighterCredentials,
-    LighterGateway, OrderAck, OrderManager, OrderStatus, QuoteIntent, Venue,
+    GateWsConfig, GateWsGateway, InventoryReportOutcome, InventoryTracker, LighterAuthClient,
+    LighterCredentials, LighterGateway, OrderAck, OrderManager, OrderStatus, QuoteIntent, Venue,
+    resolve_lighter_signer_path,
 };
 use rust_test::logging::quote::{DebugLogger, QuoteLogHandle, format_f64};
 use rust_test::strategy::{ReferenceMeta, SimpleQuoteStrategy, SizeSpec};
+use serde_json::Value;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::{self, MissedTickBehavior, interval, sleep};
 
@@ -64,6 +66,218 @@ fn lighter_mid_price() -> Option<f64> {
         return None;
     }
     Some(mid)
+}
+
+const LIGHTER_POSITION_ENDPOINTS: [&str; 5] = [
+    "api/v1/accountPositions",
+    "api/v1/accountPosition",
+    "api/v1/accountPositionInfo",
+    "api/v1/accountPositionsInfo",
+    "api/v1/positions",
+];
+
+fn parse_lighter_amount(value: &Value, size_scale: f64) -> Option<f64> {
+    match value {
+        Value::String(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let parsed = trimmed.parse::<f64>().ok()?;
+            if trimmed.contains('.') || trimmed.contains('e') || trimmed.contains('E') {
+                Some(parsed)
+            } else if size_scale > 0.0 {
+                Some(parsed / size_scale)
+            } else {
+                Some(parsed)
+            }
+        }
+        Value::Number(num) => {
+            let parsed = num.as_f64()?;
+            if (parsed.fract()).abs() < 1e-9 && size_scale > 0.0 {
+                Some(parsed / size_scale)
+            } else {
+                Some(parsed)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn parse_lighter_market_id(map: &serde_json::Map<String, Value>) -> Option<u32> {
+    let candidates = ["market_id", "marketId", "market_index", "marketIndex"];
+    for key in candidates {
+        if let Some(value) = map.get(key) {
+            if let Some(id) = value.as_u64() {
+                return Some(id as u32);
+            }
+            if let Some(raw) = value.as_str() {
+                if let Ok(id) = raw.parse::<u32>() {
+                    return Some(id);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn parse_lighter_position_sign(map: &serde_json::Map<String, Value>) -> Option<f64> {
+    if let Some(flag) = map.get("is_long").and_then(|v| v.as_bool()) {
+        return Some(if flag { 1.0 } else { -1.0 });
+    }
+    if let Some(flag) = map.get("is_short").and_then(|v| v.as_bool()) {
+        return Some(if flag { -1.0 } else { 1.0 });
+    }
+    let side_keys = ["side", "position_side", "positionSide", "direction"];
+    for key in side_keys {
+        if let Some(side) = map.get(key).and_then(|v| v.as_str()) {
+            let lower = side.to_ascii_lowercase();
+            if lower.contains("short") || lower.contains("sell") || lower.contains("ask") {
+                return Some(-1.0);
+            }
+            if lower.contains("long") || lower.contains("buy") || lower.contains("bid") {
+                return Some(1.0);
+            }
+        }
+    }
+    None
+}
+
+fn parse_lighter_position_entry(
+    map: &serde_json::Map<String, Value>,
+    market_id: u32,
+    size_scale: f64,
+    contract_size: f64,
+) -> Option<f64> {
+    if let Some(id) = parse_lighter_market_id(map) {
+        if id != market_id {
+            return None;
+        }
+    }
+
+    let size_keys = [
+        "position",
+        "size",
+        "base_amount",
+        "baseAmount",
+        "base_size",
+        "baseSize",
+        "net_base_amount",
+        "netBaseAmount",
+        "position_size",
+        "positionSize",
+        "qty",
+        "quantity",
+        "amount",
+    ];
+    let mut base = None;
+    for key in size_keys {
+        if let Some(value) = map.get(key) {
+            base = parse_lighter_amount(value, size_scale);
+            if base.is_some() {
+                break;
+            }
+        }
+    }
+    let mut base = base?;
+
+    if base >= 0.0 {
+        if let Some(sign) = parse_lighter_position_sign(map) {
+            base *= sign;
+        }
+    }
+
+    if contract_size > 0.0 {
+        Some(base / contract_size)
+    } else {
+        None
+    }
+}
+
+fn extract_lighter_position_contracts(
+    value: &Value,
+    market_id: u32,
+    size_scale: f64,
+    contract_size: f64,
+) -> Option<f64> {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                if let Some(found) =
+                    extract_lighter_position_contracts(item, market_id, size_scale, contract_size)
+                {
+                    return Some(found);
+                }
+            }
+        }
+        Value::Object(map) => {
+            if let Some(code) = map.get("code").and_then(|v| v.as_i64()) {
+                if code != 200 {
+                    return None;
+                }
+            }
+            if let Some(found) =
+                parse_lighter_position_entry(map, market_id, size_scale, contract_size)
+            {
+                return Some(found);
+            }
+            for entry in map.values() {
+                if let Some(found) =
+                    extract_lighter_position_contracts(entry, market_id, size_scale, contract_size)
+                {
+                    return Some(found);
+                }
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
+async fn fetch_lighter_position_contracts(
+    auth_client: &LighterAuthClient,
+    creds: &LighterCredentials,
+    meta: &lighter_rest::LighterMarketMeta,
+    http: &Client,
+    debug: &DebugLogger,
+    contract_size: f64,
+) -> Result<Option<f64>> {
+    let token = auth_client.auth_token().await?;
+    let api_base = Url::parse(&creds.base_url)?;
+    let size_scale = 10_f64.powi(meta.size_decimals as i32);
+    let query_pairs = vec![
+        ("account_index", creds.account_index.to_string()),
+        ("market_id", meta.market_id.to_string()),
+    ];
+
+    for endpoint in LIGHTER_POSITION_ENDPOINTS {
+        let url = api_base
+            .join(endpoint)
+            .with_context(|| format!("invalid Lighter endpoint {}", endpoint))?;
+        let resp = http
+            .get(url)
+            .query(&query_pairs)
+            .header("Authorization", token.clone())
+            .send()
+            .await
+            .with_context(|| format!("Lighter position request failed ({endpoint})"))?;
+        if !resp.status().is_success() {
+            continue;
+        }
+        let body = resp.text().await?;
+        let value: Value = serde_json::from_str(&body)
+            .with_context(|| format!("invalid Lighter position JSON ({endpoint})"))?;
+        if let Some(contracts) =
+            extract_lighter_position_contracts(&value, meta.market_id, size_scale, contract_size)
+        {
+            return Ok(Some(contracts));
+        }
+        if debug.is_enabled() {
+            debug.info(|| format!("Lighter position parse miss ({endpoint})"));
+        }
+    }
+
+    Ok(None)
 }
 
 const REF_WARN: Duration = Duration::from_millis(20);
@@ -225,8 +439,46 @@ async fn main() -> Result<()> {
         _ => None,
     };
 
-    let initial_contracts = match (venue, rest_client.as_ref()) {
-        (Venue::Gate, Some(client)) => match client
+    let mut lighter_auth_client: Option<LighterAuthClient> = None;
+    let mut lighter_http: Option<Client> = None;
+    let mut lighter_creds: Option<LighterCredentials> = None;
+
+    if let (Venue::Lighter, Some(LiveCreds::Lighter(creds)), Some(meta)) =
+        (venue, credentials.as_ref(), lighter_meta.as_ref())
+    {
+        let mut resolved = creds.clone();
+        match resolve_lighter_signer_path(&resolved.signer_lib) {
+            Ok(path) => resolved.signer_lib = path,
+            Err(err) => debug.error(|| format!("failed to resolve Lighter signer: {:#}", err)),
+        }
+        lighter_creds = Some(resolved.clone());
+        match LighterAuthClient::connect(resolved, config.mode.debug_prints).await {
+            Ok(client) => lighter_auth_client = Some(client),
+            Err(err) => debug.error(|| format!("failed to init Lighter auth client: {:#}", err)),
+        }
+        match Client::builder().timeout(Duration::from_secs(10)).build() {
+            Ok(client) => lighter_http = Some(client),
+            Err(err) => debug.error(|| format!("failed to init Lighter HTTP client: {:#}", err)),
+        }
+        if debug.is_enabled() {
+            debug.info(|| {
+                format!(
+                    "Lighter position lookup enabled (market_id={}, account_idx={})",
+                    meta.market_id, creds.account_index
+                )
+            });
+        }
+    }
+
+    let initial_contracts = match (
+        venue,
+        rest_client.as_ref(),
+        lighter_auth_client.as_ref(),
+        lighter_http.as_ref(),
+        lighter_creds.as_ref(),
+        lighter_meta.as_ref(),
+    ) {
+        (Venue::Gate, Some(client), _, _, _, _) => match client
             .fetch_position_contracts(&settle, &config.strategy.symbol)
             .await
         {
@@ -241,6 +493,43 @@ async fn main() -> Result<()> {
             }
             Err(err) => {
                 debug.error(|| format!("failed to fetch initial position: {:#}", err));
+                0.0
+            }
+        },
+        (
+            Venue::Lighter,
+            _,
+            Some(auth_client),
+            Some(http),
+            Some(creds),
+            Some(meta),
+        ) => match fetch_lighter_position_contracts(
+            auth_client,
+            creds,
+            meta,
+            http,
+            &debug,
+            contract_size,
+        )
+        .await
+        {
+            Ok(Some(contracts)) => {
+                let notional = format_inventory_notional(contracts, contract_size, None);
+                debug.info(|| {
+                    format!(
+                        "Initial Lighter position: {} contracts {}",
+                        format_f64(contracts),
+                        notional
+                    )
+                });
+                contracts
+            }
+            Ok(None) => {
+                debug.info(|| "Initial Lighter position: none reported".to_string());
+                0.0
+            }
+            Err(err) => {
+                debug.error(|| format!("failed to fetch Lighter position: {:#}", err));
                 0.0
             }
         },
@@ -327,7 +616,8 @@ async fn main() -> Result<()> {
                 Arc::new(setup_gate_gateway(config.as_ref(), contract_size, creds).await?)
             }
             (Venue::Lighter, LiveCreds::Lighter(creds), Some(meta)) => {
-                Arc::new(setup_lighter_gateway(config.as_ref(), creds, meta).await?)
+                let resolved = lighter_creds.as_ref().unwrap_or(creds);
+                Arc::new(setup_lighter_gateway(config.as_ref(), resolved, meta).await?)
             }
             _ => bail!("credential/venue mismatch"),
         }
@@ -341,6 +631,68 @@ async fn main() -> Result<()> {
         base_size,
     )));
     debug.info(|| format!("using base size {:.6}", base_size));
+
+    if let (Venue::Lighter, Some(auth_client), Some(http), Some(creds), Some(meta)) = (
+        venue,
+        lighter_auth_client.clone(),
+        lighter_http.clone(),
+        lighter_creds.clone(),
+        lighter_meta.clone(),
+    ) {
+        let inventory_clone = inventory.clone();
+        let strategy_clone = strategy.clone();
+        let debug_clone = debug.clone();
+        tokio::spawn(async move {
+            let mut ticker = time::interval(Duration::from_secs(20));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                match fetch_lighter_position_contracts(
+                    &auth_client,
+                    &creds,
+                    &meta,
+                    &http,
+                    &debug_clone,
+                    contract_size,
+                )
+                .await
+                {
+                    Ok(Some(contracts)) => {
+                        let change = {
+                            let mut guard = inventory_clone.lock();
+                            guard.replace_from_rest(contracts)
+                        };
+                        if let Some((prev, new)) = change {
+                            let latest_price = {
+                                let guard = strategy_clone.lock();
+                                guard.latest_price()
+                            };
+                            let notional =
+                                format_inventory_notional(new, contract_size, latest_price);
+                            debug_clone.info(|| {
+                                format!(
+                                    "inventory sync (Lighter) {:.4} -> {:.4} contracts {}",
+                                    prev, new, notional
+                                )
+                            });
+                        }
+                    }
+                    Ok(None) => {
+                        if debug_clone.is_enabled() {
+                            debug_clone.info(|| {
+                                "Lighter position refresh: no position reported".to_string()
+                            });
+                        }
+                    }
+                    Err(err) => {
+                        debug_clone.error(|| {
+                            format!("Lighter position refresh failed: {:#}", err)
+                        });
+                    }
+                }
+            }
+        });
+    }
 
     {
         let reports_strategy = strategy.clone();
@@ -363,6 +715,7 @@ async fn main() -> Result<()> {
                             reports_logger.clone(),
                             reports_debug.clone(),
                             reports_inventory.clone(),
+                            contract_size,
                         )
                         .await
                         {
@@ -743,16 +1096,16 @@ async fn handle_quote_tick(
             order_minima.as_ref(),
             &size_spec,
         )?;
-        if !filter.skipped.is_empty() {
-            for (id, reason) in &filter.skipped {
-                debug.info(|| format!("skipping intent {} -> {}", id, reason));
-            }
-        }
-        if filter.allowed.is_empty() {
-            return Ok(());
-        }
-        plan.intents = filter.allowed.clone();
-        let latency_debug = latency_debug_enabled();
+	        if !filter.skipped.is_empty() {
+	            for (id, reason) in &filter.skipped {
+	                debug.info(|| format!("skipping intent {} -> {}", id, reason));
+	            }
+	        }
+	        plan.intents = filter.allowed.clone();
+	        if plan.intents.is_empty() && plan.cancels.is_empty() {
+	            return Ok(());
+	        }
+	        let latency_debug = latency_debug_enabled();
 
         let ref_meta = if let Some(meta) = plan.reference_meta.as_ref() {
             debug.info(|| {
@@ -936,6 +1289,23 @@ async fn handle_quote_tick(
     Ok(())
 }
 
+fn format_inventory_notional(
+    net_contracts: f64,
+    contract_size: f64,
+    reference_price: Option<f64>,
+) -> String {
+    let base_qty = net_contracts * contract_size;
+    if let Some(px) = reference_price.filter(|v| v.is_finite() && *v > 0.0) {
+        let notional = base_qty.abs() * px;
+        format!(
+            "notional={:.6} base={:.6} ref_px={:.6}",
+            notional, base_qty, px
+        )
+    } else {
+        format!("notional=NA base={:.6} ref_px=NA", base_qty)
+    }
+}
+
 async fn process_reports(
     reports: Vec<ExecutionReport>,
     strategy: Arc<Mutex<SimpleQuoteStrategy>>,
@@ -943,6 +1313,7 @@ async fn process_reports(
     logger: Option<QuoteLogHandle>,
     debug: DebugLogger,
     inventory: Arc<Mutex<InventoryTracker>>,
+    contract_size: f64,
 ) -> Result<()> {
     if reports.is_empty() {
         return Ok(());
@@ -950,10 +1321,11 @@ async fn process_reports(
 
     let markout_enabled = config.mode.markout_prints;
     for report in &reports {
-        {
+        let latest_price = {
             let mut strategy = strategy.lock();
             strategy.handle_report(report);
-        }
+            strategy.latest_price()
+        };
         let outcome = {
             let mut guard = inventory.lock();
             guard.apply_report(report)
@@ -962,8 +1334,13 @@ async fn process_reports(
         match outcome {
             InventoryReportOutcome::Applied(update) => {
                 debug.info(|| {
+                    let notional = format_inventory_notional(
+                        update.new_contracts,
+                        contract_size,
+                        latest_price,
+                    );
                     format!(
-                        "inventory update ({:?}): {} {:?} status {:?} delta={:.4} contracts (fill_qty={:.4} @ {:?}) {prev:.4} -> {next:.4}",
+                        "inventory update ({:?}): {} {:?} status {:?} delta={:.4} contracts (fill_qty={:.4} @ {:?}) {prev:.4} -> {next:.4} {notional}",
                         update.source,
                         update.client_order_id,
                         update.side,
@@ -972,7 +1349,8 @@ async fn process_reports(
                         update.fill_qty,
                         update.fill_price,
                         prev = update.prev_contracts,
-                        next = update.new_contracts
+                        next = update.new_contracts,
+                        notional = notional
                     )
                 });
             }
@@ -983,12 +1361,15 @@ async fn process_reports(
                 status,
             } => {
                 debug.error(|| {
+                    let net_contracts = {
+                        let guard = inventory.lock();
+                        guard.net_contracts()
+                    };
+                    let notional =
+                        format_inventory_notional(net_contracts, contract_size, latest_price);
                     format!(
-                        "inventory warning: missing order {} for fill {:.4} (avg {:?}, status {:?})",
-                        order_id,
-                        filled_qty,
-                        avg_price,
-                        status
+                        "inventory warning: missing order {} for fill {:.4} (avg {:?}, status {:?}) {}",
+                        order_id, filled_qty, avg_price, status, notional
                     )
                 });
             }
@@ -1232,50 +1613,8 @@ async fn setup_lighter_gateway(
     creds: &LighterCredentials,
     meta: &lighter_rest::LighterMarketMeta,
 ) -> Result<LighterGateway> {
-    let mut signer_path = creds.signer_lib.clone();
-    if !Path::new(&signer_path).exists() {
-        let mut candidates: Vec<String> = vec![];
-
-        // If the configured path is missing, try a couple of predictable alternatives.
-        // IMPORTANT: do not try to load a macOS .dylib on Linux (it will error with "invalid ELF header").
-        if cfg!(target_os = "macos") {
-            if signer_path.ends_with(".so") {
-                candidates.push(signer_path.trim_end_matches(".so").to_string() + ".dylib");
-            }
-        } else {
-            if signer_path.ends_with(".dylib") {
-                candidates.push(signer_path.trim_end_matches(".dylib").to_string() + ".so");
-            }
-            // If the user hardcoded the wrong arch name, try swapping it.
-            if cfg!(target_arch = "aarch64") {
-                candidates.push(
-                    signer_path
-                        .replace("amd64", "arm64")
-                        .replace(".dylib", ".so"),
-                );
-            } else if cfg!(target_arch = "x86_64") {
-                candidates.push(
-                    signer_path
-                        .replace("arm64", "amd64")
-                        .replace(".dylib", ".so"),
-                );
-            }
-        }
-
-        if let Some(found) = candidates.iter().find(|p| Path::new(p.as_str()).exists()) {
-            signer_path = found.clone();
-        } else {
-            bail!(
-                "Lighter signer library not found at {} (candidates tried: {:?}); \
-                 please provide the correct native signer for this OS/arch: \
-                 signer-amd64.so (Linux x86_64), signer-arm64.so (Linux aarch64), signer-arm64.dylib (macOS)",
-                creds.signer_lib,
-                candidates
-            );
-        }
-    }
     let mut creds = creds.clone();
-    creds.signer_lib = signer_path;
+    creds.signer_lib = resolve_lighter_signer_path(&creds.signer_lib)?;
     LighterGateway::connect(
         creds,
         meta.market_id,

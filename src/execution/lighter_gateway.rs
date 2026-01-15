@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_longlong};
+use std::path::Path;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
@@ -605,6 +606,50 @@ fn ws_url_from_base(base_url: &str) -> Result<String> {
     }
     out.push_str("/stream");
     Ok(out)
+}
+
+pub fn resolve_lighter_signer_path(lib_path: &str) -> Result<String> {
+    if Path::new(lib_path).exists() {
+        return Ok(lib_path.to_string());
+    }
+    let mut candidates: Vec<String> = vec![];
+
+    // IMPORTANT: do not try to load a macOS .dylib on Linux (it will error with "invalid ELF header").
+    if cfg!(target_os = "macos") {
+        if lib_path.ends_with(".so") {
+            candidates.push(lib_path.trim_end_matches(".so").to_string() + ".dylib");
+        }
+    } else {
+        if lib_path.ends_with(".dylib") {
+            candidates.push(lib_path.trim_end_matches(".dylib").to_string() + ".so");
+        }
+        // If the user hardcoded the wrong arch name, try swapping it.
+        if cfg!(target_arch = "aarch64") {
+            candidates.push(
+                lib_path
+                    .replace("amd64", "arm64")
+                    .replace(".dylib", ".so"),
+            );
+        } else if cfg!(target_arch = "x86_64") {
+            candidates.push(
+                lib_path
+                    .replace("arm64", "amd64")
+                    .replace(".dylib", ".so"),
+            );
+        }
+    }
+
+    if let Some(found) = candidates.iter().find(|p| Path::new(p.as_str()).exists()) {
+        return Ok(found.clone());
+    }
+
+    bail!(
+        "Lighter signer library not found at {} (candidates tried: {:?}); \
+         please provide the correct native signer for this OS/arch: \
+         signer-amd64.so (Linux x86_64), signer-arm64.so (Linux aarch64), signer-arm64.dylib (macOS)",
+        lib_path,
+        candidates
+    );
 }
 
 fn check_client_with_backoff(
@@ -1603,6 +1648,41 @@ impl LighterResyncWorker {
     }
 }
 
+#[derive(Clone)]
+pub struct LighterAuthClient {
+    signer: SignerHandle,
+    creds: LighterCredentials,
+}
+
+impl LighterAuthClient {
+    pub async fn connect(creds: LighterCredentials, debug_prints: bool) -> Result<Self> {
+        let signer = SignerHandle::new(creds.signer_lib.clone(), debug_prints)?;
+        if debug_prints {
+            eprintln!(
+                "[lighter-sign] init signer base_url={} api_key_idx={} account_idx={}",
+                creds.base_url, creds.api_key_index, creds.account_index
+            );
+        }
+        signer
+            .init_client(
+                creds.base_url.clone(),
+                creds.api_key_hex.clone(),
+                creds.chain_id.unwrap_or(304),
+                creds.api_key_index,
+                creds.account_index,
+            )
+            .await?;
+        Ok(Self { signer, creds })
+    }
+
+    pub async fn auth_token(&self) -> Result<String> {
+        let deadline = current_unix_ts() + 10 * 60;
+        self.signer
+            .auth_token(deadline, self.creds.api_key_index, self.creds.account_index)
+            .await
+    }
+}
+
 pub struct LighterGateway {
     signer: SignerHandle,
     creds: LighterCredentials,
@@ -2387,4 +2467,12 @@ impl ExecutionGateway for LighterGateway {
             self.report_notify.notified().await;
         }
     }
+}
+
+pub async fn lighter_auth_token(
+    creds: &LighterCredentials,
+    debug_prints: bool,
+) -> Result<String> {
+    let client = LighterAuthClient::connect(creds.clone(), debug_prints).await?;
+    client.auth_token().await
 }

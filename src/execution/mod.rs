@@ -16,7 +16,10 @@ pub use gateway::ExecutionGateway;
 pub use inventory::{
     InventoryReportOutcome, InventoryTracker, InventoryUpdate, InventoryUpdateSource,
 };
-pub use lighter_gateway::{LighterCredentials, LighterGateway};
+pub use lighter_gateway::{
+    LighterAuthClient, LighterCredentials, LighterGateway, lighter_auth_token,
+    resolve_lighter_signer_path,
+};
 pub use order_manager::OrderManager;
 pub use types::{
     ClientOrderId, ExchangeOrderId, ExecutionReport, OrderAck, OrderStatus, QuoteIntent,

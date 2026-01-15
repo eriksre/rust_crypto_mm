@@ -7,6 +7,7 @@ use anyhow::{Result, anyhow};
 use serde::Deserialize;
 
 use crate::base_classes::reference::ReferenceEvent;
+use crate::base_classes::state::state;
 use crate::base_classes::types::Side;
 use crate::execution::{
     ClientOrderId, ExecutionReport, OrderStatus, QuoteIntent, TimeInForce, Venue,
@@ -232,6 +233,10 @@ impl SimpleQuoteStrategy {
         }
     }
 
+    pub fn latest_price(&self) -> Option<f64> {
+        self.latest_price
+    }
+
     pub fn on_market_update(&mut self, reference: &ReferenceEvent) -> Vec<ClientOrderId> {
         let price = reference.price;
         if !price.is_finite() || price <= 0.0 {
@@ -392,6 +397,13 @@ impl SimpleQuoteStrategy {
         }
 
         let (bid_px, ask_px, _) = self.compute_targets(price, best_bid, best_ask);
+        if self.config.venue == Venue::Lighter {
+            if let Some(lighter_mid) = Self::lighter_mid_from_state() {
+                if bid_px >= lighter_mid || ask_px <= lighter_mid {
+                    return None;
+                }
+            }
+        }
 
         let mut intents = Vec::new();
         if want_bid {
@@ -590,6 +602,24 @@ impl SimpleQuoteStrategy {
             ask = bid + tick;
         }
         (bid, ask)
+    }
+
+    fn lighter_mid_from_state() -> Option<f64> {
+        let guard = state().lock().ok()?;
+        let snap = guard.lighter.orderbook;
+        if let Some(price) = snap.price.filter(|p| p.is_finite() && *p > 0.0) {
+            return Some(price);
+        }
+        let bid = snap.bid_levels[0].map(|lvl| lvl.0);
+        let ask = snap.ask_levels[0].map(|lvl| lvl.0);
+        match (bid, ask) {
+            (Some(bid), Some(ask))
+                if bid.is_finite() && ask.is_finite() && bid > 0.0 && ask > 0.0 && ask >= bid =>
+            {
+                Some((bid + ask) / 2.0)
+            }
+            _ => None,
+        }
     }
 
     fn next_client_id(&mut self, side_tag: &str) -> ClientOrderId {
