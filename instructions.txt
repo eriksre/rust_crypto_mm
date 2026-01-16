@@ -67,3 +67,5 @@
 12) Do not use -- arguments
 
 13) When running python code, you must activate the .venv virtual environment
+
+14) Sometimes the user may suggest a suggestion that doesn't make sense. Treat this codebase like your own - it's your job to tell the user about any potential unexpected behaviour that the user might not have considered if their suggestion is obviously dumb. 

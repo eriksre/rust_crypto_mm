@@ -15,6 +15,7 @@ use rust_test::base_classes::state::state;
 use rust_test::base_classes::types::Side;
 use rust_test::config::runner::{
     RiskConfig, RunnerConfig, load_gate_credentials, load_lighter_credentials, load_runner_config,
+    log_runner_config,
 };
 use rust_test::exchanges::gate::rest;
 use rust_test::exchanges::lighter::rest as lighter_rest;
@@ -26,6 +27,7 @@ use rust_test::execution::{
 };
 use rust_test::logging::quote::{DebugLogger, QuoteLogHandle, format_f64};
 use rust_test::strategy::{ReferenceMeta, SimpleQuoteStrategy, SizeSpec};
+use rust_test::utils::parsing::log_parse_drop;
 use serde_json::{Value, json};
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::{connect_async_with_config, tungstenite::Message};
@@ -80,8 +82,11 @@ fn parse_lighter_market_id(map: &serde_json::Map<String, Value>) -> Option<u32> 
                 return Some(id as u32);
             }
             if let Some(raw) = value.as_str() {
-                if let Ok(id) = raw.parse::<u32>() {
-                    return Some(id);
+                match raw.parse::<u32>() {
+                    Ok(id) => return Some(id),
+                    Err(err) => {
+                        log_parse_drop("gate_runner", "market_id", &err, raw);
+                    }
                 }
             }
         }
@@ -95,7 +100,24 @@ fn parse_lighter_position_sign(map: &serde_json::Map<String, Value>) -> Option<f
             .as_i64()
             .map(|v| v as f64)
             .or_else(|| sign_val.as_f64())
-            .or_else(|| sign_val.as_str().and_then(|s| s.parse::<f64>().ok()));
+            .or_else(|| {
+                sign_val.as_str().and_then(|s| match s.parse::<f64>() {
+                    Ok(v) if v.is_finite() => Some(v),
+                    Ok(_) => {
+                        log_parse_drop(
+                            "gate_runner",
+                            "non_finite_sign",
+                            &"non-finite sign",
+                            s,
+                        );
+                        None
+                    }
+                    Err(err) => {
+                        log_parse_drop("gate_runner", "sign", &err, s);
+                        None
+                    }
+                })
+            });
         if let Some(sign) = sign {
             if sign < 0.0 {
                 return Some(-1.0);
@@ -159,7 +181,22 @@ fn parse_lighter_position_entry(
         if let Some(value) = map.get(key) {
             base = value
                 .as_str()
-                .and_then(|s| s.parse::<f64>().ok())
+                .and_then(|s| match s.parse::<f64>() {
+                    Ok(v) if v.is_finite() => Some(v),
+                    Ok(_) => {
+                        log_parse_drop(
+                            "gate_runner",
+                            "non_finite_position",
+                            &"non-finite position size",
+                            s,
+                        );
+                        None
+                    }
+                    Err(err) => {
+                        log_parse_drop("gate_runner", "position", &err, s);
+                        None
+                    }
+                })
                 .or_else(|| value.as_f64());
             if base.is_some() {
                 break;
@@ -338,7 +375,7 @@ async fn spawn_lighter_position_ws(
                     let is_positions_update = msg_type == "update/account_all_positions"
                         || channel.starts_with("account_all_positions");
                     if is_positions_update && debug.is_enabled() {
-                        debug.info(|| format!("Lighter position ws raw: {}", value));
+                        // Raw payloads are noisy; keep this muted unless needed for debugging.
                     }
                     if is_positions_update {
                         if let Some(positions) = value.get("positions") {
@@ -401,15 +438,27 @@ struct CancelMessage {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    dotenvy::dotenv().ok();
+    if let Err(err) = dotenvy::dotenv() {
+        eprintln!("WARN: failed to load .env: {}", err);
+    }
     let cli = Cli::parse();
     let mut config = load_runner_config(&cli.config)?;
+    log_runner_config(&config);
     let venue = config.strategy.venue;
     configure_feed_overrides(config.feeds);
     configure_demean_enabled(config.mode.demean_prices);
     let debug = DebugLogger::new(config.mode.debug_prints);
 
-    let settle = config.settle.clone().unwrap_or_else(|| "usdt".to_string());
+    let settle = if venue == Venue::Gate {
+        Some(
+            config
+                .settle
+                .clone()
+                .ok_or_else(|| anyhow!("missing settle currency in config for Gate venue"))?,
+        )
+    } else {
+        None
+    };
 
     let mut lighter_meta: Option<lighter_rest::LighterMarketMeta> = None;
     let mut lighter_mins: Option<OrderMinima> = None;
@@ -567,9 +616,9 @@ async fn main() -> Result<()> {
         }
     }
 
-    let initial_contracts = match (venue, rest_client.as_ref()) {
-        (Venue::Gate, Some(client)) => match client
-            .fetch_position_contracts(&settle, &config.strategy.symbol)
+    let initial_contracts = match (venue, rest_client.as_ref(), settle.as_deref()) {
+        (Venue::Gate, Some(client), Some(settle)) => match client
+            .fetch_position_contracts(settle, &config.strategy.symbol)
             .await
         {
             Ok(Some(contracts)) => {
@@ -597,9 +646,11 @@ async fn main() -> Result<()> {
         debug.info(|| "Initial Lighter position: awaiting account_all_positions".to_string());
     }
 
-    if let (Venue::Gate, Some(client)) = (venue, rest_client.clone()) {
+    if let (Venue::Gate, Some(client), Some(settle)) =
+        (venue, rest_client.clone(), settle.clone())
+    {
         let inventory_clone = inventory.clone();
-        let settle_clone = settle.clone();
+        let settle_clone = settle;
         let symbol_clone = config.strategy.symbol.clone();
         let debug_clone = debug.clone();
         tokio::spawn(async move {
@@ -669,7 +720,10 @@ async fn main() -> Result<()> {
             .expect("credentials must exist for live mode");
         match (venue, creds, lighter_meta.as_ref()) {
             (Venue::Gate, LiveCreds::Gate(creds), _) => {
-                Arc::new(setup_gate_gateway(config.as_ref(), contract_size, creds).await?)
+                let settle = settle
+                    .as_deref()
+                    .expect("settle required for Gate venue");
+                Arc::new(setup_gate_gateway(config.as_ref(), contract_size, creds, settle).await?)
             }
             (Venue::Lighter, LiveCreds::Lighter(creds), Some(meta)) => {
                 let resolved = lighter_creds.as_ref().unwrap_or(creds);
@@ -1606,12 +1660,13 @@ async fn setup_gate_gateway(
     config: &RunnerConfig,
     contract_size: f64,
     creds: &GateCredentials,
+    settle: &str,
 ) -> Result<GateWsGateway> {
     let ws_config = GateWsConfig {
         api_key: creds.api_key.clone(),
         api_secret: creds.api_secret.clone(),
         symbol: config.strategy.symbol.clone(),
-        settle: config.settle.clone(),
+        settle: Some(settle.to_string()),
         ws_url: None,
         contract_size: Some(contract_size),
     };

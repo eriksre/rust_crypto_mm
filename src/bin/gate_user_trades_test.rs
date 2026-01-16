@@ -18,6 +18,7 @@ mod runner {
     use hmac::{Hmac, Mac};
     use rust_test::exchanges::endpoints::GateioWs;
     use rust_test::exchanges::gate::canonical_contract_symbol;
+    use rust_test::utils::parsing::log_parse_drop;
     use serde::Deserialize;
     use serde_json::{Value, json};
     use serde_yaml::Value as YamlValue;
@@ -136,8 +137,20 @@ mod runner {
         message: Option<String>,
     }
 
+    fn read_env(name: &str) -> Option<String> {
+        match env::var(name) {
+            Ok(val) => Some(val),
+            Err(err) => {
+                eprintln!("WARN: env {name} not set: {err}");
+                None
+            }
+        }
+    }
+
     pub(crate) async fn run() -> Result<()> {
-        dotenvy::dotenv().ok();
+        if let Err(err) = dotenvy::dotenv() {
+            eprintln!("WARN: failed to load .env: {}", err);
+        }
 
         let cli = Cli::parse();
 
@@ -155,35 +168,35 @@ mod runner {
 
         let api_key = cli
             .api_key
-            .or_else(|| env::var("GATE_API_KEY").ok())
+            .or_else(|| read_env("GATE_API_KEY"))
             .or_else(|| credentials.as_ref().and_then(|c| c.api_key.clone()))
             .or_else(|| {
                 credentials
                     .as_ref()
                     .and_then(|c| c.api_key_env.as_deref())
-                    .and_then(|name| env::var(name).ok())
+                    .and_then(|name| read_env(name))
             })
             .context("missing Gate API key (set --api-key, GATE_API_KEY, or populate config credentials)")?;
         let api_secret = cli
             .api_secret
-            .or_else(|| env::var("GATE_API_SECRET").ok())
+            .or_else(|| read_env("GATE_API_SECRET"))
             .or_else(|| credentials.as_ref().and_then(|c| c.api_secret.clone()))
             .or_else(|| {
                 credentials
                     .as_ref()
                     .and_then(|c| c.api_secret_env.as_deref())
-                    .and_then(|name| env::var(name).ok())
+                    .and_then(|name| read_env(name))
             })
             .context("missing Gate API secret (set --api-secret, GATE_API_SECRET, or populate config credentials)")?;
         let mut user_id = cli
             .user_id
-            .or_else(|| env::var("GATE_UID").ok())
+            .or_else(|| read_env("GATE_UID"))
             .or_else(|| credentials.as_ref().and_then(|c| c.user_id.clone()))
             .or_else(|| {
                 credentials
                     .as_ref()
                     .and_then(|c| c.user_id_env.as_deref())
-                    .and_then(|name| env::var(name).ok())
+                    .and_then(|name| read_env(name))
             });
 
         let base_ws = if let Some(url) = cli.ws_url {
@@ -223,7 +236,9 @@ mod runner {
             .with_context(|| format!("failed to connect to {ws_url}"))?;
 
         // Send initial ping to avoid idle disconnects on some gateways.
-        ws.send(Message::Ping(Vec::new())).await.ok();
+        ws.send(Message::Ping(Vec::new()))
+            .await
+            .context("failed to send initial ping")?;
 
         // Perform API login so subsequent subscriptions can access private channels.
         let login_req_id = make_request_id("login");
@@ -243,43 +258,58 @@ mod runner {
         while let Some(msg) = ws.next().await {
             match msg {
                 Ok(Message::Text(text)) => {
-                    if let Ok(resp) = serde_json::from_str::<WsResponse>(&text) {
-                        if resp.request_id.as_deref() == Some(&login_req_id) {
-                            if cli.pretty {
-                                match serde_json::from_str::<Value>(&text) {
-                                    Ok(json) => {
-                                        println!(
-                                            "Login response:\n{}",
-                                            serde_json::to_string_pretty(&json)
-                                                .unwrap_or_else(|_| text.clone())
-                                        );
-                                    }
-                                    Err(_) => println!("Login response: {text}"),
-                                }
-                            } else {
-                                println!("Login response: {text}");
-                            }
-                            if resp.is_success() {
-                                if user_id.is_none() {
-                                    if let Some(data) = resp.data.as_ref() {
-                                        if let Some(result) = data.result.as_ref() {
-                                            user_id = extract_user_id(result);
+                    match serde_json::from_str::<WsResponse>(&text) {
+                        Ok(resp) => {
+                            if resp.request_id.as_deref() == Some(&login_req_id) {
+                                if cli.pretty {
+                                    match serde_json::from_str::<Value>(&text) {
+                                        Ok(json) => {
+                                            println!(
+                                                "Login response:\n{}",
+                                                serde_json::to_string_pretty(&json)
+                                                    .unwrap_or_else(|_| text.clone())
+                                            );
+                                        }
+                                        Err(err) => {
+                                            log_parse_drop(
+                                                "gate_user_trades_test",
+                                                "login_response",
+                                                &err,
+                                                &text,
+                                            );
+                                            println!("Login response: {text}");
                                         }
                                     }
+                                } else {
+                                    println!("Login response: {text}");
                                 }
-                                login_ok = true;
-                                println!("Login acknowledged.");
-                                break;
+                                if resp.is_success() {
+                                    if user_id.is_none() {
+                                        if let Some(data) = resp.data.as_ref() {
+                                            if let Some(result) = data.result.as_ref() {
+                                                user_id = extract_user_id(result);
+                                            }
+                                        }
+                                    }
+                                    login_ok = true;
+                                    println!("Login acknowledged.");
+                                    break;
+                                }
+                                let err = resp
+                                    .error_message()
+                                    .unwrap_or_else(|| "unknown login failure".to_string());
+                                return Err(anyhow!("login failed: {err}"));
                             }
-                            let err = resp
-                                .error_message()
-                                .unwrap_or_else(|| "unknown login failure".to_string());
-                            return Err(anyhow!("login failed: {err}"));
+                        }
+                        Err(err) => {
+                            log_parse_drop("gate_user_trades_test", "login_response", &err, &text);
                         }
                     }
                 }
                 Ok(Message::Ping(data)) => {
-                    ws.send(Message::Pong(data)).await.ok();
+                    ws.send(Message::Pong(data))
+                        .await
+                        .context("failed to send pong during login")?;
                 }
                 Ok(Message::Pong(_)) => {}
                 Ok(_) => {}
@@ -379,7 +409,9 @@ mod runner {
                         }
                         Some(Ok(Message::Frame(_))) => {}
                         Some(Ok(Message::Ping(data))) => {
-                            ws.send(Message::Pong(data)).await.ok();
+                            ws.send(Message::Pong(data))
+                                .await
+                                .context("failed to send pong")?;
                         }
                         Some(Ok(Message::Pong(_))) => {}
                         Some(Ok(Message::Close(frame))) => {

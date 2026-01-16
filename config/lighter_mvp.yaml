@@ -13,7 +13,7 @@ strategy:
   quote_interval_ms: 2000
   max_age_ms: 5000
   cross_guard_ticks: 1
-  cancellation_delay_ms: 130
+  cancellation_delay_ms: 200
 pricing_model:
   enabled: true
   time_basis: wire

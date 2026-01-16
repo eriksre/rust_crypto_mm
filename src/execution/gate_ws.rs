@@ -21,7 +21,9 @@ use crate::base_classes::types::Side;
 use crate::exchanges::gate::rest;
 use crate::exchanges::{endpoints::GateioWs, gate::signing};
 use crate::utils::math::format_price;
-use crate::utils::parsing::{extract_user_id, value_to_f64, value_to_string, value_to_u64};
+use crate::utils::parsing::{
+    extract_user_id, log_parse_drop, value_to_f64, value_to_string, value_to_u64,
+};
 use crate::utils::time::{current_unix_ms, current_unix_ts};
 
 use super::gateway::ExecutionGateway;
@@ -38,12 +40,6 @@ pub struct GateWsConfig {
     pub settle: Option<String>,
     pub ws_url: Option<String>,
     pub contract_size: Option<f64>,
-}
-
-impl GateWsConfig {
-    fn settle(&self) -> &str {
-        self.settle.as_deref().unwrap_or("usdt")
-    }
 }
 
 /// Primary websocket execution gateway used by the order manager.
@@ -76,7 +72,7 @@ impl GateWsGateway {
                 .ok_or_else(|| anyhow!("contract metadata missing quanto_multiplier"))?
         };
 
-        let settle = settle.unwrap_or_else(|| "usdt".to_string());
+        let settle = settle.ok_or_else(|| anyhow!("missing settle currency for Gate WS"))?;
         let ws_url = ws_url.unwrap_or_else(GateWsGateway::base_ws_url);
 
         let worker_config = WorkerConfig {
@@ -432,7 +428,9 @@ impl GateWsWorker {
         let (mut ws, _) = connect_async_with_config(&url, None, true)
             .await
             .with_context(|| format!("failed to connect to {}", url))?;
-        ws.send(Message::Ping(Vec::new())).await.ok();
+        ws.send(Message::Ping(Vec::new()))
+            .await
+            .context("failed to send initial ping")?;
 
         self.perform_login(&mut ws).await?;
         if let Err(err) = self.subscribe_user_trades(&mut ws).await {
@@ -459,9 +457,14 @@ impl GateWsWorker {
                     if resp.request_id.as_deref() == Some(&req_id) {
                         if resp.is_success() {
                             if self.user_id.is_none() {
-                                if let Ok(raw) = serde_json::from_str::<Value>(&text) {
-                                    if let Some(uid) = extract_user_id(&raw) {
-                                        self.user_id = Some(uid);
+                                match serde_json::from_str::<Value>(&text) {
+                                    Ok(raw) => {
+                                        if let Some(uid) = extract_user_id(&raw) {
+                                            self.user_id = Some(uid);
+                                        }
+                                    }
+                                    Err(err) => {
+                                        log_parse_drop("gate_ws", "login_user_id", &err, &text);
                                     }
                                 }
                             }
@@ -474,7 +477,9 @@ impl GateWsWorker {
                     }
                 }
                 Some(Ok(Message::Ping(data))) => {
-                    ws.send(Message::Pong(data)).await.ok();
+                    ws.send(Message::Pong(data))
+                        .await
+                        .context("failed to send pong during login")?;
                 }
                 Some(Ok(_)) => {}
                 Some(Err(err)) => return Err(anyhow!("login stream error: {err}")),
@@ -611,7 +616,10 @@ impl GateWsWorker {
 
                 let resp: WsResponse = match serde_json::from_str(&text) {
                     Ok(r) => r,
-                    Err(_) => return Ok(()),
+                    Err(err) => {
+                        log_parse_drop("gate_ws", "ws_response", &err, &text);
+                        return Ok(());
+                    }
                 };
 
                 if resp.ack.unwrap_or(false) {
@@ -658,7 +666,9 @@ impl GateWsWorker {
                 }
             }
             Message::Ping(data) => {
-                sink.send(Message::Pong(data)).await.ok();
+                sink.send(Message::Pong(data))
+                    .await
+                    .context("failed to send pong")?;
             }
             Message::Pong(_) | Message::Binary(_) => {}
             Message::Close(_) => {
@@ -705,7 +715,7 @@ impl GateWsWorker {
             let succeeded = entry
                 .get("succeeded")
                 .and_then(|v| v.as_bool())
-                .unwrap_or(true);
+                .ok_or_else(|| anyhow!("missing succeeded flag in order response"))?;
 
             if !succeeded {
                 let message = entry
@@ -853,16 +863,32 @@ impl GateWsWorker {
         intent: &QuoteIntent,
         exchange_id: Option<String>,
     ) -> ExecutionReport {
-        let size_contracts = entry.get("size").and_then(value_to_f64).unwrap_or(0.0);
-        let left_contracts = entry.get("left").and_then(value_to_f64).unwrap_or(0.0);
+        let entry_sample = entry.to_string();
+        let size_contracts = entry
+            .get("size")
+            .and_then(value_to_f64)
+            .unwrap_or_else(|| {
+                log_parse_drop("gate_ws", "missing_size", &"missing size", &entry_sample);
+                0.0
+            });
+        let left_contracts = entry
+            .get("left")
+            .and_then(value_to_f64)
+            .unwrap_or_else(|| {
+                log_parse_drop("gate_ws", "missing_left", &"missing left", &entry_sample);
+                0.0
+            });
         let filled_contracts = (size_contracts - left_contracts).max(0.0);
         let filled_qty = filled_contracts * self.cfg.contract_size;
 
-        let mut status = match entry
+        let status_raw = entry
             .get("status")
             .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-        {
+            .unwrap_or_else(|| {
+                log_parse_drop("gate_ws", "missing_status", &"missing status", &entry_sample);
+                "unknown"
+            });
+        let mut status = match status_raw {
             "finished" => match entry
                 .get("finish_as")
                 .and_then(|v| v.as_str())
@@ -893,7 +919,17 @@ impl GateWsWorker {
         let avg_fill_price = entry
             .get("fill_price")
             .and_then(|v| v.as_str())
-            .and_then(|s| s.parse::<f64>().ok())
+            .and_then(|s| match s.parse::<f64>() {
+                Ok(v) if v.is_finite() => Some(v),
+                Ok(_) => {
+                    log_parse_drop("gate_ws", "non_finite_fill_price", &"non-finite fill_price", s);
+                    None
+                }
+                Err(err) => {
+                    log_parse_drop("gate_ws", "fill_price", &err, s);
+                    None
+                }
+            })
             .filter(|p| *p > 0.0);
 
         let ts = entry

@@ -6,6 +6,7 @@ use serde::Deserialize;
 use crate::base_classes::order_book::ArrayOrderBook;
 use crate::base_classes::orderbook_trait::OrderBookOps;
 use crate::base_classes::types::*;
+use crate::utils::parsing::log_parse_drop;
 use crate::utils::time::ms_to_ns;
 
 #[cfg(feature = "bitget_book")]
@@ -44,7 +45,13 @@ where
 {
     Ok(match serde_json::Value::deserialize(deserializer)? {
         serde_json::Value::Number(n) => n.as_u64(),
-        serde_json::Value::String(s) => s.parse::<u64>().ok(),
+        serde_json::Value::String(s) => match s.parse::<u64>() {
+            Ok(v) => Some(v),
+            Err(err) => {
+                log_parse_drop("bitget_orderbook", "ts", &err, &s);
+                None
+            }
+        },
         serde_json::Value::Null => None,
         _ => None,
     })
@@ -100,8 +107,40 @@ impl<const N: usize> BitgetBook<N> {
         levels
             .iter()
             .filter_map(|entry| {
-                let px = entry.get(0)?.parse::<f64>().ok()?;
-                let qty = entry.get(1)?.parse::<f64>().ok()?;
+                let px_str = entry.get(0)?;
+                let qty_str = entry.get(1)?;
+                let px = match px_str.parse::<f64>() {
+                    Ok(v) if v.is_finite() => v,
+                    Ok(_) => {
+                        log_parse_drop(
+                            "bitget_orderbook",
+                            "non_finite_px",
+                            &"non-finite px",
+                            px_str,
+                        );
+                        return None;
+                    }
+                    Err(err) => {
+                        log_parse_drop("bitget_orderbook", "px", &err, px_str);
+                        return None;
+                    }
+                };
+                let qty = match qty_str.parse::<f64>() {
+                    Ok(v) if v.is_finite() => v,
+                    Ok(_) => {
+                        log_parse_drop(
+                            "bitget_orderbook",
+                            "non_finite_qty",
+                            &"non-finite qty",
+                            qty_str,
+                        );
+                        return None;
+                    }
+                    Err(err) => {
+                        log_parse_drop("bitget_orderbook", "qty", &err, qty_str);
+                        return None;
+                    }
+                };
                 Some(self.conv(px, qty))
             })
             .collect()
@@ -125,9 +164,21 @@ impl<const N: usize> BitgetBook<N> {
             return false;
         }
         let d = &msg.data[0];
-        let seq_val = Self::extract_seq(d).unwrap_or(0);
+        let seq_val = match Self::extract_seq(d) {
+            Some(seq) => seq,
+            None => {
+                log_parse_drop("bitget_orderbook", "missing_seq", &"missing seq", "");
+                return false;
+            }
+        };
         let prev_seq = Self::extract_prev_seq(d);
-        let ts_ms = d.ts.or(msg.ts).unwrap_or(0);
+        let ts_ms = match d.ts.or(msg.ts) {
+            Some(ts) => ts,
+            None => {
+                log_parse_drop("bitget_orderbook", "missing_ts", &"missing ts", "");
+                return false;
+            }
+        };
         let ts: Ts = ms_to_ns(ts_ms);
         self.last_system_ts_ns = msg.ts.map(ms_to_ns);
         let seq: Seq = seq_val as Seq;
@@ -175,7 +226,13 @@ impl<const N: usize> BitgetBook<N> {
             return false;
         }
         let d = &msg.data[0];
-        let seq_val = Self::extract_seq(d).unwrap_or(0);
+        let seq_val = match Self::extract_seq(d) {
+            Some(seq) => seq,
+            None => {
+                log_parse_drop("bitget_orderbook", "missing_seq", &"missing seq", "");
+                return false;
+            }
+        };
         if seq_val == 0 || seq_val <= self.last_seq {
             return false;
         }
@@ -184,7 +241,13 @@ impl<const N: usize> BitgetBook<N> {
                 return false;
             }
         }
-        let ts_ms = d.ts.or(msg.ts).unwrap_or(0);
+        let ts_ms = match d.ts.or(msg.ts) {
+            Some(ts) => ts,
+            None => {
+                log_parse_drop("bitget_orderbook", "missing_ts", &"missing ts", "");
+                return false;
+            }
+        };
         let ts: Ts = ms_to_ns(ts_ms);
         self.last_bbo_system_ts_ns = msg.ts.map(ms_to_ns);
         let seq: Seq = seq_val as Seq;
@@ -192,13 +255,77 @@ impl<const N: usize> BitgetBook<N> {
         let mut bids_iter = d.bids.iter();
         let mut asks_iter = d.asks.iter();
         let best_bid = bids_iter.next().and_then(|lvl| {
-            let px = lvl.get(0)?.parse::<f64>().ok()?;
-            let qty = lvl.get(1)?.parse::<f64>().ok()?;
+            let px_str = lvl.get(0)?;
+            let qty_str = lvl.get(1)?;
+            let px = match px_str.parse::<f64>() {
+                Ok(v) if v.is_finite() => v,
+                Ok(_) => {
+                    log_parse_drop(
+                        "bitget_orderbook",
+                        "non_finite_px",
+                        &"non-finite px",
+                        px_str,
+                    );
+                    return None;
+                }
+                Err(err) => {
+                    log_parse_drop("bitget_orderbook", "px", &err, px_str);
+                    return None;
+                }
+            };
+            let qty = match qty_str.parse::<f64>() {
+                Ok(v) if v.is_finite() => v,
+                Ok(_) => {
+                    log_parse_drop(
+                        "bitget_orderbook",
+                        "non_finite_qty",
+                        &"non-finite qty",
+                        qty_str,
+                    );
+                    return None;
+                }
+                Err(err) => {
+                    log_parse_drop("bitget_orderbook", "qty", &err, qty_str);
+                    return None;
+                }
+            };
             Some(self.conv(px, qty))
         });
         let best_ask = asks_iter.next().and_then(|lvl| {
-            let px = lvl.get(0)?.parse::<f64>().ok()?;
-            let qty = lvl.get(1)?.parse::<f64>().ok()?;
+            let px_str = lvl.get(0)?;
+            let qty_str = lvl.get(1)?;
+            let px = match px_str.parse::<f64>() {
+                Ok(v) if v.is_finite() => v,
+                Ok(_) => {
+                    log_parse_drop(
+                        "bitget_orderbook",
+                        "non_finite_px",
+                        &"non-finite px",
+                        px_str,
+                    );
+                    return None;
+                }
+                Err(err) => {
+                    log_parse_drop("bitget_orderbook", "px", &err, px_str);
+                    return None;
+                }
+            };
+            let qty = match qty_str.parse::<f64>() {
+                Ok(v) if v.is_finite() => v,
+                Ok(_) => {
+                    log_parse_drop(
+                        "bitget_orderbook",
+                        "non_finite_qty",
+                        &"non-finite qty",
+                        qty_str,
+                    );
+                    return None;
+                }
+                Err(err) => {
+                    log_parse_drop("bitget_orderbook", "qty", &err, qty_str);
+                    return None;
+                }
+            };
             Some(self.conv(px, qty))
         });
 

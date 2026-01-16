@@ -80,9 +80,12 @@ fn apply_demean(price: f64, adj: Option<&ExchangeAdjustment>) -> f64 {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    dotenvy::dotenv().ok();
+    if let Err(err) = dotenvy::dotenv() {
+        eprintln!("WARN: failed to load .env: {}", err);
+    }
     let cli = Cli::parse();
     let mut config = load_runner_config(&cli.config)?;
+    crate::config::runner::log_runner_config(&config);
     crate::base_classes::engine::configure_feed_overrides(config.feeds);
     crate::base_classes::engine::configure_demean_enabled(config.mode.demean_prices);
     let debug = DebugLogger::new(config.mode.debug_prints);
@@ -144,7 +147,10 @@ async fn main() -> Result<()> {
         None
     };
 
-    let settle = config.settle.clone().unwrap_or_else(|| "usdt".to_string());
+    let settle = config
+        .settle
+        .clone()
+        .ok_or_else(|| anyhow!("missing settle currency in config"))?;
 
     let credentials = if config.mode.dry_run {
         None

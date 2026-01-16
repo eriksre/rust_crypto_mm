@@ -6,7 +6,7 @@ use rust_test::base_classes::engine::{
     configure_demean_enabled, configure_feed_overrides, spawn_state_engine,
 };
 use rust_test::base_classes::reference::ReferenceEvent;
-use rust_test::config::runner::load_runner_config;
+use rust_test::config::runner::{load_runner_config, log_runner_config};
 
 #[derive(Debug, Parser)]
 #[command(name = "price-predictor", about = "Print model-predicted price/bid/ask/spread")]
@@ -18,9 +18,12 @@ struct Cli {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    dotenvy::dotenv().ok();
+    if let Err(err) = dotenvy::dotenv() {
+        eprintln!("WARN: failed to load .env: {}", err);
+    }
     let cli = Cli::parse();
     let config = load_runner_config(&cli.config)?;
+    log_runner_config(&config);
 
     configure_feed_overrides(config.feeds);
     configure_demean_enabled(config.mode.demean_prices);
@@ -61,6 +64,10 @@ async fn main() -> Result<()> {
 fn print_event(event: &ReferenceEvent) {
     let (spread_abs, spread_bps) = spread_metrics(event.price, event.best_bid, event.best_ask);
 
+    let ts_display = event
+        .ts_ns
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "missing".to_string());
     println!(
         "{:<20} {:>16} {:>16} {:>16} {:>16} {:>10} {:>20}",
         event.source,
@@ -69,7 +76,7 @@ fn print_event(event: &ReferenceEvent) {
         fmt_opt_px(event.best_ask),
         fmt_opt_px(spread_abs),
         fmt_opt_bps(spread_bps),
-        event.ts_ns.unwrap_or(0)
+        ts_display
     );
 }
 

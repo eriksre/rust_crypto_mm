@@ -2,6 +2,7 @@
 
 use crate::base_classes::types::Ts;
 use crate::base_classes::ws::ExchangeHandler;
+use crate::utils::parsing::{log_parse_drop, log_parse_drop_bytes};
 #[cfg(feature = "binance_book")]
 use crate::exchanges::binance::parsed::DepthUpdate;
 use serde_json::{self, Value};
@@ -109,43 +110,84 @@ impl BinanceFrame {
     pub fn preparse_text(&mut self, text: &str) {
         let flags = binance_preparse_flags(text);
         if flags.needs_json && self.json_cache.is_none() {
-            self.json_cache = serde_json::from_str::<Value>(text).ok();
+            self.json_cache = match serde_json::from_str::<Value>(text) {
+                Ok(val) => Some(val),
+                Err(err) => {
+                    log_parse_drop("binance_parser", "json", &err, text);
+                    None
+                }
+            };
         }
         #[cfg(feature = "binance_book")]
         {
             if flags.needs_depth && self.depth_cache.is_none() {
-                self.depth_cache = serde_json::from_str::<DepthUpdate>(text).ok();
+                self.depth_cache = match serde_json::from_str::<DepthUpdate>(text) {
+                    Ok(val) => Some(val),
+                    Err(err) => {
+                        log_parse_drop("binance_parser", "depth_update", &err, text);
+                        None
+                    }
+                };
             }
         }
     }
 
     pub fn preparse_binary(&mut self) {
-        if let Ok(text) = core::str::from_utf8(&self.raw) {
-            let flags = binance_preparse_flags(text);
-            if !flags.needs_json && !flags.needs_depth {
+        let text = match core::str::from_utf8(&self.raw) {
+            Ok(text) => text,
+            Err(err) => {
+                log_parse_drop_bytes("binance_parser", "utf8", &err, &self.raw);
                 return;
             }
-            if flags.needs_json && self.json_cache.is_none() {
-                self.json_cache = serde_json::from_slice(&self.raw).ok();
-            }
-            #[cfg(feature = "binance_book")]
-            {
-                if flags.needs_depth && self.depth_cache.is_none() {
-                    self.depth_cache = serde_json::from_slice(&self.raw).ok();
+        };
+        let flags = binance_preparse_flags(text);
+        if !flags.needs_json && !flags.needs_depth {
+            return;
+        }
+        if flags.needs_json && self.json_cache.is_none() {
+            self.json_cache = match serde_json::from_slice(&self.raw) {
+                Ok(val) => Some(val),
+                Err(err) => {
+                    log_parse_drop_bytes("binance_parser", "json", &err, &self.raw);
+                    None
                 }
+            };
+        }
+        #[cfg(feature = "binance_book")]
+        {
+            if flags.needs_depth && self.depth_cache.is_none() {
+                self.depth_cache = match serde_json::from_slice(&self.raw) {
+                    Ok(val) => Some(val),
+                    Err(err) => {
+                        log_parse_drop_bytes("binance_parser", "depth_update", &err, &self.raw);
+                        None
+                    }
+                };
             }
         }
     }
 
     #[inline(always)]
     pub fn text(&self) -> Option<&str> {
-        core::str::from_utf8(&self.raw).ok()
+        match core::str::from_utf8(&self.raw) {
+            Ok(text) => Some(text),
+            Err(err) => {
+                log_parse_drop_bytes("binance_parser", "utf8", &err, &self.raw);
+                None
+            }
+        }
     }
 
     #[inline(always)]
     pub fn json(&mut self) -> Option<&Value> {
         if self.json_cache.is_none() {
-            self.json_cache = serde_json::from_slice(&self.raw).ok();
+            self.json_cache = match serde_json::from_slice(&self.raw) {
+                Ok(val) => Some(val),
+                Err(err) => {
+                    log_parse_drop_bytes("binance_parser", "json", &err, &self.raw);
+                    None
+                }
+            };
         }
         self.json_cache.as_ref()
     }
@@ -154,7 +196,13 @@ impl BinanceFrame {
     #[cfg(feature = "binance_book")]
     pub fn depth_update(&mut self) -> Option<&DepthUpdate> {
         if self.depth_cache.is_none() {
-            self.depth_cache = serde_json::from_slice(&self.raw).ok();
+            self.depth_cache = match serde_json::from_slice(&self.raw) {
+                Ok(val) => Some(val),
+                Err(err) => {
+                    log_parse_drop_bytes("binance_parser", "depth_update", &err, &self.raw);
+                    None
+                }
+            };
         }
         self.depth_cache.as_ref()
     }

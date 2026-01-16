@@ -1,12 +1,69 @@
 #[cfg(any(feature = "parsing", feature = "parse_binance", feature = "gate_exec"))]
 use serde_json::Value;
+#[cfg(any(feature = "parsing", feature = "parse_binance", feature = "gate_exec"))]
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(any(feature = "parsing", feature = "parse_binance", feature = "gate_exec"))]
+const PARSE_LOG_EVERY: u64 = 100;
+
+#[cfg(any(feature = "parsing", feature = "parse_binance", feature = "gate_exec"))]
+static PARSE_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(any(feature = "parsing", feature = "parse_binance", feature = "gate_exec"))]
+fn truncate_payload(payload: &str, max_chars: usize) -> String {
+    if payload.len() <= max_chars {
+        return payload.to_string();
+    }
+    payload.chars().take(max_chars).collect()
+}
+
+#[cfg(any(feature = "parsing", feature = "parse_binance", feature = "gate_exec"))]
+pub fn log_parse_drop(source: &str, event: &str, err: &dyn std::fmt::Display, payload: &str) {
+    let count = PARSE_FAIL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if count == 1 || count % PARSE_LOG_EVERY == 0 {
+        let sample = truncate_payload(payload, 256);
+        eprintln!(
+            "WARN: parse drop source={} event={} count={} err={} sample=\"{}\"",
+            source, event, count, err, sample
+        );
+    }
+}
+
+#[cfg(any(feature = "parsing", feature = "parse_binance", feature = "gate_exec"))]
+pub fn log_parse_drop_bytes(
+    source: &str,
+    event: &str,
+    err: &dyn std::fmt::Display,
+    payload: &[u8],
+) {
+    let sample = String::from_utf8_lossy(payload);
+    log_parse_drop(source, event, err, &sample);
+}
 
 /// Converts a JSON Value to f64, handling both Number and String types.
 #[cfg(any(feature = "parsing", feature = "parse_binance", feature = "gate_exec"))]
 pub fn value_to_f64(value: &Value) -> Option<f64> {
     match value {
-        Value::Number(n) => n.as_f64(),
-        Value::String(s) => s.parse::<f64>().ok(),
+        Value::Number(n) => {
+            let v = n.as_f64()?;
+            if v.is_finite() {
+                Some(v)
+            } else {
+                log_parse_drop("value_to_f64", "non_finite", &"non-finite number", &v.to_string());
+                None
+            }
+        }
+        Value::String(s) => match s.parse::<f64>() {
+            Ok(v) if v.is_finite() => Some(v),
+            Ok(_) => {
+                log_parse_drop("value_to_f64", "non_finite", &"non-finite number", s);
+                None
+            }
+            Err(err) => {
+                log_parse_drop("value_to_f64", "parse", &err, s);
+                None
+            }
+        },
         _ => None,
     }
 }
@@ -15,8 +72,20 @@ pub fn value_to_f64(value: &Value) -> Option<f64> {
 #[cfg(any(feature = "parsing", feature = "parse_binance", feature = "gate_exec"))]
 pub fn value_to_u64(value: &Value) -> Option<u64> {
     match value {
-        Value::Number(n) => n.as_u64(),
-        Value::String(s) => s.parse::<u64>().ok(),
+        Value::Number(n) => {
+            let v = n.as_u64();
+            if v.is_none() {
+                log_parse_drop("value_to_u64", "non_u64", &"non-u64 number", &n.to_string());
+            }
+            v
+        }
+        Value::String(s) => match s.parse::<u64>() {
+            Ok(v) => Some(v),
+            Err(err) => {
+                log_parse_drop("value_to_u64", "parse", &err, s);
+                None
+            }
+        },
         _ => None,
     }
 }
@@ -25,8 +94,20 @@ pub fn value_to_u64(value: &Value) -> Option<u64> {
 #[cfg(any(feature = "parsing", feature = "parse_binance", feature = "gate_exec"))]
 pub fn value_to_i64(value: &Value) -> Option<i64> {
     match value {
-        Value::Number(n) => n.as_i64(),
-        Value::String(s) => s.parse::<i64>().ok(),
+        Value::Number(n) => {
+            let v = n.as_i64();
+            if v.is_none() {
+                log_parse_drop("value_to_i64", "non_i64", &"non-i64 number", &n.to_string());
+            }
+            v
+        }
+        Value::String(s) => match s.parse::<i64>() {
+            Ok(v) => Some(v),
+            Err(err) => {
+                log_parse_drop("value_to_i64", "parse", &err, s);
+                None
+            }
+        },
         _ => None,
     }
 }

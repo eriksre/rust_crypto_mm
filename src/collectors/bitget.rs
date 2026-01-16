@@ -6,6 +6,7 @@ use crate::collectors::helpers::{
     extract_first_price_in_array, find_first_string_number, find_json_string,
 };
 use crate::exchanges::bitget::orderbook::{BitgetBook, BitgetMsg};
+use crate::utils::parsing::log_parse_drop;
 use crate::utils::time::ms_to_ns;
 use serde_json::{self, Value};
 
@@ -43,16 +44,51 @@ pub const QTY_SCALE: f64 = BitgetBook::<1>::QTY_SCALE;
 
 fn as_f64(value: &Value) -> Option<f64> {
     match value {
-        Value::String(s) => s.parse::<f64>().ok(),
-        Value::Number(n) => n.as_f64(),
+        Value::String(s) => match s.parse::<f64>() {
+            Ok(v) if v.is_finite() => Some(v),
+            Ok(_) => {
+                log_parse_drop("bitget_collector", "non_finite", &"non-finite number", s);
+                None
+            }
+            Err(err) => {
+                log_parse_drop("bitget_collector", "f64", &err, s);
+                None
+            }
+        },
+        Value::Number(n) => {
+            let v = n.as_f64()?;
+            if v.is_finite() {
+                Some(v)
+            } else {
+                log_parse_drop(
+                    "bitget_collector",
+                    "non_finite",
+                    &"non-finite number",
+                    &n.to_string(),
+                );
+                None
+            }
+        }
         _ => None,
     }
 }
 
 fn as_u64(value: &Value) -> Option<u64> {
     match value {
-        Value::Number(n) => n.as_u64(),
-        Value::String(s) => s.parse::<u64>().ok(),
+        Value::Number(n) => {
+            let v = n.as_u64();
+            if v.is_none() {
+                log_parse_drop("bitget_collector", "u64", &"non-u64 number", &n.to_string());
+            }
+            v
+        }
+        Value::String(s) => match s.parse::<u64>() {
+            Ok(v) => Some(v),
+            Err(err) => {
+                log_parse_drop("bitget_collector", "u64", &err, s);
+                None
+            }
+        },
         _ => None,
     }
 }
@@ -80,7 +116,13 @@ fn first_u64(value: &Value, keys: &[&str]) -> Option<u64> {
 }
 
 pub fn update_tickers(s: &str, store: &mut TickerStore) -> Option<(String, TickerSnapshot)> {
-    let raw: Value = serde_json::from_str(s).ok()?;
+    let raw: Value = match serde_json::from_str(s) {
+        Ok(val) => val,
+        Err(err) => {
+            log_parse_drop("bitget_collector", "json", &err, s);
+            return None;
+        }
+    };
     let channel = raw
         .get("channel")
         .or_else(|| raw.get("arg").and_then(|arg| arg.get("channel")))
@@ -148,7 +190,12 @@ pub fn update_tickers(s: &str, store: &mut TickerStore) -> Option<(String, Ticke
     if let Some(seq) = first_u64(data, &["seq", "seqId", "u"]) {
         snapshot.ticker.seq = seq;
     } else {
-        snapshot.ticker.seq = 0;
+        log_parse_drop(
+            "bitget_collector",
+            "missing_seq",
+            &"missing seq",
+            s,
+        );
     }
 
     if let Some(ts_ms) = first_u64(data, &["ts"]).or_else(|| raw.get("ts").and_then(as_u64)) {

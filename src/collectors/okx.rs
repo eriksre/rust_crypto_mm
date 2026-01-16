@@ -3,6 +3,7 @@ use crate::base_classes::tickers::{TickerSnapshot, TickerStore};
 use crate::base_classes::trades::{FixedTrades, Trade};
 use crate::base_classes::types::{Price, Qty, Seq};
 use crate::exchanges::okx::{OkxBook, OkxFrame};
+use crate::utils::parsing::log_parse_drop;
 use crate::utils::time::ms_to_ns;
 use serde_json::{self, Value};
 
@@ -43,6 +44,7 @@ pub fn update_tickers(
     store: &mut TickerStore,
     qty_multiplier: f64,
 ) -> Option<(String, TickerSnapshot)> {
+    let sample = frame.text().unwrap_or("").to_string();
     let raw = frame.json()?;
     let channel = raw
         .get("arg")
@@ -91,7 +93,12 @@ pub fn update_tickers(
     if let Some(seq) = value_to_u64(payload, &["seqId", "seq"]) {
         snapshot.ticker.seq = seq;
     } else {
-        snapshot.ticker.seq = 0;
+        log_parse_drop(
+            "okx_collector",
+            "missing_seq",
+            &"missing seq",
+            sample.as_str(),
+        );
     }
 
     if let Some(ts_ms) = value_to_u64(payload, &["ts"]) {
@@ -103,9 +110,18 @@ pub fn update_tickers(
 }
 
 pub fn update_bbo_store(frame: &mut OkxFrame, store: &mut BboStore, qty_multiplier: f64) -> bool {
+    let sample = frame.text().unwrap_or("").to_string();
     let raw = match frame.json() {
         Some(v) => v,
-        None => return false,
+        None => {
+            log_parse_drop(
+                "okx_collector",
+                "missing_json",
+                &"missing json",
+                sample.as_str(),
+            );
+            return false;
+        }
     };
     let channel = raw
         .get("arg")
@@ -118,6 +134,15 @@ pub fn update_bbo_store(frame: &mut OkxFrame, store: &mut BboStore, qty_multipli
         .get("arg")
         .and_then(|arg| arg.get("instId"))
         .and_then(|v| v.as_str())
+        .or_else(|| {
+            log_parse_drop(
+                "okx_collector",
+                "missing_inst_id",
+                &"missing instId",
+                sample.as_str(),
+            );
+            None
+        })
         .unwrap_or_default();
     let data = raw
         .get("data")
@@ -151,7 +176,19 @@ pub fn update_bbo_store(frame: &mut OkxFrame, store: &mut BboStore, qty_multipli
     let ts_ms = payload
         .get("ts")
         .and_then(|v| value_to_u64_raw(v))
-        .unwrap_or(0);
+        .or_else(|| {
+            log_parse_drop(
+                "okx_collector",
+                "missing_ts",
+                &"missing ts",
+                sample.as_str(),
+            );
+            None
+        });
+    let ts_ms = match ts_ms {
+        Some(ts) => ts,
+        None => return false,
+    };
     let ts_ns = ms_to_ns(ts_ms);
     store.update(
         inst_id,
@@ -170,9 +207,18 @@ pub fn update_trades<const N: usize>(
     trades: &mut FixedTrades<N>,
     qty_multiplier: f64,
 ) -> usize {
+    let sample = frame.text().unwrap_or("").to_string();
     let raw = match frame.json() {
         Some(v) => v,
-        None => return 0,
+        None => {
+            log_parse_drop(
+                "okx_collector",
+                "missing_json",
+                &"missing json",
+                sample.as_str(),
+            );
+            return 0;
+        }
     };
     let channel = raw
         .get("arg")
@@ -192,19 +238,51 @@ pub fn update_trades<const N: usize>(
         let price = entry
             .get("px")
             .and_then(|v| v.as_str())
-            .and_then(|s| s.parse::<f64>().ok())
+            .and_then(|s| match s.parse::<f64>() {
+                Ok(v) if v.is_finite() => Some(v),
+                Ok(_) => {
+                    log_parse_drop("okx_collector", "non_finite_px", &"non-finite px", s);
+                    None
+                }
+                Err(err) => {
+                    log_parse_drop("okx_collector", "px", &err, s);
+                    None
+                }
+            })
             .or_else(|| entry.get("px").and_then(|v| v.as_f64()));
         let size = entry
             .get("sz")
             .and_then(|v| v.as_str())
-            .and_then(|s| s.parse::<f64>().ok())
+            .and_then(|s| match s.parse::<f64>() {
+                Ok(v) if v.is_finite() => Some(v),
+                Ok(_) => {
+                    log_parse_drop("okx_collector", "non_finite_qty", &"non-finite qty", s);
+                    None
+                }
+                Err(err) => {
+                    log_parse_drop("okx_collector", "qty", &err, s);
+                    None
+                }
+            })
             .or_else(|| entry.get("sz").and_then(|v| v.as_f64()));
         let ts_ms = entry
             .get("ts")
             .and_then(|v| v.as_str())
-            .and_then(|s| s.parse::<u64>().ok())
+            .and_then(|s| match s.parse::<u64>() {
+                Ok(v) => Some(v),
+                Err(err) => {
+                    log_parse_drop("okx_collector", "ts", &err, s);
+                    None
+                }
+            })
             .or_else(|| entry.get("ts").and_then(|v| v.as_u64()));
         if price.is_none() || size.is_none() || ts_ms.is_none() {
+            log_parse_drop(
+                "okx_collector",
+                "missing_trade_fields",
+                &"missing trade fields",
+                sample.as_str(),
+            );
             continue;
         }
         let px_i = (price.unwrap() * PRICE_SCALE).round() as Price;
@@ -213,14 +291,42 @@ pub fn update_trades<const N: usize>(
         let seq = entry
             .get("tradeId")
             .and_then(|v| v.as_str())
-            .and_then(|s| s.parse::<u64>().ok())
+            .and_then(|s| match s.parse::<u64>() {
+                Ok(v) => Some(v),
+                Err(err) => {
+                    log_parse_drop("okx_collector", "seq", &err, s);
+                    None
+                }
+            })
             .or_else(|| entry.get("tradeId").and_then(|v| v.as_u64()))
-            .unwrap_or(0) as Seq;
-        let side = entry.get("side").and_then(|v| v.as_str()).unwrap_or("buy");
-        let is_buyer_maker = side.eq_ignore_ascii_case("sell");
-        let trade = Trade::new(px_i, qty_i, ts_ns, seq, is_buyer_maker, None);
-        trades.push(trade);
-        inserted += 1;
+            .or_else(|| {
+                log_parse_drop(
+                    "okx_collector",
+                    "missing_seq",
+                    &"missing seq",
+                    sample.as_str(),
+                );
+                None
+            })
+            .map(|v| v as Seq);
+        let side = entry
+            .get("side")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                log_parse_drop(
+                    "okx_collector",
+                    "missing_side",
+                    &"missing side",
+                    sample.as_str(),
+                );
+                None
+            });
+        if let (Some(seq), Some(side)) = (seq, side) {
+            let is_buyer_maker = side.eq_ignore_ascii_case("sell");
+            let trade = Trade::new(px_i, qty_i, ts_ns, seq, is_buyer_maker, None);
+            trades.push(trade);
+            inserted += 1;
+        }
     }
     inserted
 }
@@ -238,8 +344,31 @@ fn value_to_f64(value: &Value, keys: &[&str]) -> Option<f64> {
 
 fn value_to_f64_raw(value: &Value) -> Option<f64> {
     match value {
-        Value::Number(n) => n.as_f64(),
-        Value::String(s) => s.parse::<f64>().ok(),
+        Value::Number(n) => {
+            let v = n.as_f64()?;
+            if v.is_finite() {
+                Some(v)
+            } else {
+                log_parse_drop(
+                    "okx_collector",
+                    "non_finite",
+                    &"non-finite number",
+                    &n.to_string(),
+                );
+                None
+            }
+        }
+        Value::String(s) => match s.parse::<f64>() {
+            Ok(v) if v.is_finite() => Some(v),
+            Ok(_) => {
+                log_parse_drop("okx_collector", "non_finite", &"non-finite number", s);
+                None
+            }
+            Err(err) => {
+                log_parse_drop("okx_collector", "f64", &err, s);
+                None
+            }
+        },
         _ => None,
     }
 }
@@ -257,15 +386,49 @@ fn value_to_u64(value: &Value, keys: &[&str]) -> Option<u64> {
 
 fn value_to_u64_raw(value: &Value) -> Option<u64> {
     match value {
-        Value::Number(n) => n.as_u64(),
-        Value::String(s) => s.parse::<u64>().ok(),
+        Value::Number(n) => {
+            let v = n.as_u64();
+            if v.is_none() {
+                log_parse_drop("okx_collector", "u64", &"non-u64 number", &n.to_string());
+            }
+            v
+        }
+        Value::String(s) => match s.parse::<u64>() {
+            Ok(v) => Some(v),
+            Err(err) => {
+                log_parse_drop("okx_collector", "u64", &err, s);
+                None
+            }
+        },
         _ => None,
     }
 }
 
 fn level_to_pair(value: &Value) -> Option<(f64, f64)> {
     let arr = value.as_array()?;
-    let px = arr.get(0)?.as_str()?.parse::<f64>().ok()?;
-    let qty = arr.get(1)?.as_str()?.parse::<f64>().ok()?;
+    let px_str = arr.get(0)?.as_str()?;
+    let qty_str = arr.get(1)?.as_str()?;
+    let px = match px_str.parse::<f64>() {
+        Ok(v) if v.is_finite() => v,
+        Ok(_) => {
+            log_parse_drop("okx_collector", "non_finite_px", &"non-finite px", px_str);
+            return None;
+        }
+        Err(err) => {
+            log_parse_drop("okx_collector", "px", &err, px_str);
+            return None;
+        }
+    };
+    let qty = match qty_str.parse::<f64>() {
+        Ok(v) if v.is_finite() => v,
+        Ok(_) => {
+            log_parse_drop("okx_collector", "non_finite_qty", &"non-finite qty", qty_str);
+            return None;
+        }
+        Err(err) => {
+            log_parse_drop("okx_collector", "qty", &err, qty_str);
+            return None;
+        }
+    };
     Some((px, qty))
 }

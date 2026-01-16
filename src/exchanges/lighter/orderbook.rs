@@ -1,6 +1,7 @@
 use crate::base_classes::order_book::ArrayOrderBook;
 use crate::base_classes::orderbook_trait::OrderBookOps;
 use crate::base_classes::types::*;
+use crate::utils::parsing::log_parse_drop;
 use crate::utils::time::ms_to_ns;
 use serde::Deserialize;
 
@@ -75,7 +76,13 @@ impl<const N: usize> LighterBook<N> {
         channel
             .rsplit_once(':')
             .or_else(|| channel.rsplit_once('/'))
-            .and_then(|(_, id)| id.parse::<u32>().ok())
+            .and_then(|(_, id)| match id.parse::<u32>() {
+                Ok(v) => Some(v),
+                Err(err) => {
+                    log_parse_drop("lighter_orderbook", "market_id", &err, id);
+                    None
+                }
+            })
     }
 
     #[inline(always)]
@@ -90,8 +97,38 @@ impl<const N: usize> LighterBook<N> {
     fn parse_levels(&self, lvls: &[LighterLevel]) -> Vec<(Price, Qty)> {
         lvls.iter()
             .filter_map(|lvl| {
-                let px = lvl.price.parse::<f64>().ok()?;
-                let qty = lvl.size.parse::<f64>().ok()?;
+                let px = match lvl.price.parse::<f64>() {
+                    Ok(v) if v.is_finite() => v,
+                    Ok(_) => {
+                        log_parse_drop(
+                            "lighter_orderbook",
+                            "non_finite_px",
+                            &"non-finite px",
+                            &lvl.price,
+                        );
+                        return None;
+                    }
+                    Err(err) => {
+                        log_parse_drop("lighter_orderbook", "px", &err, &lvl.price);
+                        return None;
+                    }
+                };
+                let qty = match lvl.size.parse::<f64>() {
+                    Ok(v) if v.is_finite() => v,
+                    Ok(_) => {
+                        log_parse_drop(
+                            "lighter_orderbook",
+                            "non_finite_qty",
+                            &"non-finite qty",
+                            &lvl.size,
+                        );
+                        return None;
+                    }
+                    Err(err) => {
+                        log_parse_drop("lighter_orderbook", "qty", &err, &lvl.size);
+                        return None;
+                    }
+                };
                 Some(self.conv(px, qty))
             })
             .collect()
@@ -116,7 +153,13 @@ impl<const N: usize> LighterBook<N> {
             || msg_type.starts_with("subscribed")
             || msg_type.starts_with("snapshot");
 
-        let seq = payload.offset.or(msg.offset).or(payload.nonce).unwrap_or(0);
+        let seq = match payload.offset.or(msg.offset).or(payload.nonce) {
+            Some(seq) => seq,
+            None => {
+                log_parse_drop("lighter_orderbook", "missing_seq", &"missing seq", "");
+                0
+            }
+        };
         if !is_snapshot {
             if let Some(prev) = self.last_offset {
                 if seq != 0 && seq <= prev {
@@ -127,12 +170,24 @@ impl<const N: usize> LighterBook<N> {
             self.last_offset = None;
         }
 
-        let ts = payload
-            .timestamp
-            .or(msg.timestamp)
-            .map(Self::ts_from_exchange)
-            .unwrap_or(self.last_ts);
-        let seq_for_book = if seq == 0 { ts.max(1) } else { seq };
+        let ts = match payload.timestamp.or(msg.timestamp) {
+            Some(ts) => Self::ts_from_exchange(ts),
+            None => {
+                log_parse_drop("lighter_orderbook", "missing_ts", &"missing ts", "");
+                self.last_ts
+            }
+        };
+        let seq_for_book = if seq == 0 {
+            log_parse_drop(
+                "lighter_orderbook",
+                "seq_fallback",
+                &"seq missing; using ts",
+                "",
+            );
+            ts.max(1)
+        } else {
+            seq
+        };
 
         let bids = self.parse_levels(&payload.bids);
         let asks = self.parse_levels(&payload.asks);

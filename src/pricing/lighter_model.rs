@@ -555,7 +555,13 @@ impl LighterPricingModel {
             TimeBasis::Engine => engine_ts.or(wire_ts),
         }?;
 
-        let t_ns_i64 = i64::try_from(t_ns).ok()?;
+        let t_ns_i64 = match i64::try_from(t_ns) {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!("ERROR: timestamp overflow in pricing model: {}", t_ns);
+                return None;
+            }
+        };
         let t_sec = self.to_seconds(t_ns_i64);
 
         let (mid, micro, vwap5) = self.book_prices(obs);

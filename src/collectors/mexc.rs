@@ -3,6 +3,7 @@ use crate::base_classes::tickers::{TickerSnapshot, TickerStore};
 use crate::base_classes::trades::{FixedTrades, Trade};
 use crate::base_classes::types::{Price, Qty, Seq};
 use crate::exchanges::mexc::{MexcBook, MexcFrame};
+use crate::utils::parsing::log_parse_drop;
 use crate::utils::time::ms_to_ns;
 use serde_json::Value;
 
@@ -28,16 +29,51 @@ pub fn events_for<const N: usize>(
 
 fn as_f64(value: &Value) -> Option<f64> {
     match value {
-        Value::Number(n) => n.as_f64(),
-        Value::String(s) => s.parse::<f64>().ok(),
+        Value::Number(n) => {
+            let v = n.as_f64()?;
+            if v.is_finite() {
+                Some(v)
+            } else {
+                log_parse_drop(
+                    "mexc_collector",
+                    "non_finite",
+                    &"non-finite number",
+                    &n.to_string(),
+                );
+                None
+            }
+        }
+        Value::String(s) => match s.parse::<f64>() {
+            Ok(v) if v.is_finite() => Some(v),
+            Ok(_) => {
+                log_parse_drop("mexc_collector", "non_finite", &"non-finite number", s);
+                None
+            }
+            Err(err) => {
+                log_parse_drop("mexc_collector", "f64", &err, s);
+                None
+            }
+        },
         _ => None,
     }
 }
 
 fn as_u64(value: &Value) -> Option<u64> {
     match value {
-        Value::Number(n) => n.as_u64(),
-        Value::String(s) => s.parse::<u64>().ok(),
+        Value::Number(n) => {
+            let v = n.as_u64();
+            if v.is_none() {
+                log_parse_drop("mexc_collector", "u64", &"non-u64 number", &n.to_string());
+            }
+            v
+        }
+        Value::String(s) => match s.parse::<u64>() {
+            Ok(v) => Some(v),
+            Err(err) => {
+                log_parse_drop("mexc_collector", "u64", &err, s);
+                None
+            }
+        },
         _ => None,
     }
 }
@@ -87,9 +123,18 @@ pub fn update_trades<const N: usize>(
     if !matches!(frame.channel(), Some("push.deal")) {
         return 0;
     }
+    let sample = frame.text().unwrap_or("").to_string();
     let raw = match frame.json() {
         Some(v) => v,
-        None => return 0,
+        None => {
+            log_parse_drop(
+                "mexc_collector",
+                "missing_json",
+                &"missing json",
+                sample.as_str(),
+            );
+            return 0;
+        }
     };
     let entries = match raw.get("data").and_then(|v| v.as_array()) {
         Some(arr) => arr,
@@ -98,26 +143,69 @@ pub fn update_trades<const N: usize>(
     let system_ts_ns = raw.get("ts").and_then(as_u64).map(ms_to_ns);
     let mut inserted = 0usize;
     for trade in entries {
-        let price = trade.get("p").and_then(as_f64);
-        let qty = trade.get("v").and_then(as_f64);
-        let side = trade.get("T").and_then(as_u64);
+        let price = trade.get("p").and_then(as_f64).or_else(|| {
+            log_parse_drop(
+                "mexc_collector",
+                "missing_price",
+                &"missing price",
+                sample.as_str(),
+            );
+            None
+        });
+        let qty = trade.get("v").and_then(as_f64).or_else(|| {
+            log_parse_drop(
+                "mexc_collector",
+                "missing_qty",
+                &"missing qty",
+                sample.as_str(),
+            );
+            None
+        });
+        let side = trade.get("T").and_then(as_u64).or_else(|| {
+            log_parse_drop(
+                "mexc_collector",
+                "missing_side",
+                &"missing side",
+                sample.as_str(),
+            );
+            None
+        });
         let ts_ms = trade
             .get("t")
             .and_then(as_u64)
             .or_else(|| raw.get("ts").and_then(as_u64))
-            .unwrap_or(0);
-        if price.is_none() || qty.is_none() || side.is_none() {
+            .or_else(|| {
+                log_parse_drop(
+                    "mexc_collector",
+                    "missing_ts",
+                    &"missing ts",
+                    sample.as_str(),
+                );
+                None
+            });
+        if price.is_none() || qty.is_none() || side.is_none() || ts_ms.is_none() {
             continue;
         }
         let px_i = (price.unwrap() * PRICE_SCALE).round() as Price;
         let qty_i = (qty.unwrap() * qty_multiplier * QTY_SCALE).round() as Qty;
-        let seq = trade.get("t").and_then(as_u64).unwrap_or_else(|| ts_ms);
-        let is_buyer_maker = side.unwrap_or(0) != 1;
+        let seq = trade.get("t").and_then(as_u64).or_else(|| {
+            log_parse_drop(
+                "mexc_collector",
+                "missing_seq",
+                &"missing seq",
+                sample.as_str(),
+            );
+            None
+        });
+        if seq.is_none() {
+            continue;
+        }
+        let is_buyer_maker = side.unwrap() != 1;
         let record = Trade::new(
             px_i,
             qty_i,
-            ms_to_ns(ts_ms),
-            seq as Seq,
+            ms_to_ns(ts_ms.unwrap()),
+            seq.unwrap() as Seq,
             is_buyer_maker,
             system_ts_ns,
         );
@@ -135,12 +223,25 @@ pub fn update_tickers(
     if !matches!(frame.channel(), Some("push.ticker")) {
         return None;
     }
+    let sample = frame.text().unwrap_or("").to_string();
     let raw = frame.json()?;
     let data = match raw.get("data") {
         Some(Value::Object(map)) => map,
         _ => return None,
     };
-    let symbol = data.get("symbol").and_then(|v| v.as_str())?.to_string();
+    let symbol = data
+        .get("symbol")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            log_parse_drop(
+                "mexc_collector",
+                "missing_symbol",
+                &"missing symbol",
+                sample.as_str(),
+            );
+            None
+        })?
+        .to_string();
     let mut snapshot = store.get(&symbol).copied().unwrap_or_default();
 
     if let Some(last_px) = data.get("lastPrice").and_then(as_f64) {
@@ -184,7 +285,12 @@ pub fn update_tickers(
         snapshot.ticker.ts = ms_to_ns(ts_ms);
         snapshot.ticker.seq = ts_ms;
     } else {
-        snapshot.ticker.seq = 0;
+        log_parse_drop(
+            "mexc_collector",
+            "missing_ts",
+            &"missing ts",
+            sample.as_str(),
+        );
     }
 
     let stored = store.update(symbol.clone(), snapshot);

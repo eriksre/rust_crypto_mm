@@ -1,7 +1,8 @@
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use reqwest::Url;
 use serde::Deserialize;
 
 use crate::base_classes::feed_config::FeedToggles;
@@ -61,7 +62,7 @@ impl LoggingConfig {
     }
 
     pub fn flush_interval(&self) -> Duration {
-        Duration::from_millis(self.flush_interval_ms.max(1))
+        Duration::from_millis(self.flush_interval_ms)
     }
 }
 
@@ -109,6 +110,7 @@ pub fn load_runner_config(path: &str) -> Result<RunnerConfig> {
         .with_context(|| format!("failed to read config at {}", path))?;
     let config: RunnerConfig = serde_yaml::from_str(&contents)
         .with_context(|| format!("failed to parse config at {}", path))?;
+    validate_runner_config(&config)?;
     Ok(config)
 }
 
@@ -121,16 +123,24 @@ pub fn load_gate_credentials(config: &RunnerConfig) -> Result<GateCredentials> {
         .api_secret_env
         .unwrap_or_else(|| "GATEIO_SECRET_KEY".to_string());
 
-    let api_key = match creds.api_key.clone() {
-        Some(v) => v,
-        None => std::env::var(&key_env).with_context(|| format!("missing env var {key_env}"))?,
+    let (api_key, api_key_source) = match creds.api_key.clone() {
+        Some(v) => (v, "config.api_key".to_string()),
+        None => (
+            std::env::var(&key_env).with_context(|| format!("missing env var {key_env}"))?,
+            format!("env:{key_env}"),
+        ),
     };
-    let api_secret = match creds.api_secret.clone() {
-        Some(v) => v,
-        None => {
-            std::env::var(&secret_env).with_context(|| format!("missing env var {secret_env}"))?
-        }
+    let (api_secret, api_secret_source) = match creds.api_secret.clone() {
+        Some(v) => (v, "config.api_secret".to_string()),
+        None => (
+            std::env::var(&secret_env).with_context(|| format!("missing env var {secret_env}"))?,
+            format!("env:{secret_env}"),
+        ),
     };
+    eprintln!(
+        "Resolved Gate credentials: api_key_source={}, api_secret_source={}",
+        api_key_source, api_secret_source
+    );
     Ok(GateCredentials {
         api_key,
         api_secret,
@@ -152,32 +162,64 @@ pub fn load_lighter_credentials(config: &RunnerConfig) -> Result<LighterCredenti
     let key_env = creds
         .api_key_env
         .unwrap_or_else(|| "LIGHTER_API_KEY".to_string());
-    let api_key_hex = match creds.api_key.clone() {
-        Some(v) => v,
-        None => std::env::var(&key_env).with_context(|| format!("missing env var {key_env}"))?,
+    let (api_key_hex, api_key_source) = match creds.api_key.clone() {
+        Some(v) => (v, "config.api_key".to_string()),
+        None => (
+            std::env::var(&key_env).with_context(|| format!("missing env var {key_env}"))?,
+            format!("env:{key_env}"),
+        ),
     };
 
-    let account_index = std::env::var("LIGHTER_ACCOUNT_INDEX")
-        .ok()
-        .and_then(|v| v.parse::<i64>().ok())
-        .or(creds.account_index)
-        .unwrap_or(0);
-    let api_key_index = std::env::var("LIGHTER_API_KEY_INDEX")
-        .ok()
-        .and_then(|v| v.parse::<i32>().ok())
-        .or(creds.api_key_index)
-        .unwrap_or(0);
-    let base_url = std::env::var("LIGHTER_BASE_URL")
-        .ok()
-        .or(creds.base_url)
-        .unwrap_or_else(|| "https://mainnet.zklighter.elliot.ai/".to_string());
+    let (account_index, account_index_source) = match std::env::var("LIGHTER_ACCOUNT_INDEX") {
+        Ok(v) => (
+            v.parse::<i64>()
+                .with_context(|| "invalid LIGHTER_ACCOUNT_INDEX")?,
+            "env:LIGHTER_ACCOUNT_INDEX".to_string(),
+        ),
+        Err(_) => match creds.account_index {
+            Some(v) => (v, "config.account_index".to_string()),
+            None => bail!("missing LIGHTER_ACCOUNT_INDEX (env) or credentials.account_index"),
+        },
+    };
+    let (api_key_index, api_key_index_source) = match std::env::var("LIGHTER_API_KEY_INDEX") {
+        Ok(v) => (
+            v.parse::<i32>()
+                .with_context(|| "invalid LIGHTER_API_KEY_INDEX")?,
+            "env:LIGHTER_API_KEY_INDEX".to_string(),
+        ),
+        Err(_) => match creds.api_key_index {
+            Some(v) => (v, "config.api_key_index".to_string()),
+            None => bail!("missing LIGHTER_API_KEY_INDEX (env) or credentials.api_key_index"),
+        },
+    };
+    let (base_url, base_url_source) = match std::env::var("LIGHTER_BASE_URL") {
+        Ok(v) => (v, "env:LIGHTER_BASE_URL".to_string()),
+        Err(_) => match creds.base_url {
+            Some(v) => (v, "config.base_url".to_string()),
+            None => bail!("missing LIGHTER_BASE_URL (env) or credentials.base_url"),
+        },
+    };
+    if Url::parse(&base_url).is_err() {
+        bail!("invalid LIGHTER_BASE_URL {}", base_url);
+    }
 
-    let signer_lib_raw = creds.signer_lib.unwrap_or_else(default_signer_lib_path);
+    let signer_lib_raw = match creds.signer_lib {
+        Some(v) => v,
+        None => bail!("missing credentials.signer_lib (set to 'auto' or explicit path)"),
+    };
     let signer_lib = if signer_lib_raw.eq_ignore_ascii_case("auto") {
         default_signer_lib_path()
     } else {
         signer_lib_raw
     };
+    eprintln!(
+        "Resolved Lighter credentials: api_key_source={}, account_index_source={}, api_key_index_source={}, base_url_source={}, signer_lib={}",
+        api_key_source,
+        account_index_source,
+        api_key_index_source,
+        base_url_source,
+        signer_lib
+    );
 
     Ok(LighterCredentials {
         api_key_hex,
@@ -187,4 +229,53 @@ pub fn load_lighter_credentials(config: &RunnerConfig) -> Result<LighterCredenti
         signer_lib,
         chain_id: creds.chain_id,
     })
+}
+
+pub fn validate_runner_config(config: &RunnerConfig) -> Result<()> {
+    if config.strategy.quote_interval_ms == 0 {
+        bail!("strategy.quote_interval_ms must be > 0");
+    }
+    if config.strategy.min_tick <= 0.0 || !config.strategy.min_tick.is_finite() {
+        bail!("strategy.min_tick must be finite and > 0");
+    }
+    if config.logging.enabled && config.logging.flush_interval_ms == 0 {
+        bail!("logging.flush_interval_ms must be > 0 when logging is enabled");
+    }
+    if config.risk.max_order_notional <= 0.0 || !config.risk.max_order_notional.is_finite() {
+        bail!("risk.max_order_notional must be finite and > 0");
+    }
+    if config.risk.max_position_notional < 0.0 || !config.risk.max_position_notional.is_finite() {
+        bail!("risk.max_position_notional must be finite and >= 0");
+    }
+    if config.strategy.symbol.trim().is_empty() {
+        bail!("strategy.symbol must be set");
+    }
+    Ok(())
+}
+
+pub fn log_runner_config(config: &RunnerConfig) {
+    eprintln!(
+        "Runner config: venue={}, symbol={}, dry_run={}, log_fills={}, debug_prints={}, markout_prints={}, demean_prices={}",
+        config.strategy.venue.as_str(),
+        config.strategy.symbol,
+        config.mode.dry_run,
+        config.mode.log_fills,
+        config.mode.debug_prints,
+        config.mode.markout_prints,
+        config.mode.demean_prices
+    );
+    if config.logging.enabled {
+        eprintln!(
+            "Logging enabled: path={} flush_interval_ms={}",
+            config.logging.resolve_path(config.strategy.venue).display(),
+            config.logging.flush_interval_ms
+        );
+    } else {
+        eprintln!("Logging disabled");
+    }
+    if let Some(settle) = &config.settle {
+        eprintln!("Settle currency: {settle}");
+    } else {
+        eprintln!("Settle currency: <unset>");
+    }
 }

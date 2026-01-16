@@ -10,9 +10,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio_tungstenite::{connect_async_with_config, tungstenite::Message};
 
-use rust_test::config::runner::{load_lighter_credentials, load_runner_config};
+use rust_test::config::runner::{load_lighter_credentials, load_runner_config, log_runner_config};
 use rust_test::execution::{LighterCredentials, lighter_auth_token};
 use rust_test::exchanges::lighter::fetch_market_meta_async;
+use rust_test::utils::parsing::log_parse_drop;
 
 #[derive(Parser, Debug)]
 #[command(name = "lighter-position-watch", about = "Print Lighter position updates + notional")]
@@ -73,10 +74,22 @@ struct OrderState {
 }
 
 fn parse_price(value: &str) -> Option<f64> {
-    value
-        .parse::<f64>()
-        .ok()
-        .filter(|v| v.is_finite() && *v > 0.0)
+    match value.parse::<f64>() {
+        Ok(v) if v.is_finite() && v > 0.0 => Some(v),
+        Ok(_) => {
+            log_parse_drop(
+                "lighter_position_watch",
+                "non_finite_price",
+                &"non-finite price",
+                value,
+            );
+            None
+        }
+        Err(err) => {
+            log_parse_drop("lighter_position_watch", "price", &err, value);
+            None
+        }
+    }
 }
 
 fn ws_url_from_base(base_url: &str) -> Result<String> {
@@ -169,9 +182,12 @@ fn print_position(
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    dotenvy::dotenv().ok();
+    if let Err(err) = dotenvy::dotenv() {
+        eprintln!("WARN: failed to load .env: {}", err);
+    }
     let cli = Cli::parse();
     let config = load_runner_config(&cli.config)?;
+    log_runner_config(&config);
 
     let symbol = cli
         .symbol

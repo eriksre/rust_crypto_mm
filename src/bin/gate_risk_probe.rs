@@ -9,6 +9,7 @@ use hmac::{Hmac, Mac};
 use reqwest::{Client, Method};
 use rust_test::exchanges::endpoints::{GateioGet, GateioWs};
 use rust_test::exchanges::gate::rest;
+use rust_test::utils::parsing::log_parse_drop;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha512};
@@ -115,7 +116,9 @@ impl PositionTracker {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
-    dotenvy::dotenv().ok();
+    if let Err(err) = dotenvy::dotenv() {
+        eprintln!("WARN: failed to load .env: {}", err);
+    }
     let cli = Cli::parse();
 
     println!("Loading config from {}", cli.config);
@@ -124,7 +127,7 @@ async fn main() -> Result<()> {
     let settle = runner_cfg
         .settle
         .clone()
-        .unwrap_or_else(|| "usdt".to_string());
+        .ok_or_else(|| anyhow!("missing settle currency in config"))?;
     let contract = cli
         .symbol
         .clone()
@@ -173,7 +176,10 @@ async fn main() -> Result<()> {
     let (mut ws_stream, _) = connect_async_with_config(&ws_url, None, true)
         .await
         .with_context(|| format!("failed to connect to {}", ws_url))?;
-    ws_stream.send(Message::Ping(Vec::new())).await.ok();
+    ws_stream
+        .send(Message::Ping(Vec::new()))
+        .await
+        .context("failed to send initial ping")?;
 
     let mut ws_auth = WsAuth::new(credentials, contract.clone());
     let login_info = ws_auth
@@ -181,9 +187,13 @@ async fn main() -> Result<()> {
         .await
         .context("login failed")?;
     println!("Login acknowledged (req_id={})", login_info.req_id);
-    let user_id = login_info
-        .user_id
-        .or_else(|| std::env::var("GATE_UID").ok());
+    let user_id = login_info.user_id.or_else(|| match std::env::var("GATE_UID") {
+        Ok(val) => Some(val),
+        Err(err) => {
+            eprintln!("WARN: GATE_UID not set: {}", err);
+            None
+        }
+    });
     let user_id = user_id.ok_or_else(|| {
         anyhow!("Gate login did not provide user id; set GATE_UID env or ensure API key exposes it")
     })?;
@@ -251,7 +261,10 @@ async fn main() -> Result<()> {
                     }
                     Some(Ok(Message::Frame(_))) => {}
                     Some(Ok(Message::Ping(data))) => {
-                        write.send(Message::Pong(data)).await.ok();
+                        if let Err(err) = write.send(Message::Pong(data)).await {
+                            eprintln!("ERROR: failed to send pong: {err}");
+                            break;
+                        }
                     }
                     Some(Ok(Message::Pong(_))) => {}
                     Some(Ok(Message::Close(frame))) => {
@@ -491,7 +504,17 @@ fn handle_ws_text(text: &str, tracker: &mut PositionTracker, contract: &str) -> 
 fn value_to_f64(value: &Value) -> Option<f64> {
     match value {
         Value::Number(n) => n.as_f64(),
-        Value::String(s) => s.parse::<f64>().ok(),
+        Value::String(s) => match s.parse::<f64>() {
+            Ok(v) if v.is_finite() => Some(v),
+            Ok(_) => {
+                log_parse_drop("gate_risk_probe", "non_finite", &"non-finite number", s);
+                None
+            }
+            Err(err) => {
+                log_parse_drop("gate_risk_probe", "f64", &err, s);
+                None
+            }
+        },
         _ => None,
     }
 }
@@ -567,9 +590,18 @@ impl WsAuth {
                         .with_context(|| format!("failed to parse login response: {}", text))?;
                     if resp.request_id.as_deref() == Some(&req_id) {
                         if resp.is_success() {
-                            let user_id = serde_json::from_str::<Value>(&text)
-                                .ok()
-                                .and_then(|v| extract_user_id_value(&v));
+                            let user_id = match serde_json::from_str::<Value>(&text) {
+                                Ok(value) => extract_user_id_value(&value),
+                                Err(err) => {
+                                    log_parse_drop(
+                                        "gate_risk_probe",
+                                        "login_user_id",
+                                        &err,
+                                        &text,
+                                    );
+                                    None
+                                }
+                            };
                             return Ok(LoginInfo { req_id, user_id });
                         }
                         let err_msg = resp
@@ -579,7 +611,9 @@ impl WsAuth {
                     }
                 }
                 Some(Ok(Message::Ping(data))) => {
-                    ws.send(Message::Pong(data)).await.ok();
+                    ws.send(Message::Pong(data))
+                        .await
+                        .context("failed to send pong during login")?;
                 }
                 Some(Ok(_)) => {}
                 Some(Err(err)) => return Err(anyhow!("login stream error: {err}")),

@@ -2,6 +2,7 @@
 
 use crate::base_classes::types::Ts;
 use crate::base_classes::ws::{AppHeartbeat, ExchangeHandler, HeartbeatPayload};
+use crate::utils::parsing::{log_parse_drop, log_parse_drop_bytes};
 use crate::exchanges::bitget::orderbook::BitgetMsg;
 use crate::exchanges::endpoints::BitgetWs;
 use serde_json::{self, Value};
@@ -119,37 +120,78 @@ impl BitgetFrame {
     pub fn preparse_text(&mut self, text: &str) {
         let flags = bitget_preparse_flags(text);
         if flags.needs_json && self.json_cache.is_none() {
-            self.json_cache = serde_json::from_str::<Value>(text).ok();
+            self.json_cache = match serde_json::from_str::<Value>(text) {
+                Ok(val) => Some(val),
+                Err(err) => {
+                    log_parse_drop("bitget_parser", "json", &err, text);
+                    None
+                }
+            };
         }
         if flags.needs_orderbook && self.orderbook_cache.is_none() {
-            self.orderbook_cache = serde_json::from_str::<BitgetMsg>(text).ok();
+            self.orderbook_cache = match serde_json::from_str::<BitgetMsg>(text) {
+                Ok(val) => Some(val),
+                Err(err) => {
+                    log_parse_drop("bitget_parser", "orderbook", &err, text);
+                    None
+                }
+            };
         }
     }
 
     pub fn preparse_binary(&mut self) {
-        if let Ok(text) = core::str::from_utf8(&self.raw) {
-            let flags = bitget_preparse_flags(text);
-            if !flags.needs_json && !flags.needs_orderbook {
+        let text = match core::str::from_utf8(&self.raw) {
+            Ok(text) => text,
+            Err(err) => {
+                log_parse_drop_bytes("bitget_parser", "utf8", &err, &self.raw);
                 return;
             }
-            if flags.needs_json && self.json_cache.is_none() {
-                self.json_cache = serde_json::from_slice(&self.raw).ok();
-            }
-            if flags.needs_orderbook && self.orderbook_cache.is_none() {
-                self.orderbook_cache = serde_json::from_slice(&self.raw).ok();
-            }
+        };
+        let flags = bitget_preparse_flags(text);
+        if !flags.needs_json && !flags.needs_orderbook {
+            return;
+        }
+        if flags.needs_json && self.json_cache.is_none() {
+            self.json_cache = match serde_json::from_slice(&self.raw) {
+                Ok(val) => Some(val),
+                Err(err) => {
+                    log_parse_drop_bytes("bitget_parser", "json", &err, &self.raw);
+                    None
+                }
+            };
+        }
+        if flags.needs_orderbook && self.orderbook_cache.is_none() {
+            self.orderbook_cache = match serde_json::from_slice(&self.raw) {
+                Ok(val) => Some(val),
+                Err(err) => {
+                    log_parse_drop_bytes("bitget_parser", "orderbook", &err, &self.raw);
+                    None
+                }
+            };
         }
     }
 
     #[inline(always)]
     pub fn text(&self) -> Option<&str> {
-        core::str::from_utf8(&self.raw).ok()
+        match core::str::from_utf8(&self.raw) {
+            Ok(text) => Some(text),
+            Err(err) => {
+                log_parse_drop_bytes("bitget_parser", "utf8", &err, &self.raw);
+                None
+            }
+        }
     }
 
     #[inline(always)]
     pub fn json(&mut self) -> Option<&Value> {
         if self.json_cache.is_none() {
-            self.json_cache = serde_json::from_slice(&self.raw).ok();
+            self.json_cache = match serde_json::from_slice(&self.raw) {
+                Ok(val) => Some(val),
+                Err(err) => {
+                    log_parse_drop_bytes("bitget_parser", "json", &err, &self.raw);
+                    None
+                }
+            };
         }
         self.json_cache.as_ref()
     }
@@ -157,33 +199,54 @@ impl BitgetFrame {
     #[inline(always)]
     pub fn orderbook_msg(&mut self) -> Option<&BitgetMsg> {
         if self.orderbook_cache.is_none() {
-            self.orderbook_cache = serde_json::from_slice(&self.raw).ok();
+            self.orderbook_cache = match serde_json::from_slice(&self.raw) {
+                Ok(val) => Some(val),
+                Err(err) => {
+                    log_parse_drop_bytes("bitget_parser", "orderbook", &err, &self.raw);
+                    None
+                }
+            };
         }
         self.orderbook_cache.as_ref()
     }
 
     pub fn channel(&self) -> &str {
-        if let Ok(s) = core::str::from_utf8(&self.raw) {
-            if let Some(v) = find_json_string(s, "channel") {
-                return v;
+        let s = match core::str::from_utf8(&self.raw) {
+            Ok(text) => text,
+            Err(err) => {
+                log_parse_drop_bytes("bitget_parser", "utf8", &err, &self.raw);
+                return "(unknown)";
             }
+        };
+        if let Some(v) = find_json_string(s, "channel") {
+            return v;
         }
         "(unknown)"
     }
     pub fn event(&self) -> &str {
-        if let Ok(s) = core::str::from_utf8(&self.raw) {
-            if let Some(v) = find_json_string(s, "event") {
-                return v;
+        let s = match core::str::from_utf8(&self.raw) {
+            Ok(text) => text,
+            Err(err) => {
+                log_parse_drop_bytes("bitget_parser", "utf8", &err, &self.raw);
+                return "(unknown)";
             }
+        };
+        if let Some(v) = find_json_string(s, "event") {
+            return v;
         }
         "(unknown)"
     }
 
     pub fn action(&self) -> &str {
-        if let Ok(s) = core::str::from_utf8(&self.raw) {
-            if let Some(v) = find_json_string(s, "action") {
-                return v;
+        let s = match core::str::from_utf8(&self.raw) {
+            Ok(text) => text,
+            Err(err) => {
+                log_parse_drop_bytes("bitget_parser", "utf8", &err, &self.raw);
+                return "(unknown)";
             }
+        };
+        if let Some(v) = find_json_string(s, "action") {
+            return v;
         }
         "(unknown)"
     }

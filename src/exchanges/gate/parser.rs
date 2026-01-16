@@ -2,6 +2,7 @@
 
 use crate::base_classes::types::Ts;
 use crate::base_classes::ws::{ExchangeHandler, HeartbeatPayload};
+use crate::utils::parsing::{log_parse_drop, log_parse_drop_bytes};
 use crate::exchanges::endpoints::GateioWs;
 use crate::exchanges::gate::orderbook::GateMsg;
 use serde_json::{self, Value};
@@ -178,37 +179,78 @@ impl GateFrame {
     pub fn preparse_text(&mut self, text: &str) {
         let (needs_json, is_obu) = gate_preparse_flags(text);
         if needs_json && self.json_cache.is_none() {
-            self.json_cache = serde_json::from_str::<Value>(text).ok();
+            self.json_cache = match serde_json::from_str::<Value>(text) {
+                Ok(val) => Some(val),
+                Err(err) => {
+                    log_parse_drop("gate_parser", "json", &err, text);
+                    None
+                }
+            };
         }
         if is_obu && self.orderbook_cache.is_none() {
-            self.orderbook_cache = serde_json::from_str::<GateMsg>(text).ok();
+            self.orderbook_cache = match serde_json::from_str::<GateMsg>(text) {
+                Ok(val) => Some(val),
+                Err(err) => {
+                    log_parse_drop("gate_parser", "orderbook", &err, text);
+                    None
+                }
+            };
         }
     }
 
     pub fn preparse_binary(&mut self) {
-        if let Ok(text) = core::str::from_utf8(&self.raw) {
-            let (needs_json, is_obu) = gate_preparse_flags(text);
-            if !needs_json && !is_obu {
+        let text = match core::str::from_utf8(&self.raw) {
+            Ok(text) => text,
+            Err(err) => {
+                log_parse_drop_bytes("gate_parser", "utf8", &err, &self.raw);
                 return;
             }
-            if needs_json && self.json_cache.is_none() {
-                self.json_cache = serde_json::from_slice(&self.raw).ok();
-            }
-            if is_obu && self.orderbook_cache.is_none() {
-                self.orderbook_cache = serde_json::from_slice(&self.raw).ok();
-            }
+        };
+        let (needs_json, is_obu) = gate_preparse_flags(text);
+        if !needs_json && !is_obu {
+            return;
+        }
+        if needs_json && self.json_cache.is_none() {
+            self.json_cache = match serde_json::from_slice(&self.raw) {
+                Ok(val) => Some(val),
+                Err(err) => {
+                    log_parse_drop_bytes("gate_parser", "json", &err, &self.raw);
+                    None
+                }
+            };
+        }
+        if is_obu && self.orderbook_cache.is_none() {
+            self.orderbook_cache = match serde_json::from_slice(&self.raw) {
+                Ok(val) => Some(val),
+                Err(err) => {
+                    log_parse_drop_bytes("gate_parser", "orderbook", &err, &self.raw);
+                    None
+                }
+            };
         }
     }
 
     #[inline(always)]
     pub fn text(&self) -> Option<&str> {
-        core::str::from_utf8(&self.raw).ok()
+        match core::str::from_utf8(&self.raw) {
+            Ok(text) => Some(text),
+            Err(err) => {
+                log_parse_drop_bytes("gate_parser", "utf8", &err, &self.raw);
+                None
+            }
+        }
     }
 
     #[inline(always)]
     pub fn json(&mut self) -> Option<&Value> {
         if self.json_cache.is_none() {
-            self.json_cache = serde_json::from_slice(&self.raw).ok();
+            self.json_cache = match serde_json::from_slice(&self.raw) {
+                Ok(val) => Some(val),
+                Err(err) => {
+                    log_parse_drop_bytes("gate_parser", "json", &err, &self.raw);
+                    None
+                }
+            };
         }
         self.json_cache.as_ref()
     }
@@ -216,7 +258,13 @@ impl GateFrame {
     #[inline(always)]
     pub fn orderbook_msg(&mut self) -> Option<&GateMsg> {
         if self.orderbook_cache.is_none() {
-            self.orderbook_cache = serde_json::from_slice(&self.raw).ok();
+            self.orderbook_cache = match serde_json::from_slice(&self.raw) {
+                Ok(val) => Some(val),
+                Err(err) => {
+                    log_parse_drop_bytes("gate_parser", "orderbook", &err, &self.raw);
+                    None
+                }
+            };
         }
         self.orderbook_cache.as_ref()
     }

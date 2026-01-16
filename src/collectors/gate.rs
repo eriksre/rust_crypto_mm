@@ -4,6 +4,7 @@ use crate::base_classes::trades::{FixedTrades, Trade};
 use crate::base_classes::types::{Price, Qty, Seq};
 use crate::collectors::helpers::{find_first_string_number, find_json_string};
 use crate::exchanges::gate::orderbook::{GateBook, GateMsg};
+use crate::utils::parsing::log_parse_drop;
 use crate::utils::time::ms_to_ns;
 use serde_json::{self, Value};
 
@@ -13,11 +14,16 @@ pub fn events_for<const N: usize>(s: &str, book: &mut GateBook<N>) -> Vec<(&'sta
         match ch {
             "futures.book_ticker" => { /* handled by bbo updater in caller */ }
             "futures.obu" => {
-                if let Ok(msg) = serde_json::from_str::<GateMsg>(s) {
-                    if book.apply(&msg) {
-                        if let Some(mid) = book.mid_price_f64() {
-                            out.push(("orderbook", mid));
+                match serde_json::from_str::<GateMsg>(s) {
+                    Ok(msg) => {
+                        if book.apply(&msg) {
+                            if let Some(mid) = book.mid_price_f64() {
+                                out.push(("orderbook", mid));
+                            }
                         }
+                    }
+                    Err(err) => {
+                        log_parse_drop("gate_collector", "orderbook", &err, s);
                     }
                 }
             }
@@ -45,16 +51,51 @@ fn first_result_object(value: &Value) -> Option<&Value> {
 
 fn as_f64(value: &Value) -> Option<f64> {
     match value {
-        Value::String(s) => s.parse::<f64>().ok(),
-        Value::Number(n) => n.as_f64(),
+        Value::String(s) => match s.parse::<f64>() {
+            Ok(v) if v.is_finite() => Some(v),
+            Ok(_) => {
+                log_parse_drop("gate_collector", "non_finite", &"non-finite number", s);
+                None
+            }
+            Err(err) => {
+                log_parse_drop("gate_collector", "f64", &err, s);
+                None
+            }
+        },
+        Value::Number(n) => {
+            let v = n.as_f64()?;
+            if v.is_finite() {
+                Some(v)
+            } else {
+                log_parse_drop(
+                    "gate_collector",
+                    "non_finite",
+                    &"non-finite number",
+                    &n.to_string(),
+                );
+                None
+            }
+        }
         _ => None,
     }
 }
 
 fn as_u64(value: &Value) -> Option<u64> {
     match value {
-        Value::Number(n) => n.as_u64(),
-        Value::String(s) => s.parse::<u64>().ok(),
+        Value::Number(n) => {
+            let v = n.as_u64();
+            if v.is_none() {
+                log_parse_drop("gate_collector", "u64", &"non-u64 number", &n.to_string());
+            }
+            v
+        }
+        Value::String(s) => match s.parse::<u64>() {
+            Ok(v) => Some(v),
+            Err(err) => {
+                log_parse_drop("gate_collector", "u64", &err, s);
+                None
+            }
+        },
         _ => None,
     }
 }
@@ -86,7 +127,13 @@ pub fn update_tickers(
     store: &mut TickerStore,
     qty_multiplier: f64,
 ) -> Option<(String, TickerSnapshot)> {
-    let raw: Value = serde_json::from_str(s).ok()?;
+    let raw: Value = match serde_json::from_str(s) {
+        Ok(val) => val,
+        Err(err) => {
+            log_parse_drop("gate_collector", "json", &err, s);
+            return None;
+        }
+    };
     if raw.get("channel").and_then(|v| v.as_str()) != Some("futures.tickers") {
         return None;
     }
@@ -140,8 +187,19 @@ pub fn update_tickers(
         snapshot.quanto_multiplier = Some(mult);
     }
 
-    let multiplier = snapshot.quanto_multiplier.unwrap_or(1.0);
     if let (Some(oi), Some(mark)) = (snapshot.open_interest, snapshot.mark_px) {
+        let multiplier = match snapshot.quanto_multiplier {
+            Some(mult) => mult,
+            None => {
+                log_parse_drop(
+                    "gate_collector",
+                    "missing_quanto_multiplier",
+                    &"missing quanto_multiplier",
+                    s,
+                );
+                1.0
+            }
+        };
         snapshot.open_interest_value = Some(oi * mark * multiplier);
     }
 
@@ -156,7 +214,7 @@ pub fn update_tickers(
     if let Some(seq) = value_to_u64(data_obj, &["update_id", "seq", "t"]) {
         snapshot.ticker.seq = seq;
     } else {
-        snapshot.ticker.seq = 0;
+        log_parse_drop("gate_collector", "missing_seq", &"missing seq", s);
     }
 
     let stored = store.update(symbol.clone(), snapshot);

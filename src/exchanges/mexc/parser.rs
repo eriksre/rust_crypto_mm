@@ -2,6 +2,7 @@
 
 use crate::base_classes::types::Ts;
 use crate::base_classes::ws::{AppHeartbeat, ExchangeHandler, HeartbeatPayload};
+use crate::utils::parsing::{log_parse_drop, log_parse_drop_bytes};
 use crate::exchanges::endpoints::MexcWs;
 use crate::exchanges::mexc::orderbook::MexcDepthMsg;
 use serde_json::{self, Value};
@@ -129,38 +130,8 @@ impl MexcFrame {
         }
 
         if needs_json && self.json_cache.is_none() {
-            if let Ok(value) = serde_json::from_str::<Value>(text) {
-                if self.channel_cache.is_none() {
-                    self.channel_cache = value
-                        .get("channel")
-                        .or_else(|| value.get("c"))
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                }
-                self.json_cache = Some(value);
-            }
-        }
-
-        if needs_depth && self.depth_cache.is_none() {
-            if let Ok(msg) = serde_json::from_str::<MexcDepthMsg>(text) {
-                self.depth_cache = Some(msg);
-            }
-        }
-    }
-
-    pub fn preparse_binary(&mut self) {
-        if let Ok(text) = core::str::from_utf8(&self.raw) {
-            let (channel_opt, needs_json, needs_depth) = mexc_preparse_flags(text);
-            if !needs_json && !needs_depth && channel_opt.is_none() {
-                return;
-            }
-            if self.channel_cache.is_none() {
-                if let Some(ch) = channel_opt {
-                    self.channel_cache = Some(ch.to_string());
-                }
-            }
-            if needs_json && self.json_cache.is_none() {
-                if let Ok(value) = serde_json::from_slice::<Value>(&self.raw) {
+            match serde_json::from_str::<Value>(text) {
+                Ok(value) => {
                     if self.channel_cache.is_none() {
                         self.channel_cache = value
                             .get("channel")
@@ -170,10 +141,61 @@ impl MexcFrame {
                     }
                     self.json_cache = Some(value);
                 }
+                Err(err) => {
+                    log_parse_drop("mexc_parser", "json", &err, text);
+                }
             }
-            if needs_depth && self.depth_cache.is_none() {
-                if let Ok(msg) = serde_json::from_slice::<MexcDepthMsg>(&self.raw) {
-                    self.depth_cache = Some(msg);
+        }
+
+        if needs_depth && self.depth_cache.is_none() {
+            match serde_json::from_str::<MexcDepthMsg>(text) {
+                Ok(msg) => self.depth_cache = Some(msg),
+                Err(err) => {
+                    log_parse_drop("mexc_parser", "depth", &err, text);
+                }
+            }
+        }
+    }
+
+    pub fn preparse_binary(&mut self) {
+        let text = match core::str::from_utf8(&self.raw) {
+            Ok(text) => text,
+            Err(err) => {
+                log_parse_drop_bytes("mexc_parser", "utf8", &err, &self.raw);
+                return;
+            }
+        };
+        let (channel_opt, needs_json, needs_depth) = mexc_preparse_flags(text);
+        if !needs_json && !needs_depth && channel_opt.is_none() {
+            return;
+        }
+        if self.channel_cache.is_none() {
+            if let Some(ch) = channel_opt {
+                self.channel_cache = Some(ch.to_string());
+            }
+        }
+        if needs_json && self.json_cache.is_none() {
+            match serde_json::from_slice::<Value>(&self.raw) {
+                Ok(value) => {
+                    if self.channel_cache.is_none() {
+                        self.channel_cache = value
+                            .get("channel")
+                            .or_else(|| value.get("c"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                    }
+                    self.json_cache = Some(value);
+                }
+                Err(err) => {
+                    log_parse_drop_bytes("mexc_parser", "json", &err, &self.raw);
+                }
+            }
+        }
+        if needs_depth && self.depth_cache.is_none() {
+            match serde_json::from_slice::<MexcDepthMsg>(&self.raw) {
+                Ok(msg) => self.depth_cache = Some(msg),
+                Err(err) => {
+                    log_parse_drop_bytes("mexc_parser", "depth", &err, &self.raw);
                 }
             }
         }
@@ -184,18 +206,29 @@ impl MexcFrame {
     }
 
     pub fn text(&self) -> Option<&str> {
-        core::str::from_utf8(&self.raw).ok()
+        match core::str::from_utf8(&self.raw) {
+            Ok(text) => Some(text),
+            Err(err) => {
+                log_parse_drop_bytes("mexc_parser", "utf8", &err, &self.raw);
+                None
+            }
+        }
     }
 
     pub fn json(&mut self) -> Option<&Value> {
         if self.json_cache.is_none() {
-            if let Ok(value) = serde_json::from_slice::<Value>(&self.raw) {
-                self.channel_cache = value
-                    .get("channel")
-                    .or_else(|| value.get("c"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                self.json_cache = Some(value);
+            match serde_json::from_slice::<Value>(&self.raw) {
+                Ok(value) => {
+                    self.channel_cache = value
+                        .get("channel")
+                        .or_else(|| value.get("c"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    self.json_cache = Some(value);
+                }
+                Err(err) => {
+                    log_parse_drop_bytes("mexc_parser", "json", &err, &self.raw);
+                }
             }
         }
         self.json_cache.as_ref()
@@ -203,8 +236,11 @@ impl MexcFrame {
 
     pub fn depth_msg(&mut self) -> Option<&MexcDepthMsg> {
         if self.depth_cache.is_none() && self.channel().map_or(false, |ch| ch == "push.depth") {
-            if let Ok(msg) = serde_json::from_slice::<MexcDepthMsg>(&self.raw) {
-                self.depth_cache = Some(msg);
+            match serde_json::from_slice::<MexcDepthMsg>(&self.raw) {
+                Ok(msg) => self.depth_cache = Some(msg),
+                Err(err) => {
+                    log_parse_drop_bytes("mexc_parser", "depth", &err, &self.raw);
+                }
             }
         }
         self.depth_cache.as_ref()

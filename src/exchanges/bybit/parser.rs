@@ -2,6 +2,7 @@
 
 use crate::base_classes::types::Ts;
 use crate::base_classes::ws::ExchangeHandler;
+use crate::utils::parsing::{log_parse_drop, log_parse_drop_bytes};
 use crate::exchanges::bybit::orderbook::BybitMsg;
 use crate::exchanges::endpoints::BybitWs;
 use serde_json::{self, Value};
@@ -120,12 +121,24 @@ impl BybitFrame {
         match bybit_preparse_flags(text) {
             BybitParseTarget::Orderbook => {
                 if self.orderbook_cache.is_none() {
-                    self.orderbook_cache = serde_json::from_str::<BybitMsg>(text).ok();
+                    self.orderbook_cache = match serde_json::from_str::<BybitMsg>(text) {
+                        Ok(val) => Some(val),
+                        Err(err) => {
+                            log_parse_drop("bybit_parser", "orderbook", &err, text);
+                            None
+                        }
+                    };
                 }
             }
             BybitParseTarget::Json => {
                 if self.json_cache.is_none() {
-                    self.json_cache = serde_json::from_str::<Value>(text).ok();
+                    self.json_cache = match serde_json::from_str::<Value>(text) {
+                        Ok(val) => Some(val),
+                        Err(err) => {
+                            log_parse_drop("bybit_parser", "json", &err, text);
+                            None
+                        }
+                    };
                 }
             }
             BybitParseTarget::None => {}
@@ -133,32 +146,61 @@ impl BybitFrame {
     }
 
     pub fn preparse_binary(&mut self) {
-        if let Ok(text) = core::str::from_utf8(&self.raw) {
-            match bybit_preparse_flags(text) {
-                BybitParseTarget::Orderbook => {
-                    if self.orderbook_cache.is_none() {
-                        self.orderbook_cache = serde_json::from_slice(&self.raw).ok();
-                    }
-                }
-                BybitParseTarget::Json => {
-                    if self.json_cache.is_none() {
-                        self.json_cache = serde_json::from_slice(&self.raw).ok();
-                    }
-                }
-                BybitParseTarget::None => {}
+        let text = match core::str::from_utf8(&self.raw) {
+            Ok(text) => text,
+            Err(err) => {
+                log_parse_drop_bytes("bybit_parser", "utf8", &err, &self.raw);
+                return;
             }
+        };
+        match bybit_preparse_flags(text) {
+            BybitParseTarget::Orderbook => {
+                if self.orderbook_cache.is_none() {
+                    self.orderbook_cache = match serde_json::from_slice(&self.raw) {
+                        Ok(val) => Some(val),
+                        Err(err) => {
+                            log_parse_drop_bytes("bybit_parser", "orderbook", &err, &self.raw);
+                            None
+                        }
+                    };
+                }
+            }
+            BybitParseTarget::Json => {
+                if self.json_cache.is_none() {
+                    self.json_cache = match serde_json::from_slice(&self.raw) {
+                        Ok(val) => Some(val),
+                        Err(err) => {
+                            log_parse_drop_bytes("bybit_parser", "json", &err, &self.raw);
+                            None
+                        }
+                    };
+                }
+            }
+            BybitParseTarget::None => {}
         }
     }
 
     #[inline(always)]
     pub fn text(&self) -> Option<&str> {
-        core::str::from_utf8(&self.raw).ok()
+        match core::str::from_utf8(&self.raw) {
+            Ok(text) => Some(text),
+            Err(err) => {
+                log_parse_drop_bytes("bybit_parser", "utf8", &err, &self.raw);
+                None
+            }
+        }
     }
 
     #[inline(always)]
     pub fn json(&mut self) -> Option<&Value> {
         if self.json_cache.is_none() {
-            self.json_cache = serde_json::from_slice(&self.raw).ok();
+            self.json_cache = match serde_json::from_slice(&self.raw) {
+                Ok(val) => Some(val),
+                Err(err) => {
+                    log_parse_drop_bytes("bybit_parser", "json", &err, &self.raw);
+                    None
+                }
+            };
         }
         self.json_cache.as_ref()
     }
@@ -166,22 +208,33 @@ impl BybitFrame {
     #[inline(always)]
     pub fn orderbook_msg(&mut self) -> Option<&BybitMsg> {
         if self.orderbook_cache.is_none() {
-            self.orderbook_cache = serde_json::from_slice(&self.raw).ok();
+            self.orderbook_cache = match serde_json::from_slice(&self.raw) {
+                Ok(val) => Some(val),
+                Err(err) => {
+                    log_parse_drop_bytes("bybit_parser", "orderbook", &err, &self.raw);
+                    None
+                }
+            };
         }
         self.orderbook_cache.as_ref()
     }
 
     pub fn topic(&self) -> Option<&str> {
         // Fast substring find for "topic":"..."
-        if let Ok(s) = core::str::from_utf8(&self.raw) {
-            if let Some(i) = s.find("\"topic\"") {
-                if let Some(j) = s[i..].find(':') {
-                    let rest = &s[i + j + 1..];
-                    let start = rest.find('"')? + 1;
-                    let rest2 = &rest[start..];
-                    let end = rest2.find('"')?;
-                    return Some(&rest2[..end]);
-                }
+        let s = match core::str::from_utf8(&self.raw) {
+            Ok(text) => text,
+            Err(err) => {
+                log_parse_drop_bytes("bybit_parser", "utf8", &err, &self.raw);
+                return None;
+            }
+        };
+        if let Some(i) = s.find("\"topic\"") {
+            if let Some(j) = s[i..].find(':') {
+                let rest = &s[i + j + 1..];
+                let start = rest.find('"')? + 1;
+                let rest2 = &rest[start..];
+                let end = rest2.find('"')?;
+                return Some(&rest2[..end]);
             }
         }
         None

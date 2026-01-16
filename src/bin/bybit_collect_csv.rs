@@ -3,6 +3,7 @@ use std::io::{BufWriter, Write};
 
 use rust_test::base_classes::ws::spawn_ws_worker;
 use rust_test::exchanges::bybit::BybitHandler;
+use rust_test::utils::parsing::log_parse_drop;
 
 fn main() {
     // Args: SYMBOL [output.csv] [core]
@@ -12,9 +13,16 @@ fn main() {
     let out_path = std::env::args()
         .nth(2)
         .unwrap_or_else(|| "bybit_mid.csv".to_string());
-    let core_pin: Option<usize> = std::env::args()
-        .nth(3)
-        .and_then(|s| s.parse::<usize>().ok());
+    let core_pin: Option<usize> = match std::env::args().nth(3) {
+        Some(s) => match s.parse::<usize>() {
+            Ok(v) => Some(v),
+            Err(err) => {
+                eprintln!("ERROR: invalid core pin '{s}': {err}");
+                return;
+            }
+        },
+        None => None,
+    };
 
     const N: usize = 1 << 14; // More room
     let (consumer, _jh) =
@@ -46,10 +54,16 @@ fn main() {
                             "orderbook"
                         };
                         let mid = (bid + ask) * 0.5;
-                        writeln!(w, "{},{},{}", frame.ts, feed, mid).ok();
+                        if let Err(err) = writeln!(w, "{},{},{}", frame.ts, feed, mid) {
+                            eprintln!("ERROR: failed to write CSV line: {err}");
+                            break;
+                        }
                         n += 1;
                         if n % 256 == 0 {
-                            let _ = w.flush();
+                            if let Err(err) = w.flush() {
+                                eprintln!("ERROR: failed to flush CSV: {err}");
+                                break;
+                            }
                         }
                     }
                 }
@@ -83,7 +97,17 @@ fn extract_first_price_after(key: &str, s: &str) -> Option<f64> {
     let rest2 = &rest[q + 1..];
     let end = rest2.find('"')?;
     let px_str = &rest2[..end];
-    px_str.parse::<f64>().ok()
+    match px_str.parse::<f64>() {
+        Ok(v) if v.is_finite() => Some(v),
+        Ok(_) => {
+            log_parse_drop("bybit_collect_csv", "non_finite_px", &"non-finite px", px_str);
+            None
+        }
+        Err(err) => {
+            log_parse_drop("bybit_collect_csv", "px", &err, px_str);
+            None
+        }
+    }
 }
 
 fn extract_top_prices(s: &str) -> Option<(f64, f64)> {

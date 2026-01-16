@@ -6,6 +6,7 @@ use crate::collectors::helpers::{find_first_bool, find_json_string};
 use crate::exchanges::bybit::orderbook::{
     BybitBook, BybitData, BybitDataCont, BybitMsg, PRICE_SCALE, QTY_SCALE,
 };
+use crate::utils::parsing::log_parse_drop;
 use crate::utils::time::ms_to_ns;
 use serde_json::{self, Value};
 
@@ -13,17 +14,91 @@ pub fn events_for<const N: usize>(s: &str, book: &mut BybitBook<N>) -> Vec<(&'st
     let mut out = Vec::with_capacity(1);
     if let Some(topic) = find_json_string(s, "topic") {
         if topic.starts_with("orderbook.") {
-            if let Ok(msg) = serde_json::from_str::<BybitMsg>(s) {
-                // Route BBO vs Depth
-                if topic.starts_with("orderbook.1.") {
-                    // Apply BBO to the book; emit bbo mid from book only
-                    let dopt: Option<BybitData> = match &msg.data {
-                        BybitDataCont::Obj(d) => Some(d.clone()),
-                        BybitDataCont::Arr(v) => v.get(0).cloned(),
-                    };
-                    if let Some(d) = dopt {
-                        if let (Some(b), Some(a)) = (d.b.get(0), d.a.get(0)) {
-                            if let (Ok(bid), Ok(ask)) = (b[0].parse::<f64>(), a[0].parse::<f64>()) {
+            match serde_json::from_str::<BybitMsg>(s) {
+                Ok(msg) => {
+                    // Route BBO vs Depth
+                    if topic.starts_with("orderbook.1.") {
+                        // Apply BBO to the book; emit bbo mid from book only
+                        let dopt: Option<BybitData> = match &msg.data {
+                            BybitDataCont::Obj(d) => Some(d.clone()),
+                            BybitDataCont::Arr(v) => v.get(0).cloned(),
+                        };
+                        if let Some(d) = dopt {
+                            if let (Some(b), Some(a)) = (d.b.get(0), d.a.get(0)) {
+                                let bid = match b[0].parse::<f64>() {
+                                    Ok(v) if v.is_finite() => v,
+                                    Ok(_) => {
+                                        log_parse_drop(
+                                            "bybit_collector",
+                                            "non_finite_bid",
+                                            &"non-finite bid",
+                                            &b[0],
+                                        );
+                                        return out;
+                                    }
+                                    Err(err) => {
+                                        log_parse_drop("bybit_collector", "bid", &err, &b[0]);
+                                        return out;
+                                    }
+                                };
+                                let ask = match a[0].parse::<f64>() {
+                                    Ok(v) if v.is_finite() => v,
+                                    Ok(_) => {
+                                        log_parse_drop(
+                                            "bybit_collector",
+                                            "non_finite_ask",
+                                            &"non-finite ask",
+                                            &a[0],
+                                        );
+                                        return out;
+                                    }
+                                    Err(err) => {
+                                        log_parse_drop("bybit_collector", "ask", &err, &a[0]);
+                                        return out;
+                                    }
+                                };
+                                let bid_qty = match b[1].parse::<f64>() {
+                                    Ok(v) if v.is_finite() => v,
+                                    Ok(_) => {
+                                        log_parse_drop(
+                                            "bybit_collector",
+                                            "non_finite_bid_qty",
+                                            &"non-finite bid qty",
+                                            &b[1],
+                                        );
+                                        return out;
+                                    }
+                                    Err(err) => {
+                                        log_parse_drop(
+                                            "bybit_collector",
+                                            "bid_qty",
+                                            &err,
+                                            &b[1],
+                                        );
+                                        return out;
+                                    }
+                                };
+                                let ask_qty = match a[1].parse::<f64>() {
+                                    Ok(v) if v.is_finite() => v,
+                                    Ok(_) => {
+                                        log_parse_drop(
+                                            "bybit_collector",
+                                            "non_finite_ask_qty",
+                                            &"non-finite ask qty",
+                                            &a[1],
+                                        );
+                                        return out;
+                                    }
+                                    Err(err) => {
+                                        log_parse_drop(
+                                            "bybit_collector",
+                                            "ask_qty",
+                                            &err,
+                                            &a[1],
+                                        );
+                                        return out;
+                                    }
+                                };
                                 let cts_ms = d
                                     .cts
                                     .or(msg.cts)
@@ -35,9 +110,9 @@ pub fn events_for<const N: usize>(s: &str, book: &mut BybitBook<N>) -> Vec<(&'st
                                     );
                                 if book.apply_bbo(
                                     bid,
-                                    b[1].parse().unwrap_or(0.0),
+                                    bid_qty,
                                     ask,
-                                    a[1].parse().unwrap_or(0.0),
+                                    ask_qty,
                                     d.seq,
                                     cts_ms,
                                     system_ts_ms,
@@ -48,14 +123,17 @@ pub fn events_for<const N: usize>(s: &str, book: &mut BybitBook<N>) -> Vec<(&'st
                                 }
                             }
                         }
-                    }
-                } else {
-                    // Depth updates (50) go through full book apply; emit orderbook mid from book only
-                    if book.apply(&msg) {
-                        if let Some(mid) = book.mid_price_f64() {
-                            out.push(("orderbook", mid));
+                    } else {
+                        // Depth updates (50) go through full book apply; emit orderbook mid from book only
+                        if book.apply(&msg) {
+                            if let Some(mid) = book.mid_price_f64() {
+                                out.push(("orderbook", mid));
+                            }
                         }
                     }
+                }
+                Err(err) => {
+                    log_parse_drop("bybit_collector", "orderbook", &err, s);
                 }
             }
         }
@@ -67,16 +145,78 @@ pub fn events_for<const N: usize>(s: &str, book: &mut BybitBook<N>) -> Vec<(&'st
 pub fn update_bbo_store(s: &str, store: &mut BboStore) -> bool {
     if let Some(topic) = find_json_string(s, "topic") {
         if topic.starts_with("orderbook.1.") {
-            if let Ok(msg) = serde_json::from_str::<BybitMsg>(s) {
-                let dopt: Option<BybitData> = match &msg.data {
-                    BybitDataCont::Obj(d) => Some(d.clone()),
-                    BybitDataCont::Arr(v) => v.get(0).cloned(),
-                };
-                if let Some(d) = dopt {
-                    if let (Some(b), Some(a)) = (d.b.get(0), d.a.get(0)) {
-                        if let (Ok(bid), Ok(ask)) = (b[0].parse::<f64>(), a[0].parse::<f64>()) {
-                            let bid_qty = b[1].parse::<f64>().unwrap_or(0.0);
-                            let ask_qty = a[1].parse::<f64>().unwrap_or(0.0);
+            match serde_json::from_str::<BybitMsg>(s) {
+                Ok(msg) => {
+                    let dopt: Option<BybitData> = match &msg.data {
+                        BybitDataCont::Obj(d) => Some(d.clone()),
+                        BybitDataCont::Arr(v) => v.get(0).cloned(),
+                    };
+                    if let Some(d) = dopt {
+                        if let (Some(b), Some(a)) = (d.b.get(0), d.a.get(0)) {
+                            let bid = match b[0].parse::<f64>() {
+                                Ok(v) if v.is_finite() => v,
+                                Ok(_) => {
+                                    log_parse_drop(
+                                        "bybit_collector",
+                                        "non_finite_bid",
+                                        &"non-finite bid",
+                                        &b[0],
+                                    );
+                                    return false;
+                                }
+                                Err(err) => {
+                                    log_parse_drop("bybit_collector", "bid", &err, &b[0]);
+                                    return false;
+                                }
+                            };
+                            let ask = match a[0].parse::<f64>() {
+                                Ok(v) if v.is_finite() => v,
+                                Ok(_) => {
+                                    log_parse_drop(
+                                        "bybit_collector",
+                                        "non_finite_ask",
+                                        &"non-finite ask",
+                                        &a[0],
+                                    );
+                                    return false;
+                                }
+                                Err(err) => {
+                                    log_parse_drop("bybit_collector", "ask", &err, &a[0]);
+                                    return false;
+                                }
+                            };
+                            let bid_qty = match b[1].parse::<f64>() {
+                                Ok(v) if v.is_finite() => v,
+                                Ok(_) => {
+                                    log_parse_drop(
+                                        "bybit_collector",
+                                        "non_finite_bid_qty",
+                                        &"non-finite bid qty",
+                                        &b[1],
+                                    );
+                                    return false;
+                                }
+                                Err(err) => {
+                                    log_parse_drop("bybit_collector", "bid_qty", &err, &b[1]);
+                                    return false;
+                                }
+                            };
+                            let ask_qty = match a[1].parse::<f64>() {
+                                Ok(v) if v.is_finite() => v,
+                                Ok(_) => {
+                                    log_parse_drop(
+                                        "bybit_collector",
+                                        "non_finite_ask_qty",
+                                        &"non-finite ask qty",
+                                        &a[1],
+                                    );
+                                    return false;
+                                }
+                                Err(err) => {
+                                    log_parse_drop("bybit_collector", "ask_qty", &err, &a[1]);
+                                    return false;
+                                }
+                            };
                             let cts_ms = d
                                 .cts
                                 .or(msg.cts)
@@ -101,6 +241,9 @@ pub fn update_bbo_store(s: &str, store: &mut BboStore) -> bool {
                         }
                     }
                 }
+                Err(err) => {
+                    log_parse_drop("bybit_collector", "orderbook", &err, s);
+                }
             }
         }
     }
@@ -118,63 +261,127 @@ pub fn update_trades<const N: usize>(s: &str, trades: &mut FixedTrades<N>) -> us
     }
 
     let mut inserted = 0usize;
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(s) {
-        if let Some(data) = value.get("data").and_then(|d| d.as_array()) {
-            let system_ts_ms = value
-                .get("ts")
-                .and_then(|v| v.as_u64())
-                .expect("Bybit trade message missing system timestamp `ts`");
-            for entry in data {
-                let price = entry
-                    .get("p")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<f64>().ok());
-                let size = entry
-                    .get("v")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<f64>().ok());
-                if price.is_none() || size.is_none() {
-                    continue;
-                }
+    let value = match serde_json::from_str::<serde_json::Value>(s) {
+        Ok(value) => value,
+        Err(err) => {
+            log_parse_drop("bybit_collector", "json", &err, s);
+            return 0;
+        }
+    };
+    if let Some(data) = value.get("data").and_then(|d| d.as_array()) {
+        let system_ts_ms = value
+            .get("ts")
+            .and_then(|v| v.as_u64())
+            .expect("Bybit trade message missing system timestamp `ts`");
+        for entry in data {
+            let price = entry
+                .get("p")
+                .and_then(|v| v.as_str())
+                .and_then(|s| match s.parse::<f64>() {
+                    Ok(v) if v.is_finite() => Some(v),
+                    Ok(_) => {
+                        log_parse_drop("bybit_collector", "non_finite_price", &"non-finite price", s);
+                        None
+                    }
+                    Err(err) => {
+                        log_parse_drop("bybit_collector", "price", &err, s);
+                        None
+                    }
+                })
+                .filter(|v| v.is_finite())
+                .or_else(|| {
+                    log_parse_drop("bybit_collector", "missing_price", &"missing price", s);
+                    None
+                });
+            let size = entry
+                .get("v")
+                .and_then(|v| v.as_str())
+                .and_then(|s| match s.parse::<f64>() {
+                    Ok(v) if v.is_finite() => Some(v),
+                    Ok(_) => {
+                        log_parse_drop("bybit_collector", "non_finite_size", &"non-finite size", s);
+                        None
+                    }
+                    Err(err) => {
+                        log_parse_drop("bybit_collector", "size", &err, s);
+                        None
+                    }
+                })
+                .filter(|v| v.is_finite())
+                .or_else(|| {
+                    log_parse_drop("bybit_collector", "missing_size", &"missing size", s);
+                    None
+                });
+            if price.is_none() || size.is_none() {
+                continue;
+            }
 
-                let px_i = (price.unwrap() * PRICE_SCALE).round() as Price;
-                let qty_i = (size.unwrap() * QTY_SCALE).round() as Qty;
-                let ts_ms = entry
-                    .get("T")
-                    .and_then(|v| match v {
-                        Value::Number(n) => n.as_u64(),
-                        Value::String(s) => s.parse::<u64>().ok(),
-                        _ => None,
-                    })
-                    .expect("Bybit trade message missing engine timestamp `T`");
-                let system_ts_ns = ms_to_ns(system_ts_ms);
-                let ts = ms_to_ns(ts_ms);
-                // Prefer explicit taker side (`S`/`side`) and fall back to legacy buyer/taker flag.
-                let is_buyer_maker = entry
-                    .get("S")
-                    .and_then(|v| v.as_str())
-                    .map(|side| side.eq_ignore_ascii_case("Sell"))
-                    .or_else(|| {
-                        entry
-                            .get("side")
-                            .and_then(|v| v.as_str())
-                            .map(|side| side.eq_ignore_ascii_case("Sell"))
-                    })
-                    .or_else(|| {
-                        entry
-                            .get("BT")
-                            .and_then(|v| v.as_bool())
-                            .map(|buyer_is_taker| !buyer_is_taker)
-                    })
-                    .or_else(|| find_first_bool(s, &["BT"]).map(|buyer_is_taker| !buyer_is_taker))
-                    .unwrap_or(false);
+            let px_i = (price.unwrap() * PRICE_SCALE).round() as Price;
+            let qty_i = (size.unwrap() * QTY_SCALE).round() as Qty;
+            let ts_ms = entry
+                .get("T")
+                .and_then(|v| match v {
+                    Value::Number(n) => n.as_u64(),
+                    Value::String(s) => match s.parse::<u64>() {
+                        Ok(v) => Some(v),
+                        Err(err) => {
+                            log_parse_drop("bybit_collector", "ts", &err, s);
+                            None
+                        }
+                    },
+                    _ => None,
+                })
+                .expect("Bybit trade message missing engine timestamp `T`");
+            let system_ts_ns = ms_to_ns(system_ts_ms);
+            let ts = ms_to_ns(ts_ms);
+            // Prefer explicit taker side (`S`/`side`) and fall back to legacy buyer/taker flag.
+            let is_buyer_maker = entry
+                .get("S")
+                .and_then(|v| v.as_str())
+                .map(|side| side.eq_ignore_ascii_case("Sell"))
+                .or_else(|| {
+                    entry
+                        .get("side")
+                        .and_then(|v| v.as_str())
+                        .map(|side| side.eq_ignore_ascii_case("Sell"))
+                })
+                .or_else(|| {
+                    entry
+                        .get("BT")
+                        .and_then(|v| v.as_bool())
+                        .map(|buyer_is_taker| !buyer_is_taker)
+                })
+                .or_else(|| find_first_bool(s, &["BT"]).map(|buyer_is_taker| !buyer_is_taker))
+                .or_else(|| {
+                    log_parse_drop("bybit_collector", "missing_side", &"missing side", s);
+                    None
+                });
 
-                let seq = entry
-                    .get("t")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(0) as u64;
+            let seq = entry
+                .get("seq")
+                .and_then(|v| match v {
+                    Value::Number(n) => n.as_u64().or_else(|| {
+                        log_parse_drop("bybit_collector", "seq", &"non-u64 seq", s);
+                        None
+                    }),
+                    Value::String(raw) => match raw.parse::<u64>() {
+                        Ok(v) => Some(v),
+                        Err(err) => {
+                            log_parse_drop("bybit_collector", "seq", &err, raw);
+                            None
+                        }
+                    },
+                    _ => {
+                        log_parse_drop("bybit_collector", "seq", &"unexpected seq type", s);
+                        None
+                    }
+                })
+                .or_else(|| {
+                    log_parse_drop("bybit_collector", "missing_seq", &"missing seq", s);
+                    None
+                });
 
+            if let (Some(is_buyer_maker), Some(seq)) = (is_buyer_maker, seq) {
                 let trade = Trade::new(px_i, qty_i, ts, seq, is_buyer_maker, Some(system_ts_ns));
                 trades.push(trade);
                 inserted += 1;
@@ -190,7 +397,13 @@ pub fn update_tickers(s: &str, store: &mut TickerStore) -> Option<(String, Ticke
         return None;
     }
 
-    let root: Value = serde_json::from_str(s).ok()?;
+    let root: Value = match serde_json::from_str(s) {
+        Ok(val) => val,
+        Err(err) => {
+            log_parse_drop("bybit_collector", "json", &err, s);
+            return None;
+        }
+    };
     let data = root.get("data")?;
     let payload = if data.is_array() {
         data.as_array()?.first()?
@@ -205,7 +418,8 @@ pub fn update_tickers(s: &str, store: &mut TickerStore) -> Option<(String, Ticke
     let symbol = payload
         .get("symbol")
         .and_then(|v| v.as_str())
-        .unwrap_or_else(|| topic.rsplit('.').next().unwrap_or(topic));
+        .or_else(|| topic.rsplit('.').next())
+        .unwrap_or(topic);
     let mut snapshot = store.get(symbol).copied().unwrap_or_default();
 
     if let Some(last_px) = value_to_f64(payload, &["lastPrice", "last_price"]) {
@@ -239,7 +453,7 @@ pub fn update_tickers(s: &str, store: &mut TickerStore) -> Option<(String, Ticke
     if let Some(seq) = value_to_u64(payload, &["seq", "sequence"]) {
         snapshot.ticker.seq = seq;
     } else {
-        snapshot.ticker.seq = 0;
+        log_parse_drop("bybit_collector", "missing_seq", &"missing seq", s);
     }
 
     if let Some(ts_ms) =
@@ -258,12 +472,31 @@ fn value_to_f64(value: &Value, keys: &[&str]) -> Option<f64> {
             match entry {
                 Value::Number(n) => {
                     if let Some(v) = n.as_f64() {
-                        return Some(v);
+                        if v.is_finite() {
+                            return Some(v);
+                        }
+                        log_parse_drop(
+                            "bybit_collector",
+                            "non_finite",
+                            &"non-finite number",
+                            &n.to_string(),
+                        );
                     }
                 }
                 Value::String(s) => {
-                    if let Ok(v) = s.parse::<f64>() {
-                        return Some(v);
+                    match s.parse::<f64>() {
+                        Ok(v) if v.is_finite() => return Some(v),
+                        Ok(_) => {
+                            log_parse_drop(
+                                "bybit_collector",
+                                "non_finite",
+                                &"non-finite number",
+                                s,
+                            );
+                        }
+                        Err(err) => {
+                            log_parse_drop("bybit_collector", "f64", &err, s);
+                        }
                     }
                 }
                 _ => {}
@@ -281,10 +514,14 @@ fn value_to_u64(value: &Value, keys: &[&str]) -> Option<u64> {
                     if let Some(v) = n.as_u64() {
                         return Some(v);
                     }
+                    log_parse_drop("bybit_collector", "u64", &"non-u64 number", &n.to_string());
                 }
                 Value::String(s) => {
-                    if let Ok(v) = s.parse::<u64>() {
-                        return Some(v);
+                    match s.parse::<u64>() {
+                        Ok(v) => return Some(v),
+                        Err(err) => {
+                            log_parse_drop("bybit_collector", "u64", &err, s);
+                        }
                     }
                 }
                 _ => {}

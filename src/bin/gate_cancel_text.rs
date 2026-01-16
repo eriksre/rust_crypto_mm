@@ -42,7 +42,9 @@ struct Cli {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    dotenvy::dotenv().ok();
+    if let Err(err) = dotenvy::dotenv() {
+        eprintln!("WARN: failed to load .env: {}", err);
+    }
     let cli = Cli::parse();
 
     if cli.size <= 0.0 {
@@ -79,7 +81,7 @@ async fn main() -> Result<()> {
         ws_config
             .ws_url
             .as_deref()
-            .unwrap_or("wss://fx-ws.gateio.ws/v4/ws")
+            .ok_or_else(|| anyhow!("missing ws_url for Gate websocket"))?
             .trim_end_matches('/'),
         settle
     );

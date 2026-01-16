@@ -3,6 +3,7 @@
 use crate::base_classes::order_book::ArrayOrderBook;
 use crate::base_classes::orderbook_trait::OrderBookOps;
 use crate::base_classes::types::*;
+use crate::utils::parsing::log_parse_drop;
 use crate::utils::time::ms_to_ns;
 use serde::Deserialize;
 
@@ -48,7 +49,13 @@ where
 {
     Ok(match serde_json::Value::deserialize(deserializer)? {
         serde_json::Value::Number(n) => n.as_u64(),
-        serde_json::Value::String(s) => s.parse::<u64>().ok(),
+        serde_json::Value::String(s) => match s.parse::<u64>() {
+            Ok(v) => Some(v),
+            Err(err) => {
+                log_parse_drop("okx_orderbook", "ts", &err, &s);
+                None
+            }
+        },
         serde_json::Value::Null => None,
         _ => None,
     })
@@ -63,10 +70,17 @@ where
             if let Some(u) = n.as_u64() {
                 Some(u)
             } else {
+                log_parse_drop("okx_orderbook", "seq", &"non-u64 seq", &n.to_string());
                 None
             }
         }
-        serde_json::Value::String(s) => s.parse::<u64>().ok(),
+        serde_json::Value::String(s) => match s.parse::<u64>() {
+            Ok(v) => Some(v),
+            Err(err) => {
+                log_parse_drop("okx_orderbook", "seq", &err, &s);
+                None
+            }
+        },
         serde_json::Value::Null => None,
         _ => None,
     })
@@ -118,8 +132,40 @@ impl<const N: usize> OkxBook<N> {
         levels
             .iter()
             .filter_map(|entry| {
-                let px = entry.get(0)?.parse::<f64>().ok()?;
-                let qty = entry.get(1)?.parse::<f64>().ok()?;
+                let px_str = entry.get(0)?;
+                let qty_str = entry.get(1)?;
+                let px = match px_str.parse::<f64>() {
+                    Ok(v) if v.is_finite() => v,
+                    Ok(_) => {
+                        log_parse_drop(
+                            "okx_orderbook",
+                            "non_finite_px",
+                            &"non-finite px",
+                            px_str,
+                        );
+                        return None;
+                    }
+                    Err(err) => {
+                        log_parse_drop("okx_orderbook", "px", &err, px_str);
+                        return None;
+                    }
+                };
+                let qty = match qty_str.parse::<f64>() {
+                    Ok(v) if v.is_finite() => v,
+                    Ok(_) => {
+                        log_parse_drop(
+                            "okx_orderbook",
+                            "non_finite_qty",
+                            &"non-finite qty",
+                            qty_str,
+                        );
+                        return None;
+                    }
+                    Err(err) => {
+                        log_parse_drop("okx_orderbook", "qty", &err, qty_str);
+                        return None;
+                    }
+                };
                 Some(self.conv(px, qty))
             })
             .collect()
@@ -140,11 +186,23 @@ impl<const N: usize> OkxBook<N> {
             return false;
         }
         let datum = &msg.data[0];
-        let seq_val = Self::extract_seq(datum).unwrap_or(0);
+        let seq_val = match Self::extract_seq(datum) {
+            Some(seq) => seq,
+            None => {
+                log_parse_drop("okx_orderbook", "missing_seq", &"missing seq", "");
+                return false;
+            }
+        };
         if seq_val == 0 {
             return false;
         }
-        let ts_ms = datum.ts.unwrap_or(0);
+        let ts_ms = match datum.ts {
+            Some(ts) => ts,
+            None => {
+                log_parse_drop("okx_orderbook", "missing_ts", &"missing ts", "");
+                return false;
+            }
+        };
         let ts = ms_to_ns(ts_ms);
         self.last_system_ts_ns = datum.ts.map(ms_to_ns);
         let seq: Seq = seq_val as Seq;
@@ -195,7 +253,13 @@ impl<const N: usize> OkxBook<N> {
             return false;
         }
         let datum = &msg.data[0];
-        let seq_val = Self::extract_seq(datum).unwrap_or(0);
+        let seq_val = match Self::extract_seq(datum) {
+            Some(seq) => seq,
+            None => {
+                log_parse_drop("okx_orderbook", "missing_seq", &"missing seq", "");
+                return false;
+            }
+        };
         if seq_val == 0 || seq_val <= self.last_bbo_seq {
             return false;
         }
@@ -204,19 +268,89 @@ impl<const N: usize> OkxBook<N> {
                 return false;
             }
         }
-        let ts_ms = datum.ts.unwrap_or(0);
+        let ts_ms = match datum.ts {
+            Some(ts) => ts,
+            None => {
+                log_parse_drop("okx_orderbook", "missing_ts", &"missing ts", "");
+                return false;
+            }
+        };
         let ts = ms_to_ns(ts_ms);
         self.last_bbo_system_ts_ns = datum.ts.map(ms_to_ns);
         let seq: Seq = seq_val as Seq;
 
         let best_bid = datum.bids.iter().find_map(|lvl| {
-            let px = lvl.get(0)?.parse::<f64>().ok()?;
-            let qty = lvl.get(1)?.parse::<f64>().ok()?;
+            let px_str = lvl.get(0)?;
+            let qty_str = lvl.get(1)?;
+            let px = match px_str.parse::<f64>() {
+                Ok(v) if v.is_finite() => v,
+                Ok(_) => {
+                    log_parse_drop(
+                        "okx_orderbook",
+                        "non_finite_px",
+                        &"non-finite px",
+                        px_str,
+                    );
+                    return None;
+                }
+                Err(err) => {
+                    log_parse_drop("okx_orderbook", "px", &err, px_str);
+                    return None;
+                }
+            };
+            let qty = match qty_str.parse::<f64>() {
+                Ok(v) if v.is_finite() => v,
+                Ok(_) => {
+                    log_parse_drop(
+                        "okx_orderbook",
+                        "non_finite_qty",
+                        &"non-finite qty",
+                        qty_str,
+                    );
+                    return None;
+                }
+                Err(err) => {
+                    log_parse_drop("okx_orderbook", "qty", &err, qty_str);
+                    return None;
+                }
+            };
             Some(self.conv(px, qty))
         });
         let best_ask = datum.asks.iter().find_map(|lvl| {
-            let px = lvl.get(0)?.parse::<f64>().ok()?;
-            let qty = lvl.get(1)?.parse::<f64>().ok()?;
+            let px_str = lvl.get(0)?;
+            let qty_str = lvl.get(1)?;
+            let px = match px_str.parse::<f64>() {
+                Ok(v) if v.is_finite() => v,
+                Ok(_) => {
+                    log_parse_drop(
+                        "okx_orderbook",
+                        "non_finite_px",
+                        &"non-finite px",
+                        px_str,
+                    );
+                    return None;
+                }
+                Err(err) => {
+                    log_parse_drop("okx_orderbook", "px", &err, px_str);
+                    return None;
+                }
+            };
+            let qty = match qty_str.parse::<f64>() {
+                Ok(v) if v.is_finite() => v,
+                Ok(_) => {
+                    log_parse_drop(
+                        "okx_orderbook",
+                        "non_finite_qty",
+                        &"non-finite qty",
+                        qty_str,
+                    );
+                    return None;
+                }
+                Err(err) => {
+                    log_parse_drop("okx_orderbook", "qty", &err, qty_str);
+                    return None;
+                }
+            };
             Some(self.conv(px, qty))
         });
 

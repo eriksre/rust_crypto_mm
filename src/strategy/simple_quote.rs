@@ -23,7 +23,7 @@ const DEFAULT_REPRICE_FRACTION: f64 = 0.25;
 const DEFAULT_QUOTE_INTERVAL_MS: u64 = 200;
 const DEFAULT_MAX_AGE_MS: u64 = 5_000;
 const DEFAULT_CROSS_GUARD_TICKS: u32 = 1;
-const DEFAULT_CANCELLATION_DELAY_MS: u64 = 150;
+const DEFAULT_CANCELLATION_DELAY_MS: u64 = 200;
 
 fn default_min_tick() -> f64 {
     DEFAULT_MIN_TICK
@@ -160,7 +160,7 @@ struct ActiveQuote {
     side: Side,
     price: f64,
     placed_at: Instant,
-    cancel_pending_since: Option<Instant>,
+    delayed_cancel_since: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -264,7 +264,9 @@ impl SimpleQuoteStrategy {
         }
 
         let mut cancels = Vec::new();
-        let mut cancel_all = false;
+        let mut cancel_ids = HashSet::new();
+        let mut immediate_bid = false;
+        let mut immediate_ask = false;
         let (bid_target, ask_target, half_spread_px) =
             self.compute_targets(price, self.latest_best_bid, self.latest_best_ask);
         let reprice_threshold_px = self.reprice_threshold_px(half_spread_px);
@@ -273,17 +275,17 @@ impl SimpleQuoteStrategy {
         } else {
             Some(Duration::from_millis(self.config.max_age_ms))
         };
-        let cancel_delay = Duration::from_millis(self.config.cancellation_delay_ms);
+        let other_side_delay = Duration::from_millis(self.config.cancellation_delay_ms);
 
         let quotes_snapshot: Vec<(ClientOrderId, ActiveQuote)> = self
             .active_quotes
             .iter()
             .map(|(id, quote)| (id.clone(), quote.clone()))
             .collect();
-        let mut update_pending: Vec<(ClientOrderId, Option<Instant>)> = Vec::new();
+        let mut delayed_since_updates: HashMap<ClientOrderId, Option<Instant>> = HashMap::new();
 
-        for (id, quote) in quotes_snapshot {
-            if self.pending_cancels.contains(&id) || self.scheduled_cancels.contains(&id) {
+        for (id, quote) in &quotes_snapshot {
+            if self.pending_cancels.contains(id) || self.scheduled_cancels.contains(id) {
                 continue;
             }
             let side = quote.side;
@@ -309,44 +311,63 @@ impl SimpleQuoteStrategy {
                 Side::Ask => ask_target,
             };
             let needs_reprice = (target_price - price).abs() >= reprice_threshold_px;
-            let cancel_candidate = stale || crossed || needs_reprice;
-            let pending_since = if cancel_candidate && !stale {
-                Some(quote.cancel_pending_since.unwrap_or(now))
-            } else {
-                None
-            };
-            update_pending.push((id.clone(), pending_since));
+            let cancel_signal = stale || crossed || needs_reprice;
+            if cancel_signal {
+                match side {
+                    Side::Bid => immediate_bid = true,
+                    Side::Ask => immediate_ask = true,
+                }
+                cancels.push(id.clone());
+                cancel_ids.insert(id.clone());
+                continue;
+            }
 
-            let delay_elapsed = pending_since
-                .map(|since| now.saturating_duration_since(since) >= cancel_delay)
+            let delay_elapsed = quote
+                .delayed_cancel_since
+                .map(|since| now.saturating_duration_since(since) >= other_side_delay)
                 .unwrap_or(false);
-
-            if stale || (!stale && cancel_candidate && delay_elapsed) {
-                cancel_all = true;
+            if delay_elapsed {
+                cancels.push(id.clone());
+                cancel_ids.insert(id.clone());
+                continue;
             }
+
+            delayed_since_updates.insert(id.clone(), quote.delayed_cancel_since);
         }
 
-        for (id, pending_since) in update_pending {
-            if let Some(quote) = self.active_quotes.get_mut(&id) {
-                quote.cancel_pending_since = pending_since;
-            }
-        }
-
-        if cancel_all {
-            // Keep the system two-sided: if we need to reprice any leg, cancel all tracked live
-            // orders so the next quote tick can re-submit both sides together.
-            for id in self.active_orders.clone() {
-                if self.pending_cancels.contains(&id) || self.scheduled_cancels.contains(&id) {
+        if immediate_bid || immediate_ask {
+            // Cancel the triggered side immediately, but leave the opposite side live briefly.
+            for (id, quote) in &quotes_snapshot {
+                if self.pending_cancels.contains(id) || self.scheduled_cancels.contains(id) {
                     continue;
                 }
-                if self.active_quotes.contains_key(&id) {
-                    if self.config.venue == Venue::Lighter {
-                        self.scheduled_cancels.insert(id.clone());
-                    } else {
-                        self.pending_cancels.insert(id.clone());
-                    }
-                    cancels.push(id);
+                let same_side = match quote.side {
+                    Side::Bid => immediate_bid,
+                    Side::Ask => immediate_ask,
+                };
+                if cancel_ids.contains(id) || same_side {
+                    continue;
                 }
+                let entry = delayed_since_updates
+                    .entry(id.clone())
+                    .or_insert(quote.delayed_cancel_since);
+                if entry.is_none() {
+                    *entry = Some(now);
+                }
+            }
+        }
+
+        for (id, delayed_since) in delayed_since_updates {
+            if let Some(quote) = self.active_quotes.get_mut(&id) {
+                quote.delayed_cancel_since = delayed_since;
+            }
+        }
+
+        for id in &cancels {
+            if self.config.venue == Venue::Lighter {
+                self.scheduled_cancels.insert(id.clone());
+            } else {
+                self.pending_cancels.insert(id.clone());
             }
         }
 
@@ -374,6 +395,8 @@ impl SimpleQuoteStrategy {
             return None;
         }
 
+        let delayed_cancel = self.has_delayed_cancel();
+
         let (has_bid, has_ask) = self.active_orders.iter().fold((false, false), |acc, id| {
             let (mut bid_seen, mut ask_seen) = acc;
             if self.scheduled_cancels.contains(id)
@@ -390,46 +413,45 @@ impl SimpleQuoteStrategy {
             (bid_seen, ask_seen)
         });
 
-        let want_bid = !has_bid;
-        let want_ask = !has_ask;
-        if !want_bid && !want_ask {
-            return None;
-        }
-
-        let (bid_px, ask_px, _) = self.compute_targets(price, best_bid, best_ask);
-        if self.config.venue == Venue::Lighter {
-            if let Some(lighter_mid) = Self::lighter_mid_from_state() {
-                if bid_px >= lighter_mid || ask_px <= lighter_mid {
-                    return None;
-                }
-            }
+        let mut want_bid = !has_bid;
+        let mut want_ask = !has_ask;
+        if delayed_cancel {
+            want_bid = false;
+            want_ask = false;
         }
 
         let mut intents = Vec::new();
-        if want_bid {
-            intents.push(QuoteIntent::new(
-                self.config.venue,
-                self.config.symbol.clone(),
-                Side::Bid,
-                bid_px,
-                self.base_size,
-                TimeInForce::PostOnly,
-                self.next_client_id("B"),
-            ));
-        }
-        if want_ask {
-            intents.push(QuoteIntent::new(
-                self.config.venue,
-                self.config.symbol.clone(),
-                Side::Ask,
-                ask_px,
-                self.base_size,
-                TimeInForce::PostOnly,
-                self.next_client_id("S"),
-            ));
-        }
-        if intents.is_empty() {
-            return None;
+        if want_bid || want_ask {
+            let (bid_px, ask_px, _) = self.compute_targets(price, best_bid, best_ask);
+            if self.config.venue == Venue::Lighter {
+                if let Some(lighter_mid) = Self::lighter_mid_from_state() {
+                    if bid_px >= lighter_mid || ask_px <= lighter_mid {
+                        return None;
+                    }
+                }
+            }
+            if want_bid {
+                intents.push(QuoteIntent::new(
+                    self.config.venue,
+                    self.config.symbol.clone(),
+                    Side::Bid,
+                    bid_px,
+                    self.base_size,
+                    TimeInForce::PostOnly,
+                    self.next_client_id("B"),
+                ));
+            }
+            if want_ask {
+                intents.push(QuoteIntent::new(
+                    self.config.venue,
+                    self.config.symbol.clone(),
+                    Side::Ask,
+                    ask_px,
+                    self.base_size,
+                    TimeInForce::PostOnly,
+                    self.next_client_id("S"),
+                ));
+            }
         }
 
         let cancels = self
@@ -438,6 +460,10 @@ impl SimpleQuoteStrategy {
             .filter(|id| self.scheduled_cancels.contains(*id))
             .cloned()
             .collect::<Vec<_>>();
+
+        if intents.is_empty() && cancels.is_empty() {
+            return None;
+        }
 
         Some(QuotePlan {
             reference_price: price,
@@ -469,7 +495,7 @@ impl SimpleQuoteStrategy {
                     side: intent.side,
                     price: intent.price,
                     placed_at: plan.planned_at,
-                    cancel_pending_since: None,
+                    delayed_cancel_since: None,
                 },
             );
         }
@@ -605,7 +631,13 @@ impl SimpleQuoteStrategy {
     }
 
     fn lighter_mid_from_state() -> Option<f64> {
-        let guard = state().lock().ok()?;
+        let guard = match state().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                eprintln!("ERROR: lighter state lock poisoned: {}", poisoned);
+                return None;
+            }
+        };
         let snap = guard.lighter.orderbook;
         if let Some(price) = snap.price.filter(|p| p.is_finite() && *p > 0.0) {
             return Some(price);
@@ -620,6 +652,14 @@ impl SimpleQuoteStrategy {
             }
             _ => None,
         }
+    }
+
+    fn has_delayed_cancel(&self) -> bool {
+        self.active_quotes.iter().any(|(id, quote)| {
+            !self.pending_cancels.contains(id)
+                && !self.scheduled_cancels.contains(id)
+                && quote.delayed_cancel_since.is_some()
+        })
     }
 
     fn next_client_id(&mut self, side_tag: &str) -> ClientOrderId {

@@ -1,5 +1,6 @@
 use crate::base_classes::types::Ts;
 use crate::base_classes::ws::{AppHeartbeat, ExchangeHandler, HeartbeatPayload};
+use crate::utils::parsing::{log_parse_drop, log_parse_drop_bytes};
 use crate::exchanges::endpoints::LighterWs;
 use crate::exchanges::lighter::orderbook::LighterOrderBookMsg;
 use crate::exchanges::lighter::rest::LighterMarketMeta;
@@ -160,22 +161,32 @@ impl LighterFrame {
 
     pub fn preparse_text(&mut self, text: &str) {
         if self.json_cache.is_none() {
-            if let Ok(value) = serde_json::from_str::<Value>(text) {
-                self.channel_cache = value
-                    .get("channel")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                self.json_cache = Some(value);
+            match serde_json::from_str::<Value>(text) {
+                Ok(value) => {
+                    self.channel_cache = value
+                        .get("channel")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    self.json_cache = Some(value);
+                }
+                Err(err) => {
+                    log_parse_drop("lighter_parser", "json", &err, text);
+                }
             }
         }
         self.maybe_parse_specialized(text.as_bytes());
     }
 
     pub fn preparse_binary(&mut self) {
-        if let Ok(text) = core::str::from_utf8(&self.raw) {
-            let owned = text.to_string();
-            self.preparse_text(&owned);
-        }
+        let text = match core::str::from_utf8(&self.raw) {
+            Ok(text) => text,
+            Err(err) => {
+                log_parse_drop_bytes("lighter_parser", "utf8", &err, &self.raw);
+                return;
+            }
+        };
+        let owned = text.to_string();
+        self.preparse_text(&owned);
     }
 
     fn maybe_parse_specialized(&mut self, bytes: &[u8]) {
@@ -184,14 +195,20 @@ impl LighterFrame {
             .map_or(false, |ch| ch.starts_with("order_book"))
             && self.order_book_cache.is_none()
         {
-            if let Ok(msg) = serde_json::from_slice::<LighterOrderBookMsg>(bytes) {
-                self.order_book_cache = Some(msg);
+            match serde_json::from_slice::<LighterOrderBookMsg>(bytes) {
+                Ok(msg) => self.order_book_cache = Some(msg),
+                Err(err) => {
+                    log_parse_drop_bytes("lighter_parser", "order_book", &err, bytes);
+                }
             }
         }
         if self.channel().map_or(false, |ch| ch.starts_with("trade")) && self.trades_cache.is_none()
         {
-            if let Ok(msg) = serde_json::from_slice::<LighterTradesMsg>(bytes) {
-                self.trades_cache = Some(msg);
+            match serde_json::from_slice::<LighterTradesMsg>(bytes) {
+                Ok(msg) => self.trades_cache = Some(msg),
+                Err(err) => {
+                    log_parse_drop_bytes("lighter_parser", "trades", &err, bytes);
+                }
             }
         }
         if self
@@ -199,24 +216,38 @@ impl LighterFrame {
             .map_or(false, |ch| ch.starts_with("market_stats"))
             && self.stats_cache.is_none()
         {
-            if let Ok(msg) = serde_json::from_slice::<LighterMarketStatsMsg>(bytes) {
-                self.stats_cache = Some(msg);
+            match serde_json::from_slice::<LighterMarketStatsMsg>(bytes) {
+                Ok(msg) => self.stats_cache = Some(msg),
+                Err(err) => {
+                    log_parse_drop_bytes("lighter_parser", "market_stats", &err, bytes);
+                }
             }
         }
     }
 
     pub fn text(&self) -> Option<&str> {
-        core::str::from_utf8(&self.raw).ok()
+        match core::str::from_utf8(&self.raw) {
+            Ok(text) => Some(text),
+            Err(err) => {
+                log_parse_drop_bytes("lighter_parser", "utf8", &err, &self.raw);
+                None
+            }
+        }
     }
 
     pub fn json(&mut self) -> Option<&Value> {
         if self.json_cache.is_none() {
-            if let Ok(value) = serde_json::from_slice::<Value>(&self.raw) {
-                self.channel_cache = value
-                    .get("channel")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                self.json_cache = Some(value);
+            match serde_json::from_slice::<Value>(&self.raw) {
+                Ok(value) => {
+                    self.channel_cache = value
+                        .get("channel")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    self.json_cache = Some(value);
+                }
+                Err(err) => {
+                    log_parse_drop_bytes("lighter_parser", "json", &err, &self.raw);
+                }
             }
         }
         self.json_cache.as_ref()
@@ -224,16 +255,21 @@ impl LighterFrame {
 
     pub fn channel(&self) -> Option<&str> {
         self.channel_cache.as_deref().or_else(|| {
-            if let Ok(text) = core::str::from_utf8(&self.raw) {
-                if let Some(pos) = text.find("\"channel\"") {
-                    let rest = &text[pos + 9..];
-                    if let Some(colon) = rest.find(':') {
-                        let rest = &rest[colon + 1..];
-                        if let Some(q) = rest.find('"') {
-                            let rest = &rest[q + 1..];
-                            if let Some(end) = rest.find('"') {
-                                return Some(&rest[..end]);
-                            }
+            let text = match core::str::from_utf8(&self.raw) {
+                Ok(text) => text,
+                Err(err) => {
+                    log_parse_drop_bytes("lighter_parser", "utf8", &err, &self.raw);
+                    return None;
+                }
+            };
+            if let Some(pos) = text.find("\"channel\"") {
+                let rest = &text[pos + 9..];
+                if let Some(colon) = rest.find(':') {
+                    let rest = &rest[colon + 1..];
+                    if let Some(q) = rest.find('"') {
+                        let rest = &rest[q + 1..];
+                        if let Some(end) = rest.find('"') {
+                            return Some(&rest[..end]);
                         }
                     }
                 }
@@ -248,8 +284,11 @@ impl LighterFrame {
                 .channel()
                 .map_or(false, |ch| ch.starts_with("order_book"))
         {
-            if let Ok(msg) = serde_json::from_slice::<LighterOrderBookMsg>(&self.raw) {
-                self.order_book_cache = Some(msg);
+            match serde_json::from_slice::<LighterOrderBookMsg>(&self.raw) {
+                Ok(msg) => self.order_book_cache = Some(msg),
+                Err(err) => {
+                    log_parse_drop_bytes("lighter_parser", "order_book", &err, &self.raw);
+                }
             }
         }
         self.order_book_cache.as_ref()
@@ -258,8 +297,11 @@ impl LighterFrame {
     pub fn trades_msg(&mut self) -> Option<&LighterTradesMsg> {
         if self.trades_cache.is_none() && self.channel().map_or(false, |ch| ch.starts_with("trade"))
         {
-            if let Ok(msg) = serde_json::from_slice::<LighterTradesMsg>(&self.raw) {
-                self.trades_cache = Some(msg);
+            match serde_json::from_slice::<LighterTradesMsg>(&self.raw) {
+                Ok(msg) => self.trades_cache = Some(msg),
+                Err(err) => {
+                    log_parse_drop_bytes("lighter_parser", "trades", &err, &self.raw);
+                }
             }
         }
         self.trades_cache.as_ref()
@@ -271,8 +313,11 @@ impl LighterFrame {
                 .channel()
                 .map_or(false, |ch| ch.starts_with("market_stats"))
         {
-            if let Ok(msg) = serde_json::from_slice::<LighterMarketStatsMsg>(&self.raw) {
-                self.stats_cache = Some(msg);
+            match serde_json::from_slice::<LighterMarketStatsMsg>(&self.raw) {
+                Ok(msg) => self.stats_cache = Some(msg),
+                Err(err) => {
+                    log_parse_drop_bytes("lighter_parser", "market_stats", &err, &self.raw);
+                }
             }
         }
         self.stats_cache.as_ref()

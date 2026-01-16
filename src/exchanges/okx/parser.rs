@@ -2,6 +2,7 @@
 
 use crate::base_classes::types::Ts;
 use crate::base_classes::ws::{AppHeartbeat, ExchangeHandler, HeartbeatPayload};
+use crate::utils::parsing::{log_parse_drop, log_parse_drop_bytes};
 use crate::exchanges::endpoints::OkxWs;
 use crate::exchanges::okx::orderbook::OkxMsg;
 use serde_json::{self, Value};
@@ -110,37 +111,78 @@ impl OkxFrame {
     pub fn preparse_text(&mut self, text: &str) {
         let flags = okx_preparse_flags(text);
         if flags.needs_json && self.json_cache.is_none() {
-            self.json_cache = serde_json::from_str::<Value>(text).ok();
+            self.json_cache = match serde_json::from_str::<Value>(text) {
+                Ok(val) => Some(val),
+                Err(err) => {
+                    log_parse_drop("okx_parser", "json", &err, text);
+                    None
+                }
+            };
         }
         if flags.needs_orderbook && self.orderbook_cache.is_none() {
-            self.orderbook_cache = serde_json::from_str::<OkxMsg>(text).ok();
+            self.orderbook_cache = match serde_json::from_str::<OkxMsg>(text) {
+                Ok(val) => Some(val),
+                Err(err) => {
+                    log_parse_drop("okx_parser", "orderbook", &err, text);
+                    None
+                }
+            };
         }
     }
 
     pub fn preparse_binary(&mut self) {
-        if let Ok(text) = core::str::from_utf8(&self.raw) {
-            let flags = okx_preparse_flags(text);
-            if !flags.needs_json && !flags.needs_orderbook {
+        let text = match core::str::from_utf8(&self.raw) {
+            Ok(text) => text,
+            Err(err) => {
+                log_parse_drop_bytes("okx_parser", "utf8", &err, &self.raw);
                 return;
             }
-            if flags.needs_json && self.json_cache.is_none() {
-                self.json_cache = serde_json::from_slice(&self.raw).ok();
-            }
-            if flags.needs_orderbook && self.orderbook_cache.is_none() {
-                self.orderbook_cache = serde_json::from_slice(&self.raw).ok();
-            }
+        };
+        let flags = okx_preparse_flags(text);
+        if !flags.needs_json && !flags.needs_orderbook {
+            return;
+        }
+        if flags.needs_json && self.json_cache.is_none() {
+            self.json_cache = match serde_json::from_slice(&self.raw) {
+                Ok(val) => Some(val),
+                Err(err) => {
+                    log_parse_drop_bytes("okx_parser", "json", &err, &self.raw);
+                    None
+                }
+            };
+        }
+        if flags.needs_orderbook && self.orderbook_cache.is_none() {
+            self.orderbook_cache = match serde_json::from_slice(&self.raw) {
+                Ok(val) => Some(val),
+                Err(err) => {
+                    log_parse_drop_bytes("okx_parser", "orderbook", &err, &self.raw);
+                    None
+                }
+            };
         }
     }
 
     #[inline(always)]
     pub fn text(&self) -> Option<&str> {
-        core::str::from_utf8(&self.raw).ok()
+        match core::str::from_utf8(&self.raw) {
+            Ok(text) => Some(text),
+            Err(err) => {
+                log_parse_drop_bytes("okx_parser", "utf8", &err, &self.raw);
+                None
+            }
+        }
     }
 
     #[inline(always)]
     pub fn json(&mut self) -> Option<&Value> {
         if self.json_cache.is_none() {
-            self.json_cache = serde_json::from_slice(&self.raw).ok();
+            self.json_cache = match serde_json::from_slice(&self.raw) {
+                Ok(val) => Some(val),
+                Err(err) => {
+                    log_parse_drop_bytes("okx_parser", "json", &err, &self.raw);
+                    None
+                }
+            };
         }
         self.json_cache.as_ref()
     }
@@ -148,25 +190,41 @@ impl OkxFrame {
     #[inline(always)]
     pub fn orderbook_msg(&mut self) -> Option<&OkxMsg> {
         if self.orderbook_cache.is_none() {
-            self.orderbook_cache = serde_json::from_slice(&self.raw).ok();
+            self.orderbook_cache = match serde_json::from_slice(&self.raw) {
+                Ok(val) => Some(val),
+                Err(err) => {
+                    log_parse_drop_bytes("okx_parser", "orderbook", &err, &self.raw);
+                    None
+                }
+            };
         }
         self.orderbook_cache.as_ref()
     }
 
     pub fn channel(&self) -> &str {
-        if let Ok(s) = core::str::from_utf8(&self.raw) {
-            if let Some(ch) = find_json_string(s, "channel") {
-                return ch;
+        let s = match core::str::from_utf8(&self.raw) {
+            Ok(text) => text,
+            Err(err) => {
+                log_parse_drop_bytes("okx_parser", "utf8", &err, &self.raw);
+                return "(unknown)";
             }
+        };
+        if let Some(ch) = find_json_string(s, "channel") {
+            return ch;
         }
         "(unknown)"
     }
 
     pub fn event(&self) -> &str {
-        if let Ok(s) = core::str::from_utf8(&self.raw) {
-            if let Some(ev) = find_json_string(s, "event") {
-                return ev;
+        let s = match core::str::from_utf8(&self.raw) {
+            Ok(text) => text,
+            Err(err) => {
+                log_parse_drop_bytes("okx_parser", "utf8", &err, &self.raw);
+                return "(unknown)";
             }
+        };
+        if let Some(ev) = find_json_string(s, "event") {
+            return ev;
         }
         "(unknown)"
     }

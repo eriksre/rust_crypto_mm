@@ -60,3 +60,11 @@ My pricing algorithm:
 turn off naggle to stop kernel message coalessing
 
 make sure sizing is working properly for gate and okx
+
+
+
+
+### Plan for lighter strategy
+
+- One sided cancels. if price moves against me, instantly cancel the shit side. then cancel the good side when stale. there shouldn't be a time delay. 
+- in addition, post a super competitive quote at the side that's advantageous. eg, if price has moved up as per model, then post a bid at a competitive price to capture any marginal selling flow in the 150ms before the 

@@ -4,11 +4,20 @@ use std::path::Path;
 pub const DEFAULT_CONFIG_PATH: &str = "config/gate_mvp.yaml";
 
 pub fn default_symbol() -> String {
-    symbol_from_config(Path::new(DEFAULT_CONFIG_PATH)).unwrap_or_else(|| "BTCUSDT".to_string())
+    match symbol_from_config(Path::new(DEFAULT_CONFIG_PATH)) {
+        Some(sym) => sym,
+        None => panic!("missing symbol in config {}", DEFAULT_CONFIG_PATH),
+    }
 }
 
 pub fn symbol_from_config(path: &Path) -> Option<String> {
-    let contents = read_to_string(path).ok()?;
+    let contents = match read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) => {
+            eprintln!("ERROR: failed to read config {}: {}", path.display(), err);
+            return None;
+        }
+    };
     let mut in_strategy = false;
     for line in contents.lines() {
         let trimmed = line.trim();

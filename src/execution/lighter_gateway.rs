@@ -23,6 +23,7 @@ use crate::execution::types::{
     ClientOrderId, ExchangeOrderId, ExecutionReport, OrderAck, OrderStatus, QuoteIntent,
     TimeInForce,
 };
+use crate::utils::parsing::log_parse_drop;
 use crate::utils::time::{current_unix_ms, current_unix_ts};
 
 use super::gateway::ExecutionGateway;
@@ -197,13 +198,22 @@ impl LighterSigner {
         // Avoid a confusing libloading error when the wrong file type is configured
         // (e.g. a macOS .dylib on Linux => "invalid ELF header").
         if !cfg!(target_os = "macos") {
-            let header = std::fs::read(lib_path).ok().and_then(|b| {
-                if b.len() >= 4 {
-                    Some([b[0], b[1], b[2], b[3]])
-                } else {
+            let header = match std::fs::read(lib_path) {
+                Ok(b) => {
+                    if b.len() >= 4 {
+                        Some([b[0], b[1], b[2], b[3]])
+                    } else {
+                        None
+                    }
+                }
+                Err(err) => {
+                    eprintln!(
+                        "WARN: failed to read Lighter signer header at {}: {}",
+                        lib_path, err
+                    );
                     None
                 }
-            });
+            };
             if let Some(h) = header {
                 // 0x7F 'E' 'L' 'F'
                 if h != [0x7F, 0x45, 0x4C, 0x46] {
@@ -1585,7 +1595,7 @@ impl LighterResyncWorker {
             .context("activeOrders request failed")?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = resp.text().await.context("activeOrders read body failed")?;
             if status.as_u16() == 401 && self.debug_prints {
                 eprintln!(
                     "[lighter-resync] activeOrders unauthorized (token_len={})",
@@ -1627,7 +1637,7 @@ impl LighterResyncWorker {
             .context("inactiveOrders request failed")?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
+            let body = resp.text().await.context("inactiveOrders read body failed")?;
             if status.as_u16() == 401 && self.debug_prints {
                 eprintln!(
                     "[lighter-resync] inactiveOrders unauthorized (token_len={})",
@@ -1973,7 +1983,7 @@ impl LighterGateway {
             .await
             .context("nextNonce request failed")?;
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = resp.text().await.context("nextNonce read body failed")?;
         if !status.is_success() {
             bail!("nextNonce HTTP {} body: {}", status, body);
         }
@@ -2015,10 +2025,21 @@ impl LighterGateway {
             let retry_after = resp
                 .headers()
                 .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok());
+                .and_then(|v| match v.to_str() {
+                    Ok(s) => match s.parse::<u64>() {
+                        Ok(v) => Some(v),
+                        Err(err) => {
+                            log_parse_drop("lighter_gateway", "retry_after", &err, s);
+                            None
+                        }
+                    },
+                    Err(err) => {
+                        log_parse_drop("lighter_gateway", "retry_after", &err, "<non-utf8>");
+                        None
+                    }
+                });
 
-            let body = resp.text().await.unwrap_or_default();
+            let body = resp.text().await.context("nextNonce read body failed")?;
             if status.is_success() {
                 let data: NextNonceResponse =
                     serde_json::from_str(&body).context("invalid nextNonce json")?;
@@ -2131,8 +2152,24 @@ impl LighterGateway {
         Ok(data.orders)
     }
 
-    fn parse_f64(s: Option<&String>) -> f64 {
-        s.and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0)
+    fn parse_f64(field: &str, s: Option<&String>) -> Option<f64> {
+        let value = s?;
+        match value.parse::<f64>() {
+            Ok(v) if v.is_finite() => Some(v),
+            Ok(_) => {
+                log_parse_drop(
+                    "lighter_gateway",
+                    field,
+                    &"non-finite number",
+                    value,
+                );
+                None
+            }
+            Err(err) => {
+                log_parse_drop("lighter_gateway", field, &err, value);
+                None
+            }
+        }
     }
 
     fn map_status(status: &str) -> OrderStatus {
@@ -2156,14 +2193,43 @@ impl LighterGateway {
         if let Some(idx) = entry.order_index {
             state.order_index = Some(idx);
         }
-        let filled_base = Self::parse_f64(entry.filled_base_amount.as_ref());
+        let filled_base = match Self::parse_f64(
+            "filled_base_amount",
+            entry.filled_base_amount.as_ref(),
+        ) {
+            Some(v) => v,
+            None => {
+                log_parse_drop(
+                    "lighter_gateway",
+                    "missing_filled_base_amount",
+                    &"missing filled_base_amount",
+                    "",
+                );
+                return;
+            }
+        };
         let filled_size = filled_base / size_scale;
         if filled_size > state.filled + 1e-9 {
             state.filled = filled_size;
             let done = entry
                 .remaining_base_amount
                 .as_ref()
-                .and_then(|s| s.parse::<f64>().ok())
+                .and_then(|s| match s.parse::<f64>() {
+                    Ok(v) if v.is_finite() => Some(v),
+                    Ok(_) => {
+                        log_parse_drop(
+                            "lighter_gateway",
+                            "non_finite_remaining_base_amount",
+                            &"non-finite remaining_base_amount",
+                            s,
+                        );
+                        None
+                    }
+                    Err(err) => {
+                        log_parse_drop("lighter_gateway", "remaining_base_amount", &err, s);
+                        None
+                    }
+                })
                 .map(|rem| rem <= 0.0)
                 .unwrap_or(false);
             let status = if done {

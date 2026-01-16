@@ -31,6 +31,8 @@ struct Cli {
     #[arg(long, default_value = "gateio_secret_key")]
     api_secret_env: String,
     #[arg(long)]
+    settle: String,
+    #[arg(long)]
     cancel: bool,
     #[arg(long, default_value_t = 5)]
     poll_secs: u64,
@@ -40,7 +42,9 @@ struct Cli {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    dotenvy::dotenv().ok();
+    if let Err(err) = dotenvy::dotenv() {
+        eprintln!("WARN: failed to load .env: {}", err);
+    }
     let cli = Cli::parse();
 
     let api_key = std::env::var(&cli.api_key_env)
@@ -55,7 +59,7 @@ async fn main() -> Result<()> {
             api_key,
             api_secret,
             symbol: cli.symbol.clone(),
-            settle: None,
+            settle: Some(cli.settle.clone()),
             ws_url: None,
             contract_size: None,
         })
@@ -110,7 +114,9 @@ async fn main() -> Result<()> {
         }
     }
 
-    gateway.shutdown().await.ok();
+    if let Err(err) = gateway.shutdown().await {
+        eprintln!("ERROR: gateway shutdown failed: {:#}", err);
+    }
     Ok(())
 }
 
