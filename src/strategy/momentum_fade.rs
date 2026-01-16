@@ -104,15 +104,15 @@ struct PriceHistory {
 
 impl PriceHistory {
     fn push(&mut self, ts: Instant, price: f64) {
-        if let Some(last) = self.samples.back() {
+        let ts = if let Some(last) = self.samples.back() {
             if ts < last.ts {
-                eprintln!(
-                    "WARN: momentum_fade history out-of-order sample; ignoring (ts={:?} < {:?})",
-                    ts, last.ts
-                );
-                return;
+                last.ts
+            } else {
+                ts
             }
-        }
+        } else {
+            ts
+        };
         self.samples.push_back(PriceSample { ts, price });
     }
 
