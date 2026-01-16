@@ -3,31 +3,14 @@ strategy:
   venue: lighter
   symbol: XMR_USDT
   size: min
-  min_tick: 0.001
-  use_reference_bbo: true
-  quote_at_reference_bbo: false
-  min_half_spread_bps: 4.0
-  volatility_ewma_alpha: 0.2
-  volatility_multiplier: 1.5
-  fee_bps: 1.0
-  venue_buffer_bps: 1.0
-  reprice_fraction: 0.7
-  quote_interval_ms: 2000
-  max_age_ms: 5000
-  cross_guard_ticks: 1
-  cancellation_delay_ms: 200
 momentum_fade:
   entry_price_source: model
   lookback_ms: 142
-  entry_threshold_bps: 3.0
+  entry_threshold_bps: 5.0
   tick_offset: 1
-  adverse_threshold_bps: 1.0
+  adverse_threshold_bps: 4.0
   max_age_ms: 2000
   min_interval_ms: 50
-  max_order_notional: 50.0
-  max_position_notional: 100.0
-  symbol: XMR_USDT
-  min_tick: 0.001
 pricing_model:
   enabled: true
   time_basis: wire
