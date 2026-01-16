@@ -450,10 +450,29 @@ pub fn update_tickers(s: &str, store: &mut TickerStore) -> Option<(String, Ticke
         snapshot.open_interest_value = Some(oi * mark);
     }
 
-    if let Some(seq) = value_to_u64(payload, &["seq", "sequence"]) {
+    let seq = value_to_u64(payload, &["seq", "sequence"]).or_else(|| {
+        root.get("cs").and_then(|v| match v {
+            Value::Number(n) => n.as_u64().or_else(|| {
+                log_parse_drop("bybit_collector", "cs", &"non-u64 cs", &n.to_string());
+                None
+            }),
+            Value::String(raw) => match raw.parse::<u64>() {
+                Ok(v) => Some(v),
+                Err(err) => {
+                    log_parse_drop("bybit_collector", "cs", &err, raw);
+                    None
+                }
+            },
+            _ => {
+                log_parse_drop("bybit_collector", "cs", &"unexpected cs type", s);
+                None
+            }
+        })
+    });
+    if let Some(seq) = seq {
         snapshot.ticker.seq = seq;
     } else {
-        log_parse_drop("bybit_collector", "missing_seq", &"missing seq", s);
+        snapshot.ticker.seq = 0;
     }
 
     if let Some(ts_ms) =

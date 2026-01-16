@@ -1,0 +1,124 @@
+strategy_kind: momentum_fade
+strategy:
+  venue: lighter
+  symbol: XMR_USDT
+  size: min
+  min_tick: 0.001
+  use_reference_bbo: true
+  quote_at_reference_bbo: false
+  min_half_spread_bps: 4.0
+  volatility_ewma_alpha: 0.2
+  volatility_multiplier: 1.5
+  fee_bps: 1.0
+  venue_buffer_bps: 1.0
+  reprice_fraction: 0.7
+  quote_interval_ms: 2000
+  max_age_ms: 5000
+  cross_guard_ticks: 1
+  cancellation_delay_ms: 200
+momentum_fade:
+  entry_price_source: model
+  lookback_ms: 142
+  entry_threshold_bps: 3.0
+  tick_offset: 1
+  adverse_threshold_bps: 1.0
+  max_age_ms: 2000
+  min_interval_ms: 50
+  max_order_notional: 50.0
+  max_position_notional: 100.0
+  symbol: XMR_USDT
+  min_tick: 0.001
+pricing_model:
+  enabled: true
+  time_basis: wire
+  kalman:
+    ref_stream: lighter:orderbook
+    k_per_sec: 0.0
+    q_per_sec: 0.000001
+    gamma_imb: 0.0
+    bias_by_stream: {}
+    r_by_stream: {}
+    latency_median_us: {}
+    latency_mad_us: {}
+    spread_median_bps: {}
+    spread_mad_bps: {}
+    top_ratio_median: {}
+    top_ratio_mad: {}
+  tuning:
+    trade_dir_bps: 0.5
+    trade_r_mult: 5.0
+    trade_size_beta: 0.0
+    book_w_mid: 0.6
+    book_w_micro: 0.25
+    book_w_vwap5: 0.15
+    lighter_r_mult: 0.05
+    latency_alpha: 0.5
+    stale_alpha: 0.5
+    vol_alpha: 0.0
+    vol_halflife_s: 1.0
+    robust_z: 6.0
+    jump_z: 4.0
+    jump_beta: 0.3
+    bias_ewma_halflife_s: 2.0
+    horizon_ms: 500.0
+    q_floor_mult: 20.0
+    q_dt_floor_ms: 1.0
+    eval_move_bps: 1.0
+    blend_age0_ms: 50.0
+    blend_age_scale_ms: 25.0
+    blend_diff0_bps: 5.0
+    blend_diff_scale_bps: 2.0
+    blend_max_w: 0.8
+    vel_halflife_s: 0.2
+    vel_cap_bps_per_s: 200.0
+    ecm_tau_ms: 0.0
+    common_source: median
+    common_disp0_bps: 3.0
+    common_max_age_ms: 150.0
+    snap_diff0_bps: 5.0
+    snap_diff_scale_bps: 1.0
+    snap_disp_max_bps: 1.5
+    snap_disp_scale_bps: 1.0
+    snap_max_w: 0.9
+    snap_age0_ms: 20.0
+    snap_age_scale_ms: 10.0
+    snap_min_n: 2
+    side_age_tau_ms: 75.0
+    dir_vscale_bps_per_s: 50.0
+    quote_half_spread_floor_bps: 0.5
+    quote_half_spread_cap_bps: 15.0
+    quote_disp0_bps: 0.5
+    quote_disp_mult: 0.5
+    quote_age0_ms: 100.0
+    quote_age_bps_per_100ms: 0.5
+    quote_unc_mult: 0.5
+    lighter_bias_halflife_s: 1.0
+    lighter_bias_cap_bps: 10.0
+feeds:
+  gate: auto
+  binance: auto
+  bybit: auto
+  bitget: auto
+  okx: auto
+  mexc: false
+  lighter: true
+risk:
+  max_order_notional: 50.0
+  max_position_notional: 100.0
+mode:
+  dry_run: false
+  log_fills: false
+  debug_prints: false
+  markout_prints: true
+  demean_prices: false
+logging:
+  enabled: true
+  path: logs/lighter_activity.csv
+  flush_interval_ms: 200
+credentials:
+  api_key_env: lighter_private_key
+  api_secret_env: lighter_secret_key
+  account_index: 498195
+  api_key_index: 2
+  base_url: https://mainnet.zklighter.elliot.ai/
+  signer_lib: auto

@@ -190,12 +190,7 @@ pub fn update_tickers(s: &str, store: &mut TickerStore) -> Option<(String, Ticke
     if let Some(seq) = first_u64(data, &["seq", "seqId", "u"]) {
         snapshot.ticker.seq = seq;
     } else {
-        log_parse_drop(
-            "bitget_collector",
-            "missing_seq",
-            &"missing seq",
-            s,
-        );
+        snapshot.ticker.seq = 0;
     }
 
     if let Some(ts_ms) = first_u64(data, &["ts"]).or_else(|| raw.get("ts").and_then(as_u64)) {

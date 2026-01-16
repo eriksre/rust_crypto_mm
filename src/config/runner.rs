@@ -9,7 +9,7 @@ use crate::base_classes::feed_config::FeedToggles;
 use crate::execution::types::Venue;
 use crate::execution::{GateCredentials, LighterCredentials};
 use crate::pricing::PricingModelConfig;
-use crate::strategy::QuoteConfig;
+use crate::strategy::{MomentumFadeConfig, QuoteConfig, StrategyKind};
 
 fn default_true() -> bool {
     true
@@ -90,7 +90,11 @@ pub struct CredentialsConfig {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct RunnerConfig {
+    #[serde(default)]
+    pub strategy_kind: StrategyKind,
     pub strategy: QuoteConfig,
+    #[serde(default)]
+    pub momentum_fade: Option<MomentumFadeConfig>,
     pub risk: RiskConfig,
     pub mode: ModeConfig,
     #[serde(default)]
@@ -250,12 +254,103 @@ pub fn validate_runner_config(config: &RunnerConfig) -> Result<()> {
     if config.strategy.symbol.trim().is_empty() {
         bail!("strategy.symbol must be set");
     }
+
+    match config.strategy_kind {
+        StrategyKind::SimpleQuote => {
+            if config.momentum_fade.is_some() {
+                bail!("momentum_fade config present but strategy_kind is simple_quote");
+            }
+        }
+        StrategyKind::MomentumFade => {
+            let Some(momentum) = config.momentum_fade.as_ref() else {
+                bail!("strategy_kind=momentum_fade requires momentum_fade config");
+            };
+            if config.strategy.venue != Venue::Lighter {
+                bail!("momentum_fade strategy requires venue=lighter");
+            }
+            if !config.feeds.lighter.initial_enabled() {
+                bail!("momentum_fade strategy requires feeds.lighter to be enabled");
+            }
+            if config
+                .pricing_model
+                .as_ref()
+                .map(|cfg| cfg.enabled)
+                .unwrap_or(false)
+                == false
+            {
+                bail!("momentum_fade strategy requires pricing_model.enabled=true");
+            }
+            if momentum.lookback_ms == 0 {
+                bail!("momentum_fade.lookback_ms must be > 0");
+            }
+            if !momentum.entry_threshold_bps.is_finite() || momentum.entry_threshold_bps < 0.0 {
+                bail!("momentum_fade.entry_threshold_bps must be finite and >= 0");
+            }
+            if !momentum.adverse_threshold_bps.is_finite()
+                || momentum.adverse_threshold_bps < 0.0
+            {
+                bail!("momentum_fade.adverse_threshold_bps must be finite and >= 0");
+            }
+            if momentum.min_interval_ms == 0 {
+                bail!("momentum_fade.min_interval_ms must be > 0");
+            }
+            if let Some(symbol) = &momentum.symbol {
+                if symbol.trim().is_empty() {
+                    bail!("momentum_fade.symbol must be non-empty when set");
+                }
+                if symbol != &config.strategy.symbol {
+                    bail!(
+                        "momentum_fade.symbol {} does not match strategy.symbol {}",
+                        symbol,
+                        config.strategy.symbol
+                    );
+                }
+            }
+            if let Some(min_tick) = momentum.min_tick {
+                if !min_tick.is_finite() || min_tick <= 0.0 {
+                    bail!("momentum_fade.min_tick must be finite and > 0 when set");
+                }
+                if (min_tick - config.strategy.min_tick).abs() > f64::EPSILON {
+                    bail!(
+                        "momentum_fade.min_tick {:.8} does not match strategy.min_tick {:.8}",
+                        min_tick,
+                        config.strategy.min_tick
+                    );
+                }
+            }
+            if let Some(max_order) = momentum.max_order_notional {
+                if !max_order.is_finite() || max_order <= 0.0 {
+                    bail!("momentum_fade.max_order_notional must be finite and > 0 when set");
+                }
+                if (max_order - config.risk.max_order_notional).abs() > f64::EPSILON {
+                    bail!(
+                        "momentum_fade.max_order_notional {:.6} does not match risk.max_order_notional {:.6}",
+                        max_order,
+                        config.risk.max_order_notional
+                    );
+                }
+            }
+            if let Some(max_position) = momentum.max_position_notional {
+                if !max_position.is_finite() || max_position < 0.0 {
+                    bail!("momentum_fade.max_position_notional must be finite and >= 0 when set");
+                }
+                if (max_position - config.risk.max_position_notional).abs() > f64::EPSILON {
+                    bail!(
+                        "momentum_fade.max_position_notional {:.6} does not match risk.max_position_notional {:.6}",
+                        max_position,
+                        config.risk.max_position_notional
+                    );
+                }
+            }
+        }
+    }
     Ok(())
 }
 
 pub fn log_runner_config(config: &RunnerConfig) {
     eprintln!(
-        "Runner config: venue={}, symbol={}, dry_run={}, log_fills={}, debug_prints={}, markout_prints={}, demean_prices={}",
+        "Runner config: strategy_kind={}, venue={}, symbol={}, dry_run={}, log_fills={}, debug_prints={}, markout_prints={}, demean_prices={}",
+        config.strategy_kind.as_str(),
         config.strategy.venue.as_str(),
         config.strategy.symbol,
         config.mode.dry_run,
@@ -277,5 +372,35 @@ pub fn log_runner_config(config: &RunnerConfig) {
         eprintln!("Settle currency: {settle}");
     } else {
         eprintln!("Settle currency: <unset>");
+    }
+
+    if config.strategy_kind == StrategyKind::MomentumFade {
+        if let Some(momentum) = config.momentum_fade.as_ref() {
+            eprintln!(
+                "Momentum fade: entry_source={}, lookback_ms={}, entry_threshold_bps={}, tick_offset={}, adverse_threshold_bps={}, max_age_ms={}, min_interval_ms={}",
+                momentum.entry_price_source.as_str(),
+                momentum.lookback_ms,
+                momentum.entry_threshold_bps,
+                momentum.tick_offset,
+                momentum.adverse_threshold_bps,
+                momentum.max_age_ms,
+                momentum.min_interval_ms
+            );
+            if let Some(symbol) = &momentum.symbol {
+                eprintln!("Momentum fade symbol override: {}", symbol);
+            }
+            if let Some(min_tick) = momentum.min_tick {
+                eprintln!("Momentum fade min_tick override: {:.8}", min_tick);
+            }
+            if let Some(max_order) = momentum.max_order_notional {
+                eprintln!("Momentum fade max_order_notional override: {:.6}", max_order);
+            }
+            if let Some(max_pos) = momentum.max_position_notional {
+                eprintln!(
+                    "Momentum fade max_position_notional override: {:.6}",
+                    max_pos
+                );
+            }
+        }
     }
 }

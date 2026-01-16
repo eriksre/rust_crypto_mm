@@ -18,7 +18,7 @@ use crate::base_classes::state::{
 use crate::base_classes::types::Side;
 use crate::config::runner::RunnerConfig;
 use crate::execution::{ClientOrderId, ExecutionReport, QuoteIntent, Venue};
-use crate::strategy::ReferenceMeta;
+use crate::strategy::{FillContext, ReferenceMeta};
 
 // Re-export shared debug logger
 pub use super::debug_logger::DebugLogger;
@@ -46,7 +46,10 @@ enum LogEvent {
         send_instant: Instant,
         sent_ts: SystemTime,
     },
-    Reports(Vec<ExecutionReport>),
+    Reports {
+        reports: Vec<ExecutionReport>,
+        contexts: Vec<FillContext>,
+    },
 }
 
 impl QuoteLogHandle {
@@ -157,7 +160,29 @@ impl QuoteLogHandle {
         if reports.is_empty() {
             return;
         }
-        if let Err(err) = self.tx.send(LogEvent::Reports(reports.to_vec())) {
+        if let Err(err) = self.tx.send(LogEvent::Reports {
+            reports: reports.to_vec(),
+            contexts: Vec::new(),
+        }) {
+            eprintln!(
+                "ERROR: Failed to log reports (logger channel closed): {}",
+                err
+            );
+        }
+    }
+
+    pub fn log_reports_with_context(
+        &self,
+        reports: &[ExecutionReport],
+        contexts: &[FillContext],
+    ) {
+        if reports.is_empty() {
+            return;
+        }
+        if let Err(err) = self.tx.send(LogEvent::Reports {
+            reports: reports.to_vec(),
+            contexts: contexts.to_vec(),
+        }) {
             eprintln!(
                 "ERROR: Failed to log reports (logger channel closed): {}",
                 err
@@ -197,15 +222,7 @@ fn handle_event(logger: &mut QuoteCsvLogger, event: LogEvent, debug: &DebugLogge
             send_instant,
             sent_ts,
         ),
-        LogEvent::Reports(reports) => {
-            for report in &reports {
-                if let Err(err) = logger.log_report(report) {
-                    debug.error(|| format!("csv logger report error: {:#}", err));
-                    return Err(err);
-                }
-            }
-            Ok(())
-        }
+        LogEvent::Reports { reports, contexts } => logger.log_reports(&reports, &contexts, debug),
     }
 }
 
@@ -261,7 +278,7 @@ impl QuoteCsvLogger {
         let mut writer = BufWriter::new(file);
         writeln!(
             writer,
-            "ts_ns,exchange,feed,source_engine_ts_ns,source_system_ts_ns,price,direction,event_type,client_order_id,side,size,reference_source,reference_ts_ns,reference_price,quote_internal_us,cancel_internal_us,quote_external_us,cancel_external_us,sent_ts_ns,bid_px_1,bid_sz_1,bid_px_2,bid_sz_2,bid_px_3,bid_sz_3,bid_px_4,bid_sz_4,bid_px_5,bid_sz_5,ask_px_1,ask_sz_1,ask_px_2,ask_sz_2,ask_px_3,ask_sz_3,ask_px_4,ask_sz_4,ask_px_5,ask_sz_5,bid_depth,ask_depth"
+            "ts_ns,exchange,feed,source_engine_ts_ns,source_system_ts_ns,price,direction,event_type,client_order_id,side,size,reference_source,reference_ts_ns,reference_price,quote_internal_us,cancel_internal_us,quote_external_us,cancel_external_us,sent_ts_ns,bid_px_1,bid_sz_1,bid_px_2,bid_sz_2,bid_px_3,bid_sz_3,bid_px_4,bid_sz_4,bid_px_5,bid_sz_5,ask_px_1,ask_sz_1,ask_px_2,ask_sz_2,ask_px_3,ask_sz_3,ask_px_4,ask_sz_4,ask_px_5,ask_sz_5,bid_depth,ask_depth,fill_fair_mid,fill_lighter_mid,fill_order_age_ms"
         )?;
         writer.flush()?;
 
@@ -421,6 +438,9 @@ impl QuoteCsvLogger {
                 ask_levels_ref,
                 bid_depth,
                 ask_depth,
+                None,
+                None,
+                None,
             )?;
         }
         Ok(())
@@ -473,6 +493,9 @@ impl QuoteCsvLogger {
                 Some(sent_ns),
                 &EMPTY_LEVELS,
                 &EMPTY_LEVELS,
+                None,
+                None,
+                None,
                 None,
                 None,
             )?;
@@ -531,14 +554,58 @@ impl QuoteCsvLogger {
             &EMPTY_LEVELS,
             None,
             None,
+            None,
+            None,
+            None,
         )
     }
 
-    fn log_report(&mut self, report: &ExecutionReport) -> Result<()> {
+    fn log_reports(
+        &mut self,
+        reports: &[ExecutionReport],
+        contexts: &[FillContext],
+        debug: &DebugLogger,
+    ) -> Result<()> {
+        if reports.is_empty() {
+            return Ok(());
+        }
+        if contexts.is_empty() {
+            for report in reports {
+                if let Err(err) = self.log_report(report, None) {
+                    debug.error(|| format!("csv logger report error: {:#}", err));
+                    return Err(err);
+                }
+            }
+            return Ok(());
+        }
+
+        let mut ctx_map: HashMap<String, FillContext> = HashMap::new();
+        for context in contexts {
+            ctx_map.insert(context.client_order_id.0.clone(), context.clone());
+        }
+
+        for report in reports {
+            let ctx = ctx_map.get(&report.client_order_id.0);
+            if let Err(err) = self.log_report(report, ctx) {
+                debug.error(|| format!("csv logger report error: {:#}", err));
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
+    fn log_report(
+        &mut self,
+        report: &ExecutionReport,
+        context: Option<&FillContext>,
+    ) -> Result<()> {
         let now_instant = Instant::now();
         let id_str = report.client_order_id.0.clone();
         let mut cancel_external_us: Option<i128> = None;
         let mut quote_external_us: Option<i128> = None;
+        let mut order_age_ms = context.and_then(|ctx| ctx.order_age_ms);
+        let fill_fair_mid = context.and_then(|ctx| ctx.fair_mid);
+        let fill_lighter_mid = context.and_then(|ctx| ctx.lighter_mid);
 
         if let Some(cancel_info) = self.pending_cancels.remove(&id_str) {
             let cancel_dur = now_instant
@@ -557,6 +624,15 @@ impl QuoteCsvLogger {
             direction = side_to_direction(snapshot.side);
             side_str = side_to_str(snapshot.side);
             sent_ns_for_status = snapshot.sent_ns;
+            if order_age_ms.is_none() {
+                if let Some(send_inst) = snapshot.send_instant {
+                    order_age_ms = Some(
+                        now_instant
+                            .saturating_duration_since(send_inst)
+                            .as_millis() as u64,
+                    );
+                }
+            }
             if let Some(send_inst) = snapshot.send_instant.take() {
                 let ack_dur = now_instant
                     .checked_duration_since(send_inst)
@@ -616,6 +692,9 @@ impl QuoteCsvLogger {
                     &EMPTY_LEVELS,
                     None,
                     None,
+                    fill_fair_mid,
+                    fill_lighter_mid,
+                    order_age_ms,
                 )?;
             }
         }
@@ -657,6 +736,9 @@ impl QuoteCsvLogger {
                 sent_ns_for_status,
                 &EMPTY_LEVELS,
                 &EMPTY_LEVELS,
+                None,
+                None,
+                None,
                 None,
                 None,
             )?;
@@ -731,6 +813,9 @@ fn write_row(
     ask_levels: &[Option<(f64, f64)>; SNAPSHOT_DEPTH],
     bid_depth: Option<f64>,
     ask_depth: Option<f64>,
+    fill_fair_mid: Option<f64>,
+    fill_lighter_mid: Option<f64>,
+    fill_order_age_ms: Option<u64>,
 ) -> Result<()> {
     write!(
         writer,
@@ -779,9 +864,12 @@ fn write_row(
     }
     writeln!(
         writer,
-        ",{},{}",
+        ",{},{},{},{},{}",
         format_option_f64(bid_depth),
-        format_option_f64(ask_depth)
+        format_option_f64(ask_depth),
+        format_option_f64(fill_fair_mid),
+        format_option_f64(fill_lighter_mid),
+        fill_order_age_ms.map_or(String::new(), |v| v.to_string())
     )?;
     Ok(())
 }

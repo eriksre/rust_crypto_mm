@@ -12,6 +12,7 @@ use crate::base_classes::types::Side;
 use crate::execution::{
     ClientOrderId, ExecutionReport, OrderStatus, QuoteIntent, TimeInForce, Venue,
 };
+use crate::strategy::FillContext;
 
 const DEFAULT_MIN_TICK: f64 = 1e-8;
 const DEFAULT_MIN_HALF_SPREAD_BPS: f64 = 15.0;
@@ -235,6 +236,19 @@ impl SimpleQuoteStrategy {
 
     pub fn latest_price(&self) -> Option<f64> {
         self.latest_price
+    }
+
+    pub fn fill_context(&self, order_id: &ClientOrderId, now: Instant) -> FillContext {
+        let order_age_ms = self.active_quotes.get(order_id).map(|order| {
+            now.saturating_duration_since(order.placed_at)
+                .as_millis() as u64
+        });
+        FillContext {
+            client_order_id: order_id.clone(),
+            fair_mid: self.latest_price,
+            lighter_mid: Self::lighter_mid_from_state(),
+            order_age_ms,
+        }
     }
 
     pub fn on_market_update(&mut self, reference: &ReferenceEvent) -> Vec<ClientOrderId> {

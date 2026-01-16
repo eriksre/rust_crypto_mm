@@ -10,3 +10,8 @@ scp -i "/Users/eriksreinfelds/Desktop/gateio-smm-newest.pem" ec2-user@ec2-13-113
 
 cargo run --bin price_predictor --features gate_exec -- --config config/lighter_mvp.yaml
 
+new strategy: cargo run -F gate_exec --bin gate_runner -- --config config/lighter_momentum_fade.yaml
+
+
+
+old strategy: cargo run -F gate_exec --bin gate_runner -- --config config/lighter_mvp.yaml

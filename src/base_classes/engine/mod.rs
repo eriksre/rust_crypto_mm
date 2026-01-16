@@ -546,7 +546,8 @@ pub fn spawn_state_engine(
                 progressed |= engine.process(&mut feed_gate, &mut publisher, &mut demean);
             }
             if let Some(engine) = lighter_engine.as_mut() {
-                progressed |= engine.process(&mut feed_gate, &mut publisher, &mut demean);
+                progressed |=
+                    engine.process(&mut feed_gate, &mut publisher, &mut demean, &fast_sender);
             }
 
             if progressed {

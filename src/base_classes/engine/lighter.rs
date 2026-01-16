@@ -6,6 +6,7 @@ use crate::base_classes::tickers::TickerStore;
 use crate::collectors::lighter;
 use crate::exchanges::lighter::{LighterBook, LighterFrame, LighterMarketMeta};
 
+use super::FastEventSender;
 use super::demean_controller::DemeanController;
 use super::helpers::{levels_to_array, lock_state, log_stale_update};
 
@@ -47,6 +48,7 @@ impl<const N: usize> LighterEngine<N> {
         feed_gate: &mut FeedTimestampGate,
         publisher: &mut ReferencePublisher,
         _demean: &mut DemeanController,
+        fast_sender: &FastEventSender,
     ) -> bool {
         if let Some(mut f) = self.pending.take().or_else(|| self.consumer.try_pop().ok()) {
             let ts = f.ts;
@@ -64,6 +66,16 @@ impl<const N: usize> LighterEngine<N> {
                                 GateDecision::Accept => {
                                     let (bid_vec, ask_vec) =
                                         self.book.top_levels_f64(SNAPSHOT_DEPTH);
+                                    let best_bid = bid_vec.first().map(|lvl| lvl.0);
+                                    let best_ask = ask_vec.first().map(|lvl| lvl.0);
+                                    fast_sender.send(
+                                        mid,
+                                        best_bid,
+                                        best_ask,
+                                        "lighter_orderbook",
+                                        Some(ob_ts),
+                                        f.recv_instant,
+                                    );
                                     let bid_levels = levels_to_array(&bid_vec);
                                     let ask_levels = levels_to_array(&ask_vec);
                                     {

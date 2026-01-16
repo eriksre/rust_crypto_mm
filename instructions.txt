@@ -64,8 +64,6 @@
 - Stay scoped: fix what's asked; flag adjacent issues but don't fix them without approval.
 - If a task would require changes across >N files, summarize the plan first.
 
-12) Do not use -- arguments
+12) When running python code, you must activate the .venv virtual environment
 
-13) When running python code, you must activate the .venv virtual environment
-
-14) Sometimes the user may suggest a suggestion that doesn't make sense. Treat this codebase like your own - it's your job to tell the user about any potential unexpected behaviour that the user might not have considered if their suggestion is obviously dumb. 
+13) Sometimes the user may suggest a suggestion that doesn't make sense. Treat this codebase like your own - it's your job to tell the user about any potential unexpected behaviour that the user might not have considered if their suggestion is obviously dumb. 

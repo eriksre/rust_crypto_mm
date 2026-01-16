@@ -26,7 +26,10 @@ use rust_test::execution::{
     resolve_lighter_signer_path,
 };
 use rust_test::logging::quote::{DebugLogger, QuoteLogHandle, format_f64};
-use rust_test::strategy::{ReferenceMeta, SimpleQuoteStrategy, SizeSpec};
+use rust_test::strategy::{
+    MomentumFadeStrategy, ReferenceMeta, SimpleQuoteStrategy, SizeSpec, StrategyEngine,
+    StrategyKind,
+};
 use rust_test::utils::parsing::log_parse_drop;
 use serde_json::{Value, json};
 use futures_util::{SinkExt, StreamExt};
@@ -291,7 +294,7 @@ async fn spawn_lighter_position_ws(
     creds: LighterCredentials,
     meta: lighter_rest::LighterMarketMeta,
     inventory: Arc<Mutex<InventoryTracker>>,
-    strategy: Arc<Mutex<SimpleQuoteStrategy>>,
+    strategy: Arc<Mutex<StrategyEngine>>,
     debug: DebugLogger,
     contract_size: f64,
 ) {
@@ -736,10 +739,25 @@ async fn main() -> Result<()> {
         .strategy
         .resolve_size(lighter_mins.as_ref().map(|m| m.base))?;
     let order_manager = Arc::new(OrderManager::new(gateway, Duration::from_secs(30)));
-    let strategy = Arc::new(Mutex::new(SimpleQuoteStrategy::new(
-        config.strategy.clone(),
-        base_size,
-    )));
+    let strategy = Arc::new(Mutex::new(match config.strategy_kind {
+        StrategyKind::SimpleQuote => StrategyEngine::Simple(SimpleQuoteStrategy::new(
+            config.strategy.clone(),
+            base_size,
+        )),
+        StrategyKind::MomentumFade => {
+            let momentum = config
+                .momentum_fade
+                .clone()
+                .expect("momentum_fade config missing");
+            StrategyEngine::Momentum(MomentumFadeStrategy::new(
+                momentum,
+                config.strategy.venue,
+                config.strategy.symbol.clone(),
+                config.strategy.min_tick,
+                base_size,
+            ))
+        }
+    }));
     debug.info(|| format!("using base size {:.6}", base_size));
 
     if let (Venue::Lighter, Some(auth_client), Some(creds), Some(meta)) = (
@@ -836,9 +854,15 @@ async fn main() -> Result<()> {
     let mut market_timer = interval(Duration::from_millis(20));
     // Skip missed ticks to avoid backlog delaying market updates
     market_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut quote_timer = interval(Duration::from_millis(
-        config.strategy.quote_interval_ms.max(1),
-    ));
+    let quote_interval_ms = match config.strategy_kind {
+        StrategyKind::MomentumFade => config
+            .momentum_fade
+            .as_ref()
+            .map(|cfg| cfg.min_interval_ms)
+            .unwrap_or(config.strategy.quote_interval_ms),
+        StrategyKind::SimpleQuote => config.strategy.quote_interval_ms,
+    };
+    let mut quote_timer = interval(Duration::from_millis(quote_interval_ms.max(1)));
     // Skip missed ticks so quoting never starves the cancel hot path
     quote_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let warmup = Duration::from_secs(25);
@@ -960,7 +984,7 @@ struct FilteredIntents {
 }
 async fn handle_market_update(
     msg: CancelMessage,
-    strategy: Arc<Mutex<SimpleQuoteStrategy>>,
+    strategy: Arc<Mutex<StrategyEngine>>,
     config: Arc<RunnerConfig>,
     order_manager: Arc<OrderManager>,
     logger: Option<QuoteLogHandle>,
@@ -1111,7 +1135,7 @@ async fn handle_market_update(
 
 async fn handle_quote_tick(
     now: Instant,
-    strategy: Arc<Mutex<SimpleQuoteStrategy>>,
+    strategy: Arc<Mutex<StrategyEngine>>,
     config: Arc<RunnerConfig>,
     contract_size: f64,
     order_manager: Arc<OrderManager>,
@@ -1199,7 +1223,15 @@ async fn handle_quote_tick(
         let cancels = plan.cancels.clone();
         let send_start = Instant::now();
         let sent_ts = SystemTime::now();
-        let debounce_budget = Duration::from_millis(config_ref.strategy.quote_interval_ms.max(1));
+        let debounce_budget_ms = match config_ref.strategy_kind {
+            StrategyKind::MomentumFade => config_ref
+                .momentum_fade
+                .as_ref()
+                .map(|cfg| cfg.min_interval_ms)
+                .unwrap_or(config_ref.strategy.quote_interval_ms),
+            StrategyKind::SimpleQuote => config_ref.strategy.quote_interval_ms,
+        };
+        let debounce_budget = Duration::from_millis(debounce_budget_ms.max(1));
         let (reference_instant, timer_wait) = if let Some(meta) = ref_meta.as_ref() {
             let age = plan.planned_at.saturating_duration_since(meta.received_at);
             if age <= debounce_budget {
@@ -1373,7 +1405,7 @@ fn format_inventory_notional(
 
 async fn process_reports(
     reports: Vec<ExecutionReport>,
-    strategy: Arc<Mutex<SimpleQuoteStrategy>>,
+    strategy: Arc<Mutex<StrategyEngine>>,
     config: Arc<RunnerConfig>,
     logger: Option<QuoteLogHandle>,
     debug: DebugLogger,
@@ -1385,12 +1417,16 @@ async fn process_reports(
     }
 
     let markout_enabled = config.mode.markout_prints;
+    let mut fill_contexts = Vec::with_capacity(reports.len());
     for report in &reports {
-        let latest_price = {
+        let now = Instant::now();
+        let (latest_price, fill_context) = {
             let mut strategy = strategy.lock();
+            let context = strategy.fill_context(&report.client_order_id, now);
             strategy.handle_report(report);
-            strategy.latest_price()
+            (strategy.latest_price(), context)
         };
+        fill_contexts.push(fill_context);
         let outcome = {
             let mut guard = inventory.lock();
             guard.apply_report(report)
@@ -1467,7 +1503,7 @@ async fn process_reports(
     }
 
     if let Some(logger) = logger.as_ref() {
-        logger.log_reports(&reports);
+        logger.log_reports_with_context(&reports, &fill_contexts);
     }
 
     log_reports(&reports, config.as_ref(), &debug);
