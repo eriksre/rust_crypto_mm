@@ -6,18 +6,18 @@ strategy:
 momentum_fade:
   entry_price_source: model
   lookback_ms: 142
-  entry_threshold_bps: 2.0
-  entry_threshold_bps_bid: 3.5
-  entry_threshold_bps_ask: 2.0
-  tick_offset: 1
+  entry_threshold_bps: 1
+  entry_threshold_bps_bid: 1
+  entry_threshold_bps_ask: 1
+  tick_offset: 0
   tick_offset_bid: 0
-  tick_offset_ask: 1
-  adverse_threshold_bps: 1.0
-  adverse_threshold_bps_bid: 0.8
-  adverse_threshold_bps_ask: 1.0
-  max_age_ms: 500
-  max_age_ms_bid: 300
-  max_age_ms_ask: 500
+  tick_offset_ask: 0
+  adverse_threshold_bps: 0
+  adverse_threshold_bps_bid: 0
+  adverse_threshold_bps_ask: 0
+  max_age_ms: 700
+  max_age_ms_bid: 700
+  max_age_ms_ask: 700
   min_interval_ms: 50
 pricing_model:
   enabled: true
