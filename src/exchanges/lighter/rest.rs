@@ -127,7 +127,12 @@ pub fn fetch_market_meta(symbol: &str) -> Option<LighterMarketMeta> {
                         return None;
                     }
                     Err(err) => {
-                        log_parse_drop("lighter_rest", "min_base_amount", &err, &entry.min_base_amount);
+                        log_parse_drop(
+                            "lighter_rest",
+                            "min_base_amount",
+                            &err,
+                            &entry.min_base_amount,
+                        );
                         return None;
                     }
                 };
@@ -235,7 +240,12 @@ pub async fn fetch_market_meta_async(symbol: &str) -> Option<LighterMarketMeta> 
                     return None;
                 }
                 Err(err) => {
-                    log_parse_drop("lighter_rest", "min_base_amount", &err, &entry.min_base_amount);
+                    log_parse_drop(
+                        "lighter_rest",
+                        "min_base_amount",
+                        &err,
+                        &entry.min_base_amount,
+                    );
                     return None;
                 }
             };

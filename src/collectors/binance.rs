@@ -51,7 +51,12 @@ fn as_u64(value: &Value) -> Option<u64> {
         Value::Number(n) => {
             let v = n.as_u64();
             if v.is_none() {
-                log_parse_drop("binance_collector", "u64", &"non-u64 number", &n.to_string());
+                log_parse_drop(
+                    "binance_collector",
+                    "u64",
+                    &"non-u64 number",
+                    &n.to_string(),
+                );
             }
             v
         }
@@ -155,7 +160,12 @@ pub fn update_bbo_store(s: &str, store: &mut BboStore) -> bool {
         .and_then(as_f64)
         .or_else(|| find_first_string_number(s, &["B"]))
         .or_else(|| {
-            log_parse_drop("binance_collector", "missing_bid_qty", &"missing bid qty", s);
+            log_parse_drop(
+                "binance_collector",
+                "missing_bid_qty",
+                &"missing bid qty",
+                s,
+            );
             None
         }) {
         Some(v) => v,
@@ -166,7 +176,12 @@ pub fn update_bbo_store(s: &str, store: &mut BboStore) -> bool {
         .and_then(as_f64)
         .or_else(|| find_first_string_number(s, &["A"]))
         .or_else(|| {
-            log_parse_drop("binance_collector", "missing_ask_qty", &"missing ask qty", s);
+            log_parse_drop(
+                "binance_collector",
+                "missing_ask_qty",
+                &"missing ask qty",
+                s,
+            );
             None
         }) {
         Some(v) => v,

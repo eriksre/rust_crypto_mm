@@ -257,55 +257,53 @@ mod runner {
         let mut login_ok = false;
         while let Some(msg) = ws.next().await {
             match msg {
-                Ok(Message::Text(text)) => {
-                    match serde_json::from_str::<WsResponse>(&text) {
-                        Ok(resp) => {
-                            if resp.request_id.as_deref() == Some(&login_req_id) {
-                                if cli.pretty {
-                                    match serde_json::from_str::<Value>(&text) {
-                                        Ok(json) => {
-                                            println!(
-                                                "Login response:\n{}",
-                                                serde_json::to_string_pretty(&json)
-                                                    .unwrap_or_else(|_| text.clone())
-                                            );
-                                        }
-                                        Err(err) => {
-                                            log_parse_drop(
-                                                "gate_user_trades_test",
-                                                "login_response",
-                                                &err,
-                                                &text,
-                                            );
-                                            println!("Login response: {text}");
-                                        }
+                Ok(Message::Text(text)) => match serde_json::from_str::<WsResponse>(&text) {
+                    Ok(resp) => {
+                        if resp.request_id.as_deref() == Some(&login_req_id) {
+                            if cli.pretty {
+                                match serde_json::from_str::<Value>(&text) {
+                                    Ok(json) => {
+                                        println!(
+                                            "Login response:\n{}",
+                                            serde_json::to_string_pretty(&json)
+                                                .unwrap_or_else(|_| text.clone())
+                                        );
                                     }
-                                } else {
-                                    println!("Login response: {text}");
-                                }
-                                if resp.is_success() {
-                                    if user_id.is_none() {
-                                        if let Some(data) = resp.data.as_ref() {
-                                            if let Some(result) = data.result.as_ref() {
-                                                user_id = extract_user_id(result);
-                                            }
-                                        }
+                                    Err(err) => {
+                                        log_parse_drop(
+                                            "gate_user_trades_test",
+                                            "login_response",
+                                            &err,
+                                            &text,
+                                        );
+                                        println!("Login response: {text}");
                                     }
-                                    login_ok = true;
-                                    println!("Login acknowledged.");
-                                    break;
                                 }
-                                let err = resp
-                                    .error_message()
-                                    .unwrap_or_else(|| "unknown login failure".to_string());
-                                return Err(anyhow!("login failed: {err}"));
+                            } else {
+                                println!("Login response: {text}");
                             }
-                        }
-                        Err(err) => {
-                            log_parse_drop("gate_user_trades_test", "login_response", &err, &text);
+                            if resp.is_success() {
+                                if user_id.is_none() {
+                                    if let Some(data) = resp.data.as_ref() {
+                                        if let Some(result) = data.result.as_ref() {
+                                            user_id = extract_user_id(result);
+                                        }
+                                    }
+                                }
+                                login_ok = true;
+                                println!("Login acknowledged.");
+                                break;
+                            }
+                            let err = resp
+                                .error_message()
+                                .unwrap_or_else(|| "unknown login failure".to_string());
+                            return Err(anyhow!("login failed: {err}"));
                         }
                     }
-                }
+                    Err(err) => {
+                        log_parse_drop("gate_user_trades_test", "login_response", &err, &text);
+                    }
+                },
                 Ok(Message::Ping(data)) => {
                     ws.send(Message::Pong(data))
                         .await

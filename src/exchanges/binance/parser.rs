@@ -2,9 +2,9 @@
 
 use crate::base_classes::types::Ts;
 use crate::base_classes::ws::ExchangeHandler;
-use crate::utils::parsing::{log_parse_drop, log_parse_drop_bytes};
 #[cfg(feature = "binance_book")]
 use crate::exchanges::binance::parsed::DepthUpdate;
+use crate::utils::parsing::{log_parse_drop, log_parse_drop_bytes};
 use serde_json::{self, Value};
 use std::time::Instant;
 

@@ -121,8 +121,7 @@ impl<const N: usize> LighterEngine<N> {
                     for trade in self.trades.iter_last(new_trades) {
                         let trade_ts = trade.ts;
                         let gate_ts = trade_ts.max(ts);
-                        match feed_gate.evaluate(ExchangeFeed::Lighter, FeedKind::Trades, gate_ts)
-                        {
+                        match feed_gate.evaluate(ExchangeFeed::Lighter, FeedKind::Trades, gate_ts) {
                             GateDecision::Accept => {
                                 let px = (trade.px as f64) / self.price_scale;
                                 let qty = (trade.qty as f64).abs() / self.qty_scale;

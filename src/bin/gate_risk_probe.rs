@@ -187,13 +187,15 @@ async fn main() -> Result<()> {
         .await
         .context("login failed")?;
     println!("Login acknowledged (req_id={})", login_info.req_id);
-    let user_id = login_info.user_id.or_else(|| match std::env::var("GATE_UID") {
-        Ok(val) => Some(val),
-        Err(err) => {
-            eprintln!("WARN: GATE_UID not set: {}", err);
-            None
-        }
-    });
+    let user_id = login_info
+        .user_id
+        .or_else(|| match std::env::var("GATE_UID") {
+            Ok(val) => Some(val),
+            Err(err) => {
+                eprintln!("WARN: GATE_UID not set: {}", err);
+                None
+            }
+        });
     let user_id = user_id.ok_or_else(|| {
         anyhow!("Gate login did not provide user id; set GATE_UID env or ensure API key exposes it")
     })?;
@@ -593,12 +595,7 @@ impl WsAuth {
                             let user_id = match serde_json::from_str::<Value>(&text) {
                                 Ok(value) => extract_user_id_value(&value),
                                 Err(err) => {
-                                    log_parse_drop(
-                                        "gate_risk_probe",
-                                        "login_user_id",
-                                        &err,
-                                        &text,
-                                    );
+                                    log_parse_drop("gate_risk_probe", "login_user_id", &err, &text);
                                     None
                                 }
                             };

@@ -13,20 +13,18 @@ pub fn events_for<const N: usize>(s: &str, book: &mut GateBook<N>) -> Vec<(&'sta
     if let Some(ch) = find_json_string(s, "channel") {
         match ch {
             "futures.book_ticker" => { /* handled by bbo updater in caller */ }
-            "futures.obu" => {
-                match serde_json::from_str::<GateMsg>(s) {
-                    Ok(msg) => {
-                        if book.apply(&msg) {
-                            if let Some(mid) = book.mid_price_f64() {
-                                out.push(("orderbook", mid));
-                            }
+            "futures.obu" => match serde_json::from_str::<GateMsg>(s) {
+                Ok(msg) => {
+                    if book.apply(&msg) {
+                        if let Some(mid) = book.mid_price_f64() {
+                            out.push(("orderbook", mid));
                         }
                     }
-                    Err(err) => {
-                        log_parse_drop("gate_collector", "orderbook", &err, s);
-                    }
                 }
-            }
+                Err(err) => {
+                    log_parse_drop("gate_collector", "orderbook", &err, s);
+                }
+            },
             "futures.trades" => { /* handled by trades updater in caller */ }
             _ => {}
         }

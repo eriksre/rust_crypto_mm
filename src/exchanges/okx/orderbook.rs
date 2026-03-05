@@ -137,12 +137,7 @@ impl<const N: usize> OkxBook<N> {
                 let px = match px_str.parse::<f64>() {
                     Ok(v) if v.is_finite() => v,
                     Ok(_) => {
-                        log_parse_drop(
-                            "okx_orderbook",
-                            "non_finite_px",
-                            &"non-finite px",
-                            px_str,
-                        );
+                        log_parse_drop("okx_orderbook", "non_finite_px", &"non-finite px", px_str);
                         return None;
                     }
                     Err(err) => {
@@ -285,12 +280,7 @@ impl<const N: usize> OkxBook<N> {
             let px = match px_str.parse::<f64>() {
                 Ok(v) if v.is_finite() => v,
                 Ok(_) => {
-                    log_parse_drop(
-                        "okx_orderbook",
-                        "non_finite_px",
-                        &"non-finite px",
-                        px_str,
-                    );
+                    log_parse_drop("okx_orderbook", "non_finite_px", &"non-finite px", px_str);
                     return None;
                 }
                 Err(err) => {
@@ -322,12 +312,7 @@ impl<const N: usize> OkxBook<N> {
             let px = match px_str.parse::<f64>() {
                 Ok(v) if v.is_finite() => v,
                 Ok(_) => {
-                    log_parse_drop(
-                        "okx_orderbook",
-                        "non_finite_px",
-                        &"non-finite px",
-                        px_str,
-                    );
+                    log_parse_drop("okx_orderbook", "non_finite_px", &"non-finite px", px_str);
                     return None;
                 }
                 Err(err) => {

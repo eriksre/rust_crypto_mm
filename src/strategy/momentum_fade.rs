@@ -66,6 +66,7 @@ impl EntryPriceSource {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct MomentumFadeConfig {
     #[serde(default = "default_entry_price_source")]
     pub entry_price_source: EntryPriceSource,
@@ -73,12 +74,28 @@ pub struct MomentumFadeConfig {
     pub lookback_ms: u64,
     #[serde(default = "default_entry_threshold_bps")]
     pub entry_threshold_bps: f64,
+    #[serde(default)]
+    pub entry_threshold_bps_bid: Option<f64>,
+    #[serde(default)]
+    pub entry_threshold_bps_ask: Option<f64>,
     #[serde(default = "default_tick_offset")]
     pub tick_offset: u32,
+    #[serde(default)]
+    pub tick_offset_bid: Option<u32>,
+    #[serde(default)]
+    pub tick_offset_ask: Option<u32>,
     #[serde(default = "default_adverse_threshold_bps")]
     pub adverse_threshold_bps: f64,
+    #[serde(default)]
+    pub adverse_threshold_bps_bid: Option<f64>,
+    #[serde(default)]
+    pub adverse_threshold_bps_ask: Option<f64>,
     #[serde(default = "default_max_age_ms")]
     pub max_age_ms: u64,
+    #[serde(default)]
+    pub max_age_ms_bid: Option<u64>,
+    #[serde(default)]
+    pub max_age_ms_ask: Option<u64>,
     #[serde(default = "default_min_interval_ms")]
     pub min_interval_ms: u64,
     #[serde(default)]
@@ -105,11 +122,7 @@ struct PriceHistory {
 impl PriceHistory {
     fn push(&mut self, ts: Instant, price: f64) {
         let ts = if let Some(last) = self.samples.back() {
-            if ts < last.ts {
-                last.ts
-            } else {
-                ts
-            }
+            if ts < last.ts { last.ts } else { ts }
         } else {
             ts
         };
@@ -231,13 +244,11 @@ impl MomentumFadeStrategy {
             return None;
         }
 
-        let cancels = self
-            .scheduled_cancels
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
+        let cancels = self.scheduled_cancels.iter().cloned().collect::<Vec<_>>();
 
-        let bbo = self.latest_lighter_bbo().or_else(Self::lighter_bbo_from_state);
+        let bbo = self
+            .latest_lighter_bbo()
+            .or_else(Self::lighter_bbo_from_state);
         let (best_bid, best_ask) = bbo
             .map(|(bid, ask)| (Some(bid), Some(ask)))
             .unwrap_or((None, None));
@@ -284,14 +295,17 @@ impl MomentumFadeStrategy {
         .or_else(|| self.active_quotes.values().next().map(|order| order.price))?;
         let reference_meta = match self.config.entry_price_source {
             EntryPriceSource::Model => self.latest_meta.clone(),
-            EntryPriceSource::Lighter => self.latest_lighter_received_at.map(|recv_at| ReferenceMeta {
-                source: self
-                    .latest_lighter_source
-                    .clone()
-                    .unwrap_or_else(|| "lighter_orderbook".to_string()),
-                ts_ns: self.latest_lighter_ts_ns,
-                received_at: recv_at,
-            }),
+            EntryPriceSource::Lighter => {
+                self.latest_lighter_received_at
+                    .map(|recv_at| ReferenceMeta {
+                        source: self
+                            .latest_lighter_source
+                            .clone()
+                            .unwrap_or_else(|| "lighter_orderbook".to_string()),
+                        ts_ns: self.latest_lighter_ts_ns,
+                        received_at: recv_at,
+                    })
+            }
         };
 
         Some(QuotePlan {
@@ -379,11 +393,13 @@ impl MomentumFadeStrategy {
     }
 
     pub fn fill_context(&self, order_id: &ClientOrderId, now: Instant) -> FillContext {
-        let order_age_ms = self.active_quotes.get(order_id).map(|order| {
-            now.saturating_duration_since(order.placed_at)
-                .as_millis() as u64
-        });
-        let lighter_mid = self.latest_lighter_mid.or_else(Self::lighter_mid_from_state);
+        let order_age_ms = self
+            .active_quotes
+            .get(order_id)
+            .map(|order| now.saturating_duration_since(order.placed_at).as_millis() as u64);
+        let lighter_mid = self
+            .latest_lighter_mid
+            .or_else(Self::lighter_mid_from_state);
         FillContext {
             client_order_id: order_id.clone(),
             fair_mid: self.latest_fair_mid,
@@ -491,13 +507,6 @@ impl MomentumFadeStrategy {
     }
 
     fn evaluate_cancels(&mut self, now: Instant) -> Vec<ClientOrderId> {
-        let max_age = if self.config.max_age_ms == 0 {
-            None
-        } else {
-            Some(Duration::from_millis(self.config.max_age_ms))
-        };
-        let adverse_bps = self.config.adverse_threshold_bps;
-
         let mut cancels = Vec::new();
         let snapshot: Vec<(ClientOrderId, ActiveOrder)> = self
             .active_quotes
@@ -508,6 +517,8 @@ impl MomentumFadeStrategy {
             if self.pending_cancels.contains(&id) || self.scheduled_cancels.contains(&id) {
                 continue;
             }
+            let max_age = self.max_age_for_side(order.side);
+            let adverse_bps = self.adverse_threshold_bps_for_side(order.side);
             let stale = max_age
                 .map(|age| now.saturating_duration_since(order.placed_at) >= age)
                 .unwrap_or(false);
@@ -558,23 +569,18 @@ impl MomentumFadeStrategy {
         }
 
         let move_bps = (price_now - price_old) / price_old * 10_000.0;
-        if move_bps >= self.config.entry_threshold_bps {
+        if move_bps >= self.entry_threshold_bps_for_side(Side::Bid) {
             Some(Side::Bid)
-        } else if move_bps <= -self.config.entry_threshold_bps {
+        } else if move_bps <= -self.entry_threshold_bps_for_side(Side::Ask) {
             Some(Side::Ask)
         } else {
             None
         }
     }
 
-    fn entry_price_for_side(
-        &self,
-        side: Side,
-        best_bid: f64,
-        best_ask: f64,
-    ) -> Option<f64> {
+    fn entry_price_for_side(&self, side: Side, best_bid: f64, best_ask: f64) -> Option<f64> {
         let tick = self.min_tick.max(1e-8);
-        let offset = tick * f64::from(self.config.tick_offset);
+        let offset = tick * f64::from(self.tick_offset_for_side(side));
         match side {
             Side::Bid => {
                 let price = best_bid + offset;
@@ -612,9 +618,7 @@ impl MomentumFadeStrategy {
 
     fn latest_lighter_bbo(&self) -> Option<(f64, f64)> {
         match (self.latest_lighter_bid, self.latest_lighter_ask) {
-            (Some(bid), Some(ask))
-                if is_valid_price(bid) && is_valid_price(ask) && ask >= bid =>
-            {
+            (Some(bid), Some(ask)) if is_valid_price(bid) && is_valid_price(ask) && ask >= bid => {
                 Some((bid, ask))
             }
             _ => None,
@@ -633,9 +637,7 @@ impl MomentumFadeStrategy {
         let bid = snap.bid_levels[0].map(|lvl| lvl.0);
         let ask = snap.ask_levels[0].map(|lvl| lvl.0);
         match (bid, ask) {
-            (Some(bid), Some(ask))
-                if is_valid_price(bid) && is_valid_price(ask) && ask >= bid =>
-            {
+            (Some(bid), Some(ask)) if is_valid_price(bid) && is_valid_price(ask) && ask >= bid => {
                 Some((bid, ask))
             }
             _ => None,
@@ -654,6 +656,57 @@ impl MomentumFadeStrategy {
             side_tag.to_lowercase(),
             self.next_id
         ))
+    }
+
+    fn entry_threshold_bps_for_side(&self, side: Side) -> f64 {
+        match side {
+            Side::Bid => self
+                .config
+                .entry_threshold_bps_bid
+                .unwrap_or(self.config.entry_threshold_bps),
+            Side::Ask => self
+                .config
+                .entry_threshold_bps_ask
+                .unwrap_or(self.config.entry_threshold_bps),
+        }
+    }
+
+    fn adverse_threshold_bps_for_side(&self, side: Side) -> f64 {
+        match side {
+            Side::Bid => self
+                .config
+                .adverse_threshold_bps_bid
+                .unwrap_or(self.config.adverse_threshold_bps),
+            Side::Ask => self
+                .config
+                .adverse_threshold_bps_ask
+                .unwrap_or(self.config.adverse_threshold_bps),
+        }
+    }
+
+    fn max_age_for_side(&self, side: Side) -> Option<Duration> {
+        let max_age_ms = match side {
+            Side::Bid => self.config.max_age_ms_bid.unwrap_or(self.config.max_age_ms),
+            Side::Ask => self.config.max_age_ms_ask.unwrap_or(self.config.max_age_ms),
+        };
+        if max_age_ms == 0 {
+            None
+        } else {
+            Some(Duration::from_millis(max_age_ms))
+        }
+    }
+
+    fn tick_offset_for_side(&self, side: Side) -> u32 {
+        match side {
+            Side::Bid => self
+                .config
+                .tick_offset_bid
+                .unwrap_or(self.config.tick_offset),
+            Side::Ask => self
+                .config
+                .tick_offset_ask
+                .unwrap_or(self.config.tick_offset),
+        }
     }
 }
 
@@ -690,9 +743,17 @@ mod tests {
             entry_price_source,
             lookback_ms: 140,
             entry_threshold_bps: 5.0,
+            entry_threshold_bps_bid: None,
+            entry_threshold_bps_ask: None,
             tick_offset: 1,
+            tick_offset_bid: None,
+            tick_offset_ask: None,
             adverse_threshold_bps: 1.0,
+            adverse_threshold_bps_bid: None,
+            adverse_threshold_bps_ask: None,
             max_age_ms: 2_000,
+            max_age_ms_bid: None,
+            max_age_ms_ask: None,
             min_interval_ms: 50,
             symbol: None,
             min_tick: None,
@@ -718,5 +779,59 @@ mod tests {
             .idle_reason()
             .expect("expected idle reason when model output is missing");
         assert!(reason.contains("pricing model output"));
+    }
+
+    #[test]
+    fn entry_signal_uses_side_specific_thresholds() {
+        let mut cfg = base_config(EntryPriceSource::Model);
+        cfg.entry_threshold_bps_bid = Some(8.0);
+        cfg.entry_threshold_bps_ask = Some(2.0);
+        let mut strategy =
+            MomentumFadeStrategy::new(cfg, Venue::Lighter, "XMR_USDT".to_string(), 0.001, 1.0);
+
+        let now = Instant::now();
+        strategy
+            .history
+            .push(now - Duration::from_millis(140), 100.0);
+
+        strategy.latest_fair_mid = Some(100.05); // +5 bps
+        assert_eq!(strategy.entry_signal(now), None);
+
+        strategy.latest_fair_mid = Some(99.97); // -3 bps
+        assert_eq!(strategy.entry_signal(now), Some(Side::Ask));
+    }
+
+    #[test]
+    fn evaluate_cancels_uses_side_specific_max_age() {
+        let mut cfg = base_config(EntryPriceSource::Model);
+        cfg.max_age_ms = 500;
+        cfg.max_age_ms_bid = Some(100);
+        cfg.max_age_ms_ask = Some(0);
+        let mut strategy =
+            MomentumFadeStrategy::new(cfg, Venue::Lighter, "XMR_USDT".to_string(), 0.001, 1.0);
+
+        let now = Instant::now();
+        let bid_id = ClientOrderId::new("mf-lighter-b-1");
+        let ask_id = ClientOrderId::new("mf-lighter-s-2");
+        strategy.active_quotes.insert(
+            bid_id.clone(),
+            ActiveOrder {
+                side: Side::Bid,
+                price: 100.0,
+                placed_at: now - Duration::from_millis(150),
+            },
+        );
+        strategy.active_quotes.insert(
+            ask_id.clone(),
+            ActiveOrder {
+                side: Side::Ask,
+                price: 100.0,
+                placed_at: now - Duration::from_millis(150),
+            },
+        );
+
+        let cancels = strategy.evaluate_cancels(now);
+        assert!(cancels.contains(&bid_id));
+        assert!(!cancels.contains(&ask_id));
     }
 }

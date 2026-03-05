@@ -9,7 +9,10 @@ use rust_test::base_classes::reference::ReferenceEvent;
 use rust_test::config::runner::{load_runner_config, log_runner_config};
 
 #[derive(Debug, Parser)]
-#[command(name = "price-predictor", about = "Print model-predicted price/bid/ask/spread")]
+#[command(
+    name = "price-predictor",
+    about = "Print model-predicted price/bid/ask/spread"
+)]
 struct Cli {
     /// Path to YAML configuration
     #[arg(long, default_value = "config/lighter_mvp.yaml")]
@@ -86,7 +89,12 @@ const BPS_WIDTH: usize = 10;
 const BPS_PRECISION: usize = 2;
 
 fn fmt_px(value: f64) -> String {
-    format!("{:>width$.prec$}", value, width = PX_WIDTH, prec = PX_PRECISION)
+    format!(
+        "{:>width$.prec$}",
+        value,
+        width = PX_WIDTH,
+        prec = PX_PRECISION
+    )
 }
 
 fn fmt_opt_px(value: Option<f64>) -> String {
@@ -98,7 +106,12 @@ fn fmt_opt_px(value: Option<f64>) -> String {
 
 fn fmt_opt_bps(value: Option<f64>) -> String {
     match value.filter(|v| v.is_finite()) {
-        Some(v) => format!("{:>width$.prec$}", v, width = BPS_WIDTH, prec = BPS_PRECISION),
+        Some(v) => format!(
+            "{:>width$.prec$}",
+            v,
+            width = BPS_WIDTH,
+            prec = BPS_PRECISION
+        ),
         None => format!("{:>width$}", "NA", width = BPS_WIDTH),
     }
 }

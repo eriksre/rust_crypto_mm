@@ -2,9 +2,9 @@
 
 use crate::base_classes::types::Ts;
 use crate::base_classes::ws::{AppHeartbeat, ExchangeHandler, HeartbeatPayload};
-use crate::utils::parsing::{log_parse_drop, log_parse_drop_bytes};
 use crate::exchanges::endpoints::OkxWs;
 use crate::exchanges::okx::orderbook::OkxMsg;
+use crate::utils::parsing::{log_parse_drop, log_parse_drop_bytes};
 use serde_json::{self, Value};
 use std::time::Instant;
 

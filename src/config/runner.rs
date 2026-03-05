@@ -20,6 +20,7 @@ fn default_flush_interval_ms() -> u64 {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct RiskConfig {
     pub max_order_notional: f64,
     #[serde(default)]
@@ -27,6 +28,7 @@ pub struct RiskConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ModeConfig {
     #[serde(default = "default_true")]
     pub dry_run: bool,
@@ -42,6 +44,7 @@ pub struct ModeConfig {
 
 #[derive(Debug, Deserialize, Clone, Default)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     pub enabled: bool,
     pub path: Option<String>,
@@ -67,6 +70,7 @@ impl LoggingConfig {
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct CredentialsConfig {
     #[serde(default)]
     pub api_key_env: Option<String>,
@@ -89,6 +93,7 @@ pub struct CredentialsConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct RunnerConfig {
     #[serde(default)]
     pub strategy_kind: StrategyKind,
@@ -218,11 +223,7 @@ pub fn load_lighter_credentials(config: &RunnerConfig) -> Result<LighterCredenti
     };
     eprintln!(
         "Resolved Lighter credentials: api_key_source={}, account_index_source={}, api_key_index_source={}, base_url_source={}, signer_lib={}",
-        api_key_source,
-        account_index_source,
-        api_key_index_source,
-        base_url_source,
-        signer_lib
+        api_key_source, account_index_source, api_key_index_source, base_url_source, signer_lib
     );
 
     Ok(LighterCredentials {
@@ -253,6 +254,9 @@ pub fn validate_runner_config(config: &RunnerConfig) -> Result<()> {
     }
     if config.strategy.symbol.trim().is_empty() {
         bail!("strategy.symbol must be set");
+    }
+    if let Some(model_cfg) = config.pricing_model.as_ref().filter(|cfg| cfg.enabled) {
+        validate_pricing_model_config(model_cfg)?;
     }
 
     match config.strategy_kind {
@@ -286,10 +290,28 @@ pub fn validate_runner_config(config: &RunnerConfig) -> Result<()> {
             if !momentum.entry_threshold_bps.is_finite() || momentum.entry_threshold_bps < 0.0 {
                 bail!("momentum_fade.entry_threshold_bps must be finite and >= 0");
             }
-            if !momentum.adverse_threshold_bps.is_finite()
-                || momentum.adverse_threshold_bps < 0.0
-            {
+            if let Some(v) = momentum.entry_threshold_bps_bid {
+                if !v.is_finite() || v < 0.0 {
+                    bail!("momentum_fade.entry_threshold_bps_bid must be finite and >= 0");
+                }
+            }
+            if let Some(v) = momentum.entry_threshold_bps_ask {
+                if !v.is_finite() || v < 0.0 {
+                    bail!("momentum_fade.entry_threshold_bps_ask must be finite and >= 0");
+                }
+            }
+            if !momentum.adverse_threshold_bps.is_finite() || momentum.adverse_threshold_bps < 0.0 {
                 bail!("momentum_fade.adverse_threshold_bps must be finite and >= 0");
+            }
+            if let Some(v) = momentum.adverse_threshold_bps_bid {
+                if !v.is_finite() || v < 0.0 {
+                    bail!("momentum_fade.adverse_threshold_bps_bid must be finite and >= 0");
+                }
+            }
+            if let Some(v) = momentum.adverse_threshold_bps_ask {
+                if !v.is_finite() || v < 0.0 {
+                    bail!("momentum_fade.adverse_threshold_bps_ask must be finite and >= 0");
+                }
             }
             if momentum.min_interval_ms == 0 {
                 bail!("momentum_fade.min_interval_ms must be > 0");
@@ -347,6 +369,310 @@ pub fn validate_runner_config(config: &RunnerConfig) -> Result<()> {
     Ok(())
 }
 
+fn validate_pricing_model_config(cfg: &PricingModelConfig) -> Result<()> {
+    let kalman = &cfg.kalman;
+    let tuning = &cfg.tuning;
+
+    if kalman.ref_stream.trim().is_empty() || !kalman.ref_stream.contains(':') {
+        bail!(
+            "pricing_model.kalman.ref_stream must be in '<exchange>:<feed>' format, got '{}'",
+            kalman.ref_stream
+        );
+    }
+    ensure_finite("pricing_model.kalman.k_per_sec", kalman.k_per_sec)?;
+    ensure_finite_ge("pricing_model.kalman.q_per_sec", kalman.q_per_sec, 0.0)?;
+    ensure_finite("pricing_model.kalman.gamma_imb", kalman.gamma_imb)?;
+
+    validate_f64_map(
+        "pricing_model.kalman.bias_by_stream",
+        &kalman.bias_by_stream,
+        |v| v.is_finite(),
+        "finite",
+    )?;
+    validate_f64_map(
+        "pricing_model.kalman.r_by_stream",
+        &kalman.r_by_stream,
+        |v| v.is_finite() && v > 0.0,
+        "finite and > 0",
+    )?;
+    validate_f64_map(
+        "pricing_model.kalman.latency_median_us",
+        &kalman.latency_median_us,
+        |v| v.is_finite() && v >= 0.0,
+        "finite and >= 0",
+    )?;
+    validate_f64_map(
+        "pricing_model.kalman.latency_mad_us",
+        &kalman.latency_mad_us,
+        |v| v.is_finite() && v > 0.0,
+        "finite and > 0",
+    )?;
+    validate_f64_map(
+        "pricing_model.kalman.spread_median_bps",
+        &kalman.spread_median_bps,
+        |v| v.is_finite() && v >= 0.0,
+        "finite and >= 0",
+    )?;
+    validate_f64_map(
+        "pricing_model.kalman.spread_mad_bps",
+        &kalman.spread_mad_bps,
+        |v| v.is_finite() && v > 0.0,
+        "finite and > 0",
+    )?;
+    validate_f64_map(
+        "pricing_model.kalman.top_ratio_median",
+        &kalman.top_ratio_median,
+        |v| v.is_finite() && v >= 0.0,
+        "finite and >= 0",
+    )?;
+    validate_f64_map(
+        "pricing_model.kalman.top_ratio_mad",
+        &kalman.top_ratio_mad,
+        |v| v.is_finite() && v > 0.0,
+        "finite and > 0",
+    )?;
+
+    ensure_finite("pricing_model.tuning.trade_dir_bps", tuning.trade_dir_bps)?;
+    ensure_finite_ge(
+        "pricing_model.tuning.trade_r_mult",
+        tuning.trade_r_mult,
+        0.0,
+    )?;
+    ensure_finite_ge(
+        "pricing_model.tuning.trade_size_beta",
+        tuning.trade_size_beta,
+        0.0,
+    )?;
+    ensure_finite_ge("pricing_model.tuning.book_w_mid", tuning.book_w_mid, 0.0)?;
+    ensure_finite_ge(
+        "pricing_model.tuning.book_w_micro",
+        tuning.book_w_micro,
+        0.0,
+    )?;
+    ensure_finite_ge(
+        "pricing_model.tuning.book_w_vwap5",
+        tuning.book_w_vwap5,
+        0.0,
+    )?;
+    ensure_finite_ge(
+        "pricing_model.tuning.lighter_r_mult",
+        tuning.lighter_r_mult,
+        0.0,
+    )?;
+    ensure_finite_ge(
+        "pricing_model.tuning.latency_alpha",
+        tuning.latency_alpha,
+        0.0,
+    )?;
+    ensure_finite_ge("pricing_model.tuning.stale_alpha", tuning.stale_alpha, 0.0)?;
+    ensure_finite_ge("pricing_model.tuning.vol_alpha", tuning.vol_alpha, 0.0)?;
+    ensure_finite_ge(
+        "pricing_model.tuning.vol_halflife_s",
+        tuning.vol_halflife_s,
+        0.0,
+    )?;
+    ensure_finite_ge("pricing_model.tuning.robust_z", tuning.robust_z, 0.0)?;
+    ensure_finite_ge("pricing_model.tuning.jump_z", tuning.jump_z, 0.0)?;
+    ensure_finite_ge("pricing_model.tuning.jump_beta", tuning.jump_beta, 0.0)?;
+    ensure_finite_ge(
+        "pricing_model.tuning.bias_ewma_halflife_s",
+        tuning.bias_ewma_halflife_s,
+        0.0,
+    )?;
+    ensure_finite_ge("pricing_model.tuning.horizon_ms", tuning.horizon_ms, 0.0)?;
+    ensure_finite_ge(
+        "pricing_model.tuning.q_floor_mult",
+        tuning.q_floor_mult,
+        0.0,
+    )?;
+    ensure_finite_ge(
+        "pricing_model.tuning.q_dt_floor_ms",
+        tuning.q_dt_floor_ms,
+        0.0,
+    )?;
+    ensure_finite_ge(
+        "pricing_model.tuning.eval_move_bps",
+        tuning.eval_move_bps,
+        0.0,
+    )?;
+    ensure_finite_ge(
+        "pricing_model.tuning.blend_age0_ms",
+        tuning.blend_age0_ms,
+        0.0,
+    )?;
+    ensure_finite_ge(
+        "pricing_model.tuning.blend_age_scale_ms",
+        tuning.blend_age_scale_ms,
+        0.0,
+    )?;
+    ensure_finite_ge(
+        "pricing_model.tuning.blend_diff0_bps",
+        tuning.blend_diff0_bps,
+        0.0,
+    )?;
+    ensure_finite_ge(
+        "pricing_model.tuning.blend_diff_scale_bps",
+        tuning.blend_diff_scale_bps,
+        0.0,
+    )?;
+    ensure_finite_ge("pricing_model.tuning.blend_max_w", tuning.blend_max_w, 0.0)?;
+    ensure_finite_ge(
+        "pricing_model.tuning.vel_halflife_s",
+        tuning.vel_halflife_s,
+        0.0,
+    )?;
+    ensure_finite_ge(
+        "pricing_model.tuning.vel_cap_bps_per_s",
+        tuning.vel_cap_bps_per_s,
+        0.0,
+    )?;
+    ensure_finite_ge("pricing_model.tuning.ecm_tau_ms", tuning.ecm_tau_ms, 0.0)?;
+    ensure_finite_ge(
+        "pricing_model.tuning.common_disp0_bps",
+        tuning.common_disp0_bps,
+        0.0,
+    )?;
+    ensure_finite_ge(
+        "pricing_model.tuning.common_max_age_ms",
+        tuning.common_max_age_ms,
+        0.0,
+    )?;
+    ensure_finite_ge(
+        "pricing_model.tuning.snap_diff0_bps",
+        tuning.snap_diff0_bps,
+        0.0,
+    )?;
+    ensure_finite_ge(
+        "pricing_model.tuning.snap_diff_scale_bps",
+        tuning.snap_diff_scale_bps,
+        0.0,
+    )?;
+    ensure_finite_ge(
+        "pricing_model.tuning.snap_disp_max_bps",
+        tuning.snap_disp_max_bps,
+        0.0,
+    )?;
+    ensure_finite_ge(
+        "pricing_model.tuning.snap_disp_scale_bps",
+        tuning.snap_disp_scale_bps,
+        0.0,
+    )?;
+    ensure_finite_ge("pricing_model.tuning.snap_max_w", tuning.snap_max_w, 0.0)?;
+    ensure_finite_ge(
+        "pricing_model.tuning.snap_age0_ms",
+        tuning.snap_age0_ms,
+        0.0,
+    )?;
+    ensure_finite_ge(
+        "pricing_model.tuning.snap_age_scale_ms",
+        tuning.snap_age_scale_ms,
+        0.0,
+    )?;
+    if tuning.snap_min_n <= 0 {
+        bail!("pricing_model.tuning.snap_min_n must be > 0");
+    }
+    ensure_finite_ge(
+        "pricing_model.tuning.side_age_tau_ms",
+        tuning.side_age_tau_ms,
+        0.0,
+    )?;
+    ensure_finite_ge(
+        "pricing_model.tuning.dir_vscale_bps_per_s",
+        tuning.dir_vscale_bps_per_s,
+        0.0,
+    )?;
+    ensure_finite_ge(
+        "pricing_model.tuning.quote_half_spread_floor_bps",
+        tuning.quote_half_spread_floor_bps,
+        0.0,
+    )?;
+    ensure_finite_ge(
+        "pricing_model.tuning.quote_half_spread_cap_bps",
+        tuning.quote_half_spread_cap_bps,
+        0.0,
+    )?;
+    if tuning.quote_half_spread_cap_bps < tuning.quote_half_spread_floor_bps {
+        bail!(
+            "pricing_model.tuning.quote_half_spread_cap_bps must be >= quote_half_spread_floor_bps"
+        );
+    }
+    ensure_finite_ge(
+        "pricing_model.tuning.quote_disp0_bps",
+        tuning.quote_disp0_bps,
+        0.0,
+    )?;
+    ensure_finite_ge(
+        "pricing_model.tuning.quote_disp_mult",
+        tuning.quote_disp_mult,
+        0.0,
+    )?;
+    ensure_finite_ge(
+        "pricing_model.tuning.quote_age0_ms",
+        tuning.quote_age0_ms,
+        0.0,
+    )?;
+    ensure_finite_ge(
+        "pricing_model.tuning.quote_age_bps_per_100ms",
+        tuning.quote_age_bps_per_100ms,
+        0.0,
+    )?;
+    ensure_finite_ge(
+        "pricing_model.tuning.quote_unc_mult",
+        tuning.quote_unc_mult,
+        0.0,
+    )?;
+    ensure_finite_ge(
+        "pricing_model.tuning.lighter_bias_halflife_s",
+        tuning.lighter_bias_halflife_s,
+        0.0,
+    )?;
+    ensure_finite_ge(
+        "pricing_model.tuning.lighter_bias_cap_bps",
+        tuning.lighter_bias_cap_bps,
+        0.0,
+    )?;
+
+    if tuning.common_source.trim().is_empty() {
+        bail!("pricing_model.tuning.common_source must be non-empty");
+    }
+
+    Ok(())
+}
+
+fn ensure_finite(name: &str, value: f64) -> Result<()> {
+    if !value.is_finite() {
+        bail!("{name} must be finite");
+    }
+    Ok(())
+}
+
+fn ensure_finite_ge(name: &str, value: f64, min: f64) -> Result<()> {
+    if !value.is_finite() || value < min {
+        bail!("{name} must be finite and >= {min}");
+    }
+    Ok(())
+}
+
+fn validate_f64_map<F>(
+    map_name: &str,
+    map: &std::collections::HashMap<String, f64>,
+    is_valid: F,
+    expectation: &str,
+) -> Result<()>
+where
+    F: Fn(f64) -> bool,
+{
+    for (key, value) in map {
+        if key.trim().is_empty() {
+            bail!("{map_name} contains an empty key");
+        }
+        if !is_valid(*value) {
+            bail!("{map_name}['{key}'] must be {expectation}, got {value}");
+        }
+    }
+    Ok(())
+}
+
 pub fn log_runner_config(config: &RunnerConfig) {
     eprintln!(
         "Runner config: strategy_kind={}, venue={}, symbol={}, dry_run={}, log_fills={}, debug_prints={}, markout_prints={}, demean_prices={}",
@@ -386,6 +712,34 @@ pub fn log_runner_config(config: &RunnerConfig) {
                 momentum.max_age_ms,
                 momentum.min_interval_ms
             );
+            if momentum.entry_threshold_bps_bid.is_some()
+                || momentum.entry_threshold_bps_ask.is_some()
+            {
+                eprintln!(
+                    "Momentum fade side entry thresholds: bid={:?} ask={:?}",
+                    momentum.entry_threshold_bps_bid, momentum.entry_threshold_bps_ask
+                );
+            }
+            if momentum.tick_offset_bid.is_some() || momentum.tick_offset_ask.is_some() {
+                eprintln!(
+                    "Momentum fade side tick offsets: bid={:?} ask={:?}",
+                    momentum.tick_offset_bid, momentum.tick_offset_ask
+                );
+            }
+            if momentum.adverse_threshold_bps_bid.is_some()
+                || momentum.adverse_threshold_bps_ask.is_some()
+            {
+                eprintln!(
+                    "Momentum fade side adverse thresholds: bid={:?} ask={:?}",
+                    momentum.adverse_threshold_bps_bid, momentum.adverse_threshold_bps_ask
+                );
+            }
+            if momentum.max_age_ms_bid.is_some() || momentum.max_age_ms_ask.is_some() {
+                eprintln!(
+                    "Momentum fade side max_age_ms: bid={:?} ask={:?}",
+                    momentum.max_age_ms_bid, momentum.max_age_ms_ask
+                );
+            }
             if let Some(symbol) = &momentum.symbol {
                 eprintln!("Momentum fade symbol override: {}", symbol);
             }
@@ -393,7 +747,10 @@ pub fn log_runner_config(config: &RunnerConfig) {
                 eprintln!("Momentum fade min_tick override: {:.8}", min_tick);
             }
             if let Some(max_order) = momentum.max_order_notional {
-                eprintln!("Momentum fade max_order_notional override: {:.6}", max_order);
+                eprintln!(
+                    "Momentum fade max_order_notional override: {:.6}",
+                    max_order
+                );
             }
             if let Some(max_pos) = momentum.max_position_notional {
                 eprintln!(
@@ -402,5 +759,55 @@ pub fn log_runner_config(config: &RunnerConfig) {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_strategy_field_is_rejected() {
+        let yaml = r#"
+strategy:
+  venue: gate
+  symbol: BTC_USDT
+  size: 1
+  spread_bps: 40
+risk:
+  max_order_notional: 10
+  max_position_notional: 20
+mode:
+  dry_run: true
+"#;
+        let err = serde_yaml::from_str::<RunnerConfig>(&yaml).expect_err("expected parse failure");
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains("spread_bps"),
+            "expected unknown field error to mention spread_bps, got: {err_text}"
+        );
+    }
+
+    #[test]
+    fn pricing_model_validation_accepts_positive_k_per_sec() {
+        let yaml = r#"
+strategy:
+  venue: gate
+  symbol: BTC_USDT
+  size: 1
+risk:
+  max_order_notional: 10
+  max_position_notional: 20
+mode:
+  dry_run: true
+pricing_model:
+  enabled: true
+  kalman:
+    ref_stream: gate:orderbook
+    k_per_sec: 0.1
+    q_per_sec: 0.000001
+"#;
+        let cfg = serde_yaml::from_str::<RunnerConfig>(yaml).expect("valid config");
+        validate_runner_config(&cfg).expect("validation should pass");
     }
 }

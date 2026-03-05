@@ -49,7 +49,12 @@ pub fn value_to_f64(value: &Value) -> Option<f64> {
             if v.is_finite() {
                 Some(v)
             } else {
-                log_parse_drop("value_to_f64", "non_finite", &"non-finite number", &v.to_string());
+                log_parse_drop(
+                    "value_to_f64",
+                    "non_finite",
+                    &"non-finite number",
+                    &v.to_string(),
+                );
                 None
             }
         }

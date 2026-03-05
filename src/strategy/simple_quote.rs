@@ -113,6 +113,7 @@ where
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct QuoteConfig {
     pub venue: Venue,
     pub symbol: String,
@@ -239,10 +240,10 @@ impl SimpleQuoteStrategy {
     }
 
     pub fn fill_context(&self, order_id: &ClientOrderId, now: Instant) -> FillContext {
-        let order_age_ms = self.active_quotes.get(order_id).map(|order| {
-            now.saturating_duration_since(order.placed_at)
-                .as_millis() as u64
-        });
+        let order_age_ms = self
+            .active_quotes
+            .get(order_id)
+            .map(|order| now.saturating_duration_since(order.placed_at).as_millis() as u64);
         FillContext {
             client_order_id: order_id.clone(),
             fair_mid: self.latest_price,

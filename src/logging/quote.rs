@@ -171,11 +171,7 @@ impl QuoteLogHandle {
         }
     }
 
-    pub fn log_reports_with_context(
-        &self,
-        reports: &[ExecutionReport],
-        contexts: &[FillContext],
-    ) {
+    pub fn log_reports_with_context(&self, reports: &[ExecutionReport], contexts: &[FillContext]) {
         if reports.is_empty() {
             return;
         }
@@ -626,11 +622,8 @@ impl QuoteCsvLogger {
             sent_ns_for_status = snapshot.sent_ns;
             if order_age_ms.is_none() {
                 if let Some(send_inst) = snapshot.send_instant {
-                    order_age_ms = Some(
-                        now_instant
-                            .saturating_duration_since(send_inst)
-                            .as_millis() as u64,
-                    );
+                    order_age_ms =
+                        Some(now_instant.saturating_duration_since(send_inst).as_millis() as u64);
                 }
             }
             if let Some(send_inst) = snapshot.send_instant.take() {

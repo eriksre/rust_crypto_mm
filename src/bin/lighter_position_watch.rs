@@ -11,12 +11,15 @@ use serde_json::{Value, json};
 use tokio_tungstenite::{connect_async_with_config, tungstenite::Message};
 
 use rust_test::config::runner::{load_lighter_credentials, load_runner_config, log_runner_config};
-use rust_test::execution::{LighterCredentials, lighter_auth_token};
 use rust_test::exchanges::lighter::fetch_market_meta_async;
+use rust_test::execution::{LighterCredentials, lighter_auth_token};
 use rust_test::utils::parsing::log_parse_drop;
 
 #[derive(Parser, Debug)]
-#[command(name = "lighter-position-watch", about = "Print Lighter position updates + notional")]
+#[command(
+    name = "lighter-position-watch",
+    about = "Print Lighter position updates + notional"
+)]
 struct Cli {
     /// Path to the YAML runner config
     #[arg(long, default_value = "config/lighter_mvp.yaml")]
@@ -172,7 +175,11 @@ fn print_position(
             format!("{:.6}", notional),
         )
     } else {
-        ("NA".to_string(), price_source.unwrap_or("unknown"), "NA".to_string())
+        (
+            "NA".to_string(),
+            price_source.unwrap_or("unknown"),
+            "NA".to_string(),
+        )
     };
     println!(
         "[position] net_base={:.6} net_contracts={:.6} dir={} notional={} price={} source={} orders={}",
@@ -238,15 +245,23 @@ async fn main() -> Result<()> {
 
         let stats_channel = format!("market_stats/{}", meta.market_id);
         let orders_channel = format!("account_orders/{}/{}", meta.market_id, creds.account_index);
-        sink.send(Message::Text(json!({
-            "type": "subscribe",
-            "channel": stats_channel,
-        }).to_string())).await?;
-        sink.send(Message::Text(json!({
-            "type": "subscribe",
-            "channel": orders_channel,
-            "auth": auth,
-        }).to_string())).await?;
+        sink.send(Message::Text(
+            json!({
+                "type": "subscribe",
+                "channel": stats_channel,
+            })
+            .to_string(),
+        ))
+        .await?;
+        sink.send(Message::Text(
+            json!({
+                "type": "subscribe",
+                "channel": orders_channel,
+                "auth": auth,
+            })
+            .to_string(),
+        ))
+        .await?;
 
         backoff = Duration::from_secs(1);
 
@@ -332,9 +347,7 @@ async fn main() -> Result<()> {
 
                                     let mut changed = is_full;
                                     for entry in entries {
-                                        let id = entry
-                                            .client_order_index
-                                            .or(entry.order_index);
+                                        let id = entry.client_order_index.or(entry.order_index);
                                         let Some(id) = id else {
                                             continue;
                                         };

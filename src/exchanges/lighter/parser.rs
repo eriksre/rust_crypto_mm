@@ -1,9 +1,9 @@
 use crate::base_classes::types::Ts;
 use crate::base_classes::ws::{AppHeartbeat, ExchangeHandler, HeartbeatPayload};
-use crate::utils::parsing::{log_parse_drop, log_parse_drop_bytes};
 use crate::exchanges::endpoints::LighterWs;
 use crate::exchanges::lighter::orderbook::LighterOrderBookMsg;
 use crate::exchanges::lighter::rest::LighterMarketMeta;
+use crate::utils::parsing::{log_parse_drop, log_parse_drop_bytes};
 use serde::Deserialize;
 use serde_json::{self, Value};
 use std::time::Instant;

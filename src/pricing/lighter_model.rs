@@ -235,6 +235,7 @@ fn default_lighter_bias_cap_bps() -> f64 {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct PricingModelConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -248,6 +249,7 @@ pub struct PricingModelConfig {
 
 #[derive(Debug, Deserialize, Clone, Default)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct KalmanParamsConfig {
     pub mu_log: Option<f64>,
     #[serde(default = "default_k_per_sec")]
@@ -277,6 +279,7 @@ pub struct KalmanParamsConfig {
 }
 
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct FilterTuningConfig {
     #[serde(default = "default_trade_dir_bps")]
     pub trade_dir_bps: f64,
@@ -594,7 +597,8 @@ impl LighterPricingModel {
         let (_bid_depth, _ask_depth, top_ratio, imbalance) = self.depth_metrics(obs);
 
         let dt = (t_sec - self.last_t).max(0.0);
-        let k = self.cfg.kalman.k_per_sec.min(0.0);
+        // Use configured drift/reversion directly; validation happens at config load.
+        let k = self.cfg.kalman.k_per_sec;
         let q_per_sec = self.cfg.kalman.q_per_sec.max(0.0);
         let phi = if dt > 0.0 { (k * dt).exp() } else { 1.0 };
         let q = if dt > 0.0 { q_per_sec * dt } else { 0.0 };
@@ -610,8 +614,7 @@ impl LighterPricingModel {
             let dt_eff = dt.max(dt_floor);
             let dz_dt = dz / dt_eff;
             if self.cfg.tuning.vol_halflife_s > 0.0 {
-                let lam = 1.0
-                    - (-dt * (2.0f64.ln()) / self.cfg.tuning.vol_halflife_s).exp();
+                let lam = 1.0 - (-dt * (2.0f64.ln()) / self.cfg.tuning.vol_halflife_s).exp();
                 self.vol2 = (1.0 - lam) * self.vol2 + lam * (dz_dt * dz_dt);
             }
             self.last_z = z_obs;
@@ -626,8 +629,7 @@ impl LighterPricingModel {
 
         let mut b = *self.biases.get(&stream).unwrap_or(&0.0);
         if self.cfg.tuning.bias_ewma_halflife_s > 0.0 && stream != self.ref_stream && dt > 0.0 {
-            let lam = 1.0
-                - (-dt * (2.0f64.ln()) / self.cfg.tuning.bias_ewma_halflife_s).exp();
+            let lam = 1.0 - (-dt * (2.0f64.ln()) / self.cfg.tuning.bias_ewma_halflife_s).exp();
             b = b + lam * ((y_raw - self.x) - b);
             self.biases.insert(stream.clone(), b);
         }
@@ -655,7 +657,12 @@ impl LighterPricingModel {
         let mut z_lat = 0.0;
         if !is_ref && self.cfg.tuning.latency_alpha > 0.0 {
             if let Some(lat) = latency_us {
-                let med = *self.cfg.kalman.latency_median_us.get(&stream).unwrap_or(&0.0);
+                let med = *self
+                    .cfg
+                    .kalman
+                    .latency_median_us
+                    .get(&stream)
+                    .unwrap_or(&0.0);
                 let mad = *self.cfg.kalman.latency_mad_us.get(&stream).unwrap_or(&1.0);
                 z_lat = ((lat - med) / mad).max(0.0).min(10.0);
                 r_eff *= 1.0 + self.cfg.tuning.latency_alpha * z_lat;
@@ -665,14 +672,24 @@ impl LighterPricingModel {
         let mut stale_score = 0.0;
         if !is_ref && self.cfg.tuning.stale_alpha > 0.0 && is_book {
             let z_sp = if spread_bps.is_finite() {
-                let med = *self.cfg.kalman.spread_median_bps.get(&stream).unwrap_or(&0.0);
+                let med = *self
+                    .cfg
+                    .kalman
+                    .spread_median_bps
+                    .get(&stream)
+                    .unwrap_or(&0.0);
                 let mad = *self.cfg.kalman.spread_mad_bps.get(&stream).unwrap_or(&1.0);
                 ((spread_bps - med) / mad).max(0.0).min(10.0)
             } else {
                 0.0
             };
             let z_top = if top_ratio.is_finite() {
-                let med = *self.cfg.kalman.top_ratio_median.get(&stream).unwrap_or(&0.0);
+                let med = *self
+                    .cfg
+                    .kalman
+                    .top_ratio_median
+                    .get(&stream)
+                    .unwrap_or(&0.0);
                 let mad = *self.cfg.kalman.top_ratio_mad.get(&stream).unwrap_or(&1.0);
                 ((med - top_ratio) / mad).max(0.0).min(10.0)
             } else {
@@ -695,8 +712,7 @@ impl LighterPricingModel {
         let mut s_var = self.p + r_eff;
         let mut std = s_var.max(1e-12).sqrt();
         let mut _nu = (y - self.x) / std;
-        let suspicious = !is_ref
-            && (is_trade || z_lat >= 2.0 || stale_score >= 2.0);
+        let suspicious = !is_ref && (is_trade || z_lat >= 2.0 || stale_score >= 2.0);
         if suspicious && self.cfg.tuning.robust_z > 0.0 && _nu.abs() > self.cfg.tuning.robust_z {
             let scale = (_nu.abs() / self.cfg.tuning.robust_z).powi(2);
             r_eff *= scale;
@@ -726,8 +742,7 @@ impl LighterPricingModel {
             let dt_c = (t_sec - self.last_common_t).max(0.0);
             if dt_c > 1e-6 && self.cfg.tuning.vel_halflife_s > 0.0 {
                 let inst_v = (self.x_c - self.last_common_x) / dt_c;
-                let lam_v = 1.0
-                    - (-dt_c * (2.0f64.ln()) / self.cfg.tuning.vel_halflife_s).exp();
+                let lam_v = 1.0 - (-dt_c * (2.0f64.ln()) / self.cfg.tuning.vel_halflife_s).exp();
                 self.v_c = (1.0 - lam_v) * self.v_c + lam_v * inst_v;
                 self.last_common_x = self.x_c;
                 self.last_common_t = t_sec;
@@ -741,12 +756,10 @@ impl LighterPricingModel {
 
         let (common_median, common_mad_bps, common_n) = self.common_median(t_sec);
         let common_now = (mu_log + self.x_c).exp();
-        let v_eff = self
-            .v_c
-            .clamp(
-                -self.cfg.tuning.vel_cap_bps_per_s * 1e-4,
-                self.cfg.tuning.vel_cap_bps_per_s * 1e-4,
-            );
+        let v_eff = self.v_c.clamp(
+            -self.cfg.tuning.vel_cap_bps_per_s * 1e-4,
+            self.cfg.tuning.vel_cap_bps_per_s * 1e-4,
+        );
 
         let quote_age_ms = if self.last_lighter_t.is_finite() {
             ((t_sec - self.last_lighter_t).max(0.0)) * 1000.0
@@ -766,7 +779,8 @@ impl LighterPricingModel {
                 (self.cfg.tuning.snap_disp_max_bps - common_mad_bps)
                     / self.cfg.tuning.snap_disp_scale_bps.max(1e-6),
             );
-            anchor_common = (anchor_common.ln() + w_disp * (common_median.ln() - anchor_common.ln())).exp();
+            anchor_common =
+                (anchor_common.ln() + w_disp * (common_median.ln() - anchor_common.ln())).exp();
         }
 
         let mut _nowcast_mid_pre_target = None;
@@ -775,27 +789,26 @@ impl LighterPricingModel {
             let (age_bid_pre, age_ask_pre) = self.side_ages(t_sec);
             let (fair_pre, _w_bid_pre, _w_ask_pre, _p_up) =
                 self.compute_lighter_fair(v_eff, age_bid_pre, age_ask_pre);
-            if fair_pre.is_finite() && fair_pre > 0.0 && anchor_common.is_finite() && anchor_common > 0.0 {
+            if fair_pre.is_finite()
+                && fair_pre > 0.0
+                && anchor_common.is_finite()
+                && anchor_common > 0.0
+            {
                 let spread_now = self.last_lighter_spread_bps;
-                let (z_sp, ok_basis) = self.basis_health(
-                    spread_now,
-                    age_bid_pre,
-                    age_ask_pre,
-                    common_n,
-                );
+                let (z_sp, ok_basis) =
+                    self.basis_health(spread_now, age_bid_pre, age_ask_pre, common_n);
                 let dt_b = (t_sec - self.last_basis_t).max(0.0);
                 if ok_basis && self.cfg.tuning.lighter_bias_halflife_s > 0.0 && dt_b > 0.0 {
                     let lam = 1.0
                         - (-dt_b * (2.0f64.ln()) / self.cfg.tuning.lighter_bias_halflife_s).exp();
                     let target = fair_pre.ln() - anchor_common.ln();
                     let cap_bias = self.cfg.tuning.lighter_bias_cap_bps * 1e-4;
-                    self.lighter_basis_log =
-                        ((1.0 - lam) * self.lighter_basis_log + lam * target).clamp(-cap_bias, cap_bias);
+                    self.lighter_basis_log = ((1.0 - lam) * self.lighter_basis_log + lam * target)
+                        .clamp(-cap_bias, cap_bias);
                     self.last_basis_t = t_sec;
                 }
 
-                let anchor_on_lighter =
-                    (anchor_common.ln() + self.lighter_basis_log).exp();
+                let anchor_on_lighter = (anchor_common.ln() + self.lighter_basis_log).exp();
                 let w_q = sigmoid(
                     (self.cfg.tuning.snap_age0_ms - quote_age_ms)
                         / self.cfg.tuning.snap_age_scale_ms.max(1e-6),
@@ -826,9 +839,9 @@ impl LighterPricingModel {
             } else {
                 self.last_lighter_spread_bps
             };
-            let (z_sp, _ok_basis) = self.basis_health(spread_now, age_bid_now, age_ask_now, common_n);
-            let anchor_on_lighter =
-                (anchor_common.ln() + self.lighter_basis_log).exp();
+            let (z_sp, _ok_basis) =
+                self.basis_health(spread_now, age_bid_now, age_ask_now, common_n);
+            let anchor_on_lighter = (anchor_common.ln() + self.lighter_basis_log).exp();
             let w_q = sigmoid(
                 (self.cfg.tuning.snap_age0_ms - quote_age_ms)
                     / self.cfg.tuning.snap_age_scale_ms.max(1e-6),
@@ -930,11 +943,7 @@ impl LighterPricingModel {
         add(&mut sum, &mut w_sum, mid, self.cfg.tuning.book_w_mid);
         add(&mut sum, &mut w_sum, micro, self.cfg.tuning.book_w_micro);
         add(&mut sum, &mut w_sum, vwap5, self.cfg.tuning.book_w_vwap5);
-        if w_sum > 0.0 {
-            sum / w_sum
-        } else {
-            f64::NAN
-        }
+        if w_sum > 0.0 { sum / w_sum } else { f64::NAN }
     }
 
     fn trade_observation(&self, obs: &PricingObservation) -> f64 {
@@ -950,10 +959,7 @@ impl LighterPricingModel {
         obs.price * offset_log.exp()
     }
 
-    fn top_of_book(
-        &self,
-        obs: &PricingObservation,
-    ) -> (f64, f64, f64, f64) {
+    fn top_of_book(&self, obs: &PricingObservation) -> (f64, f64, f64, f64) {
         let bid = obs.bid_levels[0].map(|lvl| lvl.0).unwrap_or(f64::NAN);
         let ask = obs.ask_levels[0].map(|lvl| lvl.0).unwrap_or(f64::NAN);
         let bid_sz = obs.bid_levels[0].map(|lvl| lvl.1).unwrap_or(f64::NAN);
@@ -1142,8 +1148,16 @@ impl LighterPricingModel {
         let (w_bid, w_ask) = if w_sum > 0.0 {
             (w_bid_raw / w_sum, w_ask_raw / w_sum)
         } else {
-            let mut wb = if bid_px.is_finite() && bid_px > 0.0 { 1.0 } else { 0.0 };
-            let mut wa = if ask_px.is_finite() && ask_px > 0.0 { 1.0 } else { 0.0 };
+            let mut wb = if bid_px.is_finite() && bid_px > 0.0 {
+                1.0
+            } else {
+                0.0
+            };
+            let mut wa = if ask_px.is_finite() && ask_px > 0.0 {
+                1.0
+            } else {
+                0.0
+            };
             let wsum2 = wb + wa;
             if wsum2 > 0.0 {
                 wb /= wsum2;
@@ -1189,7 +1203,13 @@ impl LighterPricingModel {
         }
     }
 
-    fn basis_health(&self, spread_now: f64, age_bid: f64, age_ask: f64, common_n: i32) -> (f64, bool) {
+    fn basis_health(
+        &self,
+        spread_now: f64,
+        age_bid: f64,
+        age_ask: f64,
+        common_n: i32,
+    ) -> (f64, bool) {
         let spread_med = self
             .cfg
             .kalman

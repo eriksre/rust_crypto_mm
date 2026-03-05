@@ -26,7 +26,6 @@ use crate::base_classes::feed_gate::FeedTimestampGate;
 use crate::base_classes::reference::ReferenceEvent;
 use crate::base_classes::reference_publisher::ReferencePublisher;
 use crate::base_classes::ws::{FeedSignal, spawn_ws_worker};
-use crate::pricing::PricingModelConfig;
 use crate::exchanges::binance::BinanceHandler;
 use crate::exchanges::bitget::BitgetHandler;
 use crate::exchanges::bybit::BybitHandler;
@@ -36,6 +35,7 @@ use crate::exchanges::mexc::{
     MexcContractMeta, MexcHandler, fetch_contract_meta as fetch_mexc_contract_meta,
 };
 use crate::exchanges::okx::{OkxHandler, OkxInstrumentMeta, fetch_instrument_meta};
+use crate::pricing::PricingModelConfig;
 
 #[cfg(feature = "gate_exec")]
 use crate::execution::{GateWsConfig, GateWsGateway};

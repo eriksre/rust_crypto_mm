@@ -69,12 +69,7 @@ pub fn events_for<const N: usize>(s: &str, book: &mut BybitBook<N>) -> Vec<(&'st
                                         return out;
                                     }
                                     Err(err) => {
-                                        log_parse_drop(
-                                            "bybit_collector",
-                                            "bid_qty",
-                                            &err,
-                                            &b[1],
-                                        );
+                                        log_parse_drop("bybit_collector", "bid_qty", &err, &b[1]);
                                         return out;
                                     }
                                 };
@@ -90,12 +85,7 @@ pub fn events_for<const N: usize>(s: &str, book: &mut BybitBook<N>) -> Vec<(&'st
                                         return out;
                                     }
                                     Err(err) => {
-                                        log_parse_drop(
-                                            "bybit_collector",
-                                            "ask_qty",
-                                            &err,
-                                            &a[1],
-                                        );
+                                        log_parse_drop("bybit_collector", "ask_qty", &err, &a[1]);
                                         return out;
                                     }
                                 };
@@ -280,7 +270,12 @@ pub fn update_trades<const N: usize>(s: &str, trades: &mut FixedTrades<N>) -> us
                 .and_then(|s| match s.parse::<f64>() {
                     Ok(v) if v.is_finite() => Some(v),
                     Ok(_) => {
-                        log_parse_drop("bybit_collector", "non_finite_price", &"non-finite price", s);
+                        log_parse_drop(
+                            "bybit_collector",
+                            "non_finite_price",
+                            &"non-finite price",
+                            s,
+                        );
                         None
                     }
                     Err(err) => {
@@ -502,22 +497,15 @@ fn value_to_f64(value: &Value, keys: &[&str]) -> Option<f64> {
                         );
                     }
                 }
-                Value::String(s) => {
-                    match s.parse::<f64>() {
-                        Ok(v) if v.is_finite() => return Some(v),
-                        Ok(_) => {
-                            log_parse_drop(
-                                "bybit_collector",
-                                "non_finite",
-                                &"non-finite number",
-                                s,
-                            );
-                        }
-                        Err(err) => {
-                            log_parse_drop("bybit_collector", "f64", &err, s);
-                        }
+                Value::String(s) => match s.parse::<f64>() {
+                    Ok(v) if v.is_finite() => return Some(v),
+                    Ok(_) => {
+                        log_parse_drop("bybit_collector", "non_finite", &"non-finite number", s);
                     }
-                }
+                    Err(err) => {
+                        log_parse_drop("bybit_collector", "f64", &err, s);
+                    }
+                },
                 _ => {}
             }
         }
@@ -535,14 +523,12 @@ fn value_to_u64(value: &Value, keys: &[&str]) -> Option<u64> {
                     }
                     log_parse_drop("bybit_collector", "u64", &"non-u64 number", &n.to_string());
                 }
-                Value::String(s) => {
-                    match s.parse::<u64>() {
-                        Ok(v) => return Some(v),
-                        Err(err) => {
-                            log_parse_drop("bybit_collector", "u64", &err, s);
-                        }
+                Value::String(s) => match s.parse::<u64>() {
+                    Ok(v) => return Some(v),
+                    Err(err) => {
+                        log_parse_drop("bybit_collector", "u64", &err, s);
                     }
-                }
+                },
                 _ => {}
             }
         }

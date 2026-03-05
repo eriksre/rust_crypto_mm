@@ -1,11 +1,15 @@
 #![cfg(feature = "gate_exec")]
 
-use std::sync::{Arc, OnceLock};
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow, bail};
 use clap::Parser;
+use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use reqwest::Url;
 use rust_test::base_classes::engine::{
@@ -33,10 +37,9 @@ use rust_test::strategy::{
 };
 use rust_test::utils::parsing::log_parse_drop;
 use serde_json::{Value, json};
-use futures_util::{SinkExt, StreamExt};
-use tokio_tungstenite::{connect_async_with_config, tungstenite::Message};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::{self, MissedTickBehavior, interval, sleep};
+use tokio_tungstenite::{connect_async_with_config, tungstenite::Message};
 
 #[derive(Debug, Parser)]
 #[command(name = "gate-runner", about = "Gate.io MVP dry-run executor")]
@@ -59,7 +62,7 @@ fn dur_us(d: Duration) -> u128 {
     d.as_micros()
 }
 
-fn lighter_mid_price() -> Option<f64> {
+fn venue_markout_mid_price(venue: Venue) -> Option<f64> {
     let guard = match state().lock() {
         Ok(guard) => guard,
         Err(poisoned) => {
@@ -67,13 +70,224 @@ fn lighter_mid_price() -> Option<f64> {
             poisoned.into_inner()
         }
     };
-    let snap = &guard.lighter.orderbook;
-    let mid = snap.price.filter(|v| v.is_finite() && *v > 0.0)?;
+    let snap = match venue {
+        Venue::Gate => &guard.gate.orderbook,
+        Venue::Lighter => &guard.lighter.orderbook,
+    };
     let last_recv = snap.received_at?;
-    if last_recv.elapsed() > LIGHTER_MARKOUT_MAX_AGE {
+    if last_recv.elapsed() > MARKOUT_MAX_AGE {
         return None;
     }
-    Some(mid)
+    if let Some(mid) = snap.price.filter(|v| v.is_finite() && *v > 0.0) {
+        return Some(mid);
+    }
+    let bid = snap.bid_levels[0].map(|lvl| lvl.0);
+    let ask = snap.ask_levels[0].map(|lvl| lvl.0);
+    match (bid, ask) {
+        (Some(bid), Some(ask))
+            if bid.is_finite() && ask.is_finite() && bid > 0.0 && ask > 0.0 && ask >= bid =>
+        {
+            Some((bid + ask) / 2.0)
+        }
+        _ => None,
+    }
+}
+
+fn now_unix_ns() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
+#[derive(Clone)]
+struct MarkoutLogHandle {
+    tx: mpsc::UnboundedSender<MarkoutLogRow>,
+    path: PathBuf,
+}
+
+#[derive(Debug)]
+struct MarkoutLogRow {
+    captured_at_ns: u128,
+    observed_at_ns: u128,
+    venue: Venue,
+    symbol: String,
+    client_order_id: String,
+    side: Option<Side>,
+    horizon_ms: u64,
+    fill_price: f64,
+    observed_mid: Option<f64>,
+    raw_markout_bps: Option<f64>,
+    pnl_markout_bps: Option<f64>,
+    fill_qty: f64,
+    fill_order_age_ms: Option<u64>,
+    report_ts_ns: Option<u64>,
+}
+
+impl MarkoutLogHandle {
+    fn spawn(config: &RunnerConfig, debug: DebugLogger) -> Result<Self> {
+        let path = markout_log_path(config);
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            fs::create_dir_all(parent)?;
+        }
+        if path.exists() && path.metadata()?.len() > 0 {
+            let file = std::fs::File::open(&path)?;
+            let mut reader = BufReader::new(file);
+            let mut header = String::new();
+            reader.read_line(&mut header)?;
+            let actual = header.trim_end_matches(['\r', '\n']);
+            if actual != MARKOUT_LOG_HEADER {
+                bail!(
+                    "markout log header mismatch at {}. expected '{}', got '{}'. rotate the file before restart.",
+                    path.display(),
+                    MARKOUT_LOG_HEADER,
+                    actual
+                );
+            }
+        }
+        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        if file.metadata()?.len() == 0 {
+            writeln!(file, "{MARKOUT_LOG_HEADER}")?;
+            file.flush()?;
+        }
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<MarkoutLogRow>();
+        tokio::spawn(async move {
+            while let Some(row) = rx.recv().await {
+                let observed_mid = row
+                    .observed_mid
+                    .map(|v| format!("{v:.8}"))
+                    .unwrap_or_default();
+                let raw_markout_bps = row
+                    .raw_markout_bps
+                    .map(|v| format!("{v:.6}"))
+                    .unwrap_or_default();
+                let pnl_markout_bps = row
+                    .pnl_markout_bps
+                    .map(|v| format!("{v:.6}"))
+                    .unwrap_or_default();
+                let report_ts_ns = row.report_ts_ns.map(|v| v.to_string()).unwrap_or_default();
+                let fill_order_age_ms = row
+                    .fill_order_age_ms
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
+                let side = row.side.map(markout_side_label).unwrap_or("unknown");
+                if let Err(err) = writeln!(
+                    file,
+                    "{},{},{},{},{},{},{},{:.8},{},{},{:.8},{},{},{}",
+                    row.captured_at_ns,
+                    row.observed_at_ns,
+                    row.venue.as_str(),
+                    row.symbol,
+                    row.client_order_id,
+                    side,
+                    row.horizon_ms,
+                    row.fill_price,
+                    observed_mid,
+                    raw_markout_bps,
+                    pnl_markout_bps,
+                    row.fill_qty,
+                    fill_order_age_ms,
+                    report_ts_ns
+                ) {
+                    debug.error(|| format!("markout logger write error: {:#}", err));
+                    continue;
+                }
+                if let Err(err) = file.flush() {
+                    debug.error(|| format!("markout logger flush error: {:#}", err));
+                }
+            }
+            if let Err(err) = file.flush() {
+                debug.error(|| format!("markout logger final flush error: {:#}", err));
+            }
+        });
+
+        Ok(Self { tx, path })
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    fn log(&self, row: MarkoutLogRow) {
+        if let Err(err) = self.tx.send(row) {
+            eprintln!(
+                "ERROR: failed to queue markout row (logger channel closed): {}",
+                err
+            );
+        }
+    }
+}
+
+fn markout_log_path(config: &RunnerConfig) -> PathBuf {
+    let base = config.logging.resolve_path(config.strategy.venue);
+    let parent = base
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("logs"));
+    let stem = base
+        .file_stem()
+        .and_then(|v| v.to_str())
+        .unwrap_or("activity");
+    let ext = base.extension().and_then(|v| v.to_str()).unwrap_or("csv");
+    let markout_stem = if let Some(prefix) = stem.strip_suffix("_activity") {
+        format!("{prefix}_markouts")
+    } else {
+        format!("{stem}_markouts")
+    };
+    parent.join(format!("{markout_stem}.{ext}"))
+}
+
+const MARKOUT_LOG_HEADER: &str = "captured_at_ns,observed_at_ns,venue,symbol,client_order_id,side,horizon_ms,fill_price,observed_mid,raw_markout_bps,pnl_markout_bps,fill_qty,fill_order_age_ms,report_ts_ns";
+
+fn side_from_client_order_id(id: &ClientOrderId) -> Option<Side> {
+    let lower = id.0.to_ascii_lowercase();
+    if lower.contains("-b-") {
+        Some(Side::Bid)
+    } else if lower.contains("-s-") {
+        Some(Side::Ask)
+    } else {
+        None
+    }
+}
+
+fn sign_corrected_markout_bps(side: Option<Side>, raw_markout_bps: Option<f64>) -> Option<f64> {
+    let raw = raw_markout_bps?;
+    match side {
+        Some(Side::Bid) => Some(raw),
+        Some(Side::Ask) => Some(-raw),
+        None => None,
+    }
+}
+
+fn markout_side_label(side: Side) -> &'static str {
+    match side {
+        Side::Bid => "bid",
+        Side::Ask => "ask",
+    }
+}
+
+#[cfg(test)]
+mod markout_tests {
+    use super::*;
+
+    #[test]
+    fn sign_corrected_markout_respects_side_direction() {
+        assert_eq!(
+            sign_corrected_markout_bps(Some(Side::Bid), Some(2.5)),
+            Some(2.5)
+        );
+        assert_eq!(
+            sign_corrected_markout_bps(Some(Side::Ask), Some(-2.5)),
+            Some(2.5)
+        );
+        assert_eq!(
+            sign_corrected_markout_bps(Some(Side::Ask), Some(2.5)),
+            Some(-2.5)
+        );
+        assert_eq!(sign_corrected_markout_bps(None, Some(1.0)), None);
+        assert_eq!(sign_corrected_markout_bps(Some(Side::Bid), None), None);
+    }
 }
 
 const LIGHTER_POSITION_WS_CHANNEL: &str = "account_all_positions/{ACCOUNT_ID}";
@@ -108,12 +322,7 @@ fn parse_lighter_position_sign(map: &serde_json::Map<String, Value>) -> Option<f
                 sign_val.as_str().and_then(|s| match s.parse::<f64>() {
                     Ok(v) if v.is_finite() => Some(v),
                     Ok(_) => {
-                        log_parse_drop(
-                            "gate_runner",
-                            "non_finite_sign",
-                            &"non-finite sign",
-                            s,
-                        );
+                        log_parse_drop("gate_runner", "non_finite_sign", &"non-finite sign", s);
                         None
                     }
                     Err(err) => {
@@ -330,7 +539,8 @@ async fn spawn_lighter_position_ws(
         };
 
         let (mut sink, mut stream) = ws.split();
-        let channel = LIGHTER_POSITION_WS_CHANNEL.replace("{ACCOUNT_ID}", &creds.account_index.to_string());
+        let channel =
+            LIGHTER_POSITION_WS_CHANNEL.replace("{ACCOUNT_ID}", &creds.account_index.to_string());
         let sub = json!({
             "type": "subscribe",
             "channel": channel,
@@ -361,14 +571,8 @@ async fn spawn_lighter_position_ws(
                         Ok(value) => value,
                         Err(_) => continue,
                     };
-                    let msg_type = value
-                        .get("type")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let channel = value
-                        .get("channel")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let msg_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    let channel = value.get("channel").and_then(|v| v.as_str()).unwrap_or("");
                     if msg_type == "ping" {
                         let _ = sink
                             .send(Message::Text(r#"{"type":"pong"}"#.to_string()))
@@ -397,11 +601,8 @@ async fn spawn_lighter_position_ws(
                                         let guard = strategy.lock();
                                         guard.latest_price()
                                     };
-                                    let notional = format_inventory_notional(
-                                        new,
-                                        contract_size,
-                                        latest_price,
-                                    );
+                                    let notional =
+                                        format_inventory_notional(new, contract_size, latest_price);
                                     debug.info(|| {
                                         format!(
                                             "inventory sync (Lighter ws) {:.4} -> {:.4} contracts {}",
@@ -426,7 +627,7 @@ async fn spawn_lighter_position_ws(
 const REF_WARN: Duration = Duration::from_millis(20);
 const STAGE_WARN: Duration = Duration::from_millis(5);
 const CANCEL_WARN: Duration = Duration::from_micros(500);
-const LIGHTER_MARKOUT_MAX_AGE: Duration = Duration::from_secs(2);
+const MARKOUT_MAX_AGE: Duration = Duration::from_secs(2);
 const IDLE_WARN_THROTTLE_MS: u64 = 10_000;
 static LAST_IDLE_WARN_MS: AtomicU64 = AtomicU64::new(0);
 
@@ -596,6 +797,13 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    let markout_logger = if config.mode.markout_prints {
+        let handle = MarkoutLogHandle::spawn(config.as_ref(), debug.clone())?;
+        debug.info(|| format!("Markout logging enabled -> {}", handle.path().display()));
+        Some(handle)
+    } else {
+        None
+    };
 
     enum LiveCreds {
         Gate(GateCredentials),
@@ -676,8 +884,7 @@ async fn main() -> Result<()> {
         debug.info(|| "Initial Lighter position: awaiting account_all_positions".to_string());
     }
 
-    if let (Venue::Gate, Some(client), Some(settle)) =
-        (venue, rest_client.clone(), settle.clone())
+    if let (Venue::Gate, Some(client), Some(settle)) = (venue, rest_client.clone(), settle.clone())
     {
         let inventory_clone = inventory.clone();
         let settle_clone = settle;
@@ -750,9 +957,7 @@ async fn main() -> Result<()> {
             .expect("credentials must exist for live mode");
         match (venue, creds, lighter_meta.as_ref()) {
             (Venue::Gate, LiveCreds::Gate(creds), _) => {
-                let settle = settle
-                    .as_deref()
-                    .expect("settle required for Gate venue");
+                let settle = settle.as_deref().expect("settle required for Gate venue");
                 Arc::new(setup_gate_gateway(config.as_ref(), contract_size, creds, settle).await?)
             }
             (Venue::Lighter, LiveCreds::Lighter(creds), Some(meta)) => {
@@ -767,10 +972,9 @@ async fn main() -> Result<()> {
         .resolve_size(lighter_mins.as_ref().map(|m| m.base))?;
     let order_manager = Arc::new(OrderManager::new(gateway, Duration::from_secs(30)));
     let strategy = Arc::new(Mutex::new(match config.strategy_kind {
-        StrategyKind::SimpleQuote => StrategyEngine::Simple(SimpleQuoteStrategy::new(
-            config.strategy.clone(),
-            base_size,
-        )),
+        StrategyKind::SimpleQuote => {
+            StrategyEngine::Simple(SimpleQuoteStrategy::new(config.strategy.clone(), base_size))
+        }
         StrategyKind::MomentumFade => {
             let momentum = config
                 .momentum_fade
@@ -809,6 +1013,7 @@ async fn main() -> Result<()> {
         let reports_config = config.clone();
         let reports_order_manager = order_manager.clone();
         let reports_logger = logger.clone();
+        let reports_markout_logger = markout_logger.clone();
         let reports_debug = debug.clone();
         let reports_inventory = inventory.clone();
         tokio::spawn(async move {
@@ -823,6 +1028,7 @@ async fn main() -> Result<()> {
                             reports_strategy.clone(),
                             reports_config.clone(),
                             reports_logger.clone(),
+                            reports_markout_logger.clone(),
                             reports_debug.clone(),
                             reports_inventory.clone(),
                             contract_size,
@@ -1221,16 +1427,16 @@ async fn handle_quote_tick(
             order_minima.as_ref(),
             &size_spec,
         )?;
-	        if !filter.skipped.is_empty() {
-	            for (id, reason) in &filter.skipped {
-	                debug.info(|| format!("skipping intent {} -> {}", id, reason));
-	            }
-	        }
-	        plan.intents = filter.allowed.clone();
-	        if plan.intents.is_empty() && plan.cancels.is_empty() {
-	            return Ok(());
-	        }
-	        let latency_debug = latency_debug_enabled();
+        if !filter.skipped.is_empty() {
+            for (id, reason) in &filter.skipped {
+                debug.info(|| format!("skipping intent {} -> {}", id, reason));
+            }
+        }
+        plan.intents = filter.allowed.clone();
+        if plan.intents.is_empty() && plan.cancels.is_empty() {
+            return Ok(());
+        }
+        let latency_debug = latency_debug_enabled();
 
         let ref_meta = if let Some(meta) = plan.reference_meta.as_ref() {
             debug.info(|| {
@@ -1444,6 +1650,7 @@ async fn process_reports(
     strategy: Arc<Mutex<StrategyEngine>>,
     config: Arc<RunnerConfig>,
     logger: Option<QuoteLogHandle>,
+    markout_logger: Option<MarkoutLogHandle>,
     debug: DebugLogger,
     inventory: Arc<Mutex<InventoryTracker>>,
     contract_size: f64,
@@ -1462,6 +1669,7 @@ async fn process_reports(
             strategy.handle_report(report);
             (strategy.latest_price(), context)
         };
+        let fill_order_age_ms = fill_context.order_age_ms;
         fill_contexts.push(fill_context);
         let outcome = {
             let mut guard = inventory.lock();
@@ -1519,21 +1727,87 @@ async fn process_reports(
                 .filter(|px| px.is_finite() && *px > 0.0)
             {
                 let id = report.client_order_id.clone();
-                tokio::spawn(async move {
-                    sleep(Duration::from_secs(1)).await;
-                    match lighter_mid_price() {
-                        Some(mid) => {
-                            let bps = (mid - fill_price) / fill_price * 10_000.0;
+                let side = side_from_client_order_id(&id);
+                let venue = config.strategy.venue;
+                let symbol = config.strategy.symbol.clone();
+                let fill_qty = report.filled_qty;
+                let report_ts_ns = report.ts;
+                for horizon_ms in [100_u64, 500_u64, 1000_u64] {
+                    let id = id.clone();
+                    let symbol = symbol.clone();
+                    let side = side;
+                    let markout_logger = markout_logger.clone();
+                    tokio::spawn(async move {
+                        let captured_at_ns = now_unix_ns();
+                        sleep(Duration::from_millis(horizon_ms)).await;
+                        let observed_at_ns = now_unix_ns();
+                        let observed_mid = venue_markout_mid_price(venue);
+                        let raw_markout_bps =
+                            observed_mid.map(|mid| (mid - fill_price) / fill_price * 10_000.0);
+                        let pnl_markout_bps = sign_corrected_markout_bps(side, raw_markout_bps);
+
+                        if let Some(logger) = markout_logger.as_ref() {
+                            logger.log(MarkoutLogRow {
+                                captured_at_ns,
+                                observed_at_ns,
+                                venue,
+                                symbol: symbol.clone(),
+                                client_order_id: id.0.clone(),
+                                side,
+                                horizon_ms,
+                                fill_price,
+                                observed_mid,
+                                raw_markout_bps,
+                                pnl_markout_bps,
+                                fill_qty,
+                                fill_order_age_ms,
+                                report_ts_ns,
+                            });
+                        }
+
+                        if let (Some(mid), Some(raw_bps), Some(pnl_bps)) =
+                            (observed_mid, raw_markout_bps, pnl_markout_bps)
+                        {
                             println!(
-                                "[markout] id={} fill={:.6} mid_1s={:.6} bps={:.2}",
-                                id.0, fill_price, mid, bps
+                                "[markout] id={} side={} h={}ms fill={:.6} mid={:.6} raw_bps={:.2} pnl_bps={:.2} age_ms={}",
+                                id.0,
+                                side.map(markout_side_label).unwrap_or("unknown"),
+                                horizon_ms,
+                                fill_price,
+                                mid,
+                                raw_bps,
+                                pnl_bps,
+                                fill_order_age_ms
+                                    .map(|v| v.to_string())
+                                    .unwrap_or_else(|| "NA".to_string())
+                            );
+                        } else if let (Some(mid), Some(raw_bps)) = (observed_mid, raw_markout_bps) {
+                            println!(
+                                "[markout] id={} side={} h={}ms fill={:.6} mid={:.6} raw_bps={:.2} pnl_bps=NA age_ms={}",
+                                id.0,
+                                side.map(markout_side_label).unwrap_or("unknown"),
+                                horizon_ms,
+                                fill_price,
+                                mid,
+                                raw_bps,
+                                fill_order_age_ms
+                                    .map(|v| v.to_string())
+                                    .unwrap_or_else(|| "NA".to_string())
+                            );
+                        } else {
+                            println!(
+                                "[markout] id={} side={} h={}ms fill={:.6} mid=NA raw_bps=NA pnl_bps=NA age_ms={}",
+                                id.0,
+                                side.map(markout_side_label).unwrap_or("unknown"),
+                                horizon_ms,
+                                fill_price,
+                                fill_order_age_ms
+                                    .map(|v| v.to_string())
+                                    .unwrap_or_else(|| "NA".to_string())
                             );
                         }
-                        None => {
-                            println!("[markout] id={} fill={:.6} mid_1s=NA", id.0, fill_price);
-                        }
-                    }
-                });
+                    });
+                }
             }
         }
     }

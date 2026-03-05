@@ -74,6 +74,7 @@ impl<'de> Deserialize<'de> for FeedToggle {
 /// Aggregated feed toggles for all exchanges the engine can track.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct FeedToggles {
     pub gate: FeedToggle,
     pub binance: FeedToggle,

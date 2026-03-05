@@ -23,9 +23,17 @@ impl ReferencePublisher {
     /// Creates a new reference publisher.
     /// If `tx` is None, the publisher is a no-op (useful for testing).
     #[inline]
-    pub fn new(tx: Option<UnboundedSender<ReferenceEvent>>, model_cfg: Option<PricingModelConfig>) -> Self {
-        let model = model_cfg
-            .and_then(|cfg| if cfg.enabled { Some(LighterPricingModel::new(cfg)) } else { None });
+    pub fn new(
+        tx: Option<UnboundedSender<ReferenceEvent>>,
+        model_cfg: Option<PricingModelConfig>,
+    ) -> Self {
+        let model = model_cfg.and_then(|cfg| {
+            if cfg.enabled {
+                Some(LighterPricingModel::new(cfg))
+            } else {
+                None
+            }
+        });
         Self {
             tx,
             last_key: None,
@@ -122,67 +130,68 @@ impl ReferencePublisher {
     fn select_candidate(st: &GlobalState) -> Option<(Candidate, RevisionKey)> {
         let mut best: Option<Candidate> = None;
 
-        let mut consider = |price: Option<f64>,
-                            best_bid: Option<f64>,
-                            best_ask: Option<f64>,
-                            bid_levels: [Option<(f64, f64)>; crate::base_classes::state::SNAPSHOT_DEPTH],
-                            ask_levels: [Option<(f64, f64)>; crate::base_classes::state::SNAPSHOT_DEPTH],
-                            direction: Option<TradeDirection>,
-                            size: Option<f64>,
-                            seq: u64,
-                            ts: Option<u64>,
-                            source_engine_ts_ns: Option<u64>,
-                            source_system_ts_ns: Option<u64>,
-                            idx: u8,
-                            source: String,
-                            exchange: &'static str,
-                            feed: &'static str,
-                            received_at: Option<Instant>| {
-            // Validate inputs
-            if seq == 0 {
-                return;
-            }
+        let mut consider =
+            |price: Option<f64>,
+             best_bid: Option<f64>,
+             best_ask: Option<f64>,
+             bid_levels: [Option<(f64, f64)>; crate::base_classes::state::SNAPSHOT_DEPTH],
+             ask_levels: [Option<(f64, f64)>; crate::base_classes::state::SNAPSHOT_DEPTH],
+             direction: Option<TradeDirection>,
+             size: Option<f64>,
+             seq: u64,
+             ts: Option<u64>,
+             source_engine_ts_ns: Option<u64>,
+             source_system_ts_ns: Option<u64>,
+             idx: u8,
+             source: String,
+             exchange: &'static str,
+             feed: &'static str,
+             received_at: Option<Instant>| {
+                // Validate inputs
+                if seq == 0 {
+                    return;
+                }
 
-            let Some(px) = price else {
-                return;
-            };
+                let Some(px) = price else {
+                    return;
+                };
 
-            // LOUD FAILURE: Invalid price detected
-            if !px.is_finite() || px <= 0.0 {
-                eprintln!(
-                    "WARNING: Invalid price from {}: {} (seq={})",
-                    source, px, seq
-                );
-                return;
-            }
+                // LOUD FAILURE: Invalid price detected
+                if !px.is_finite() || px <= 0.0 {
+                    eprintln!(
+                        "WARNING: Invalid price from {}: {} (seq={})",
+                        source, px, seq
+                    );
+                    return;
+                }
 
-            let cand = Candidate {
-                price: px,
-                best_bid: best_bid.filter(|b| b.is_finite() && *b > 0.0),
-                best_ask: best_ask.filter(|a| a.is_finite() && *a > 0.0),
-                bid_levels,
-                ask_levels,
-                direction,
-                size,
-                seq,
-                ts_ns: ts,
-                source_engine_ts_ns,
-                source_system_ts_ns,
-                source_idx: idx,
-                source,
-                exchange,
-                feed,
-                received_at,
-            };
+                let cand = Candidate {
+                    price: px,
+                    best_bid: best_bid.filter(|b| b.is_finite() && *b > 0.0),
+                    best_ask: best_ask.filter(|a| a.is_finite() && *a > 0.0),
+                    bid_levels,
+                    ask_levels,
+                    direction,
+                    size,
+                    seq,
+                    ts_ns: ts,
+                    source_engine_ts_ns,
+                    source_system_ts_ns,
+                    source_idx: idx,
+                    source,
+                    exchange,
+                    feed,
+                    received_at,
+                };
 
-            if let Some(current) = &best {
-                if Self::is_newer(&cand, current) {
+                if let Some(current) = &best {
+                    if Self::is_newer(&cand, current) {
+                        best = Some(cand);
+                    }
+                } else {
                     best = Some(cand);
                 }
-            } else {
-                best = Some(cand);
-            }
-        };
+            };
 
         // Gate.io sources (no adjustment needed)
         consider(
@@ -243,8 +252,14 @@ impl ReferencePublisher {
         // Bybit sources (adjusted)
         consider(
             Self::adjust_price(st.bybit.bbo.price, &st.demean.bybit),
-            Self::adjust_price(st.bybit.bbo.bid_levels[0].map(|lvl| lvl.0), &st.demean.bybit),
-            Self::adjust_price(st.bybit.bbo.ask_levels[0].map(|lvl| lvl.0), &st.demean.bybit),
+            Self::adjust_price(
+                st.bybit.bbo.bid_levels[0].map(|lvl| lvl.0),
+                &st.demean.bybit,
+            ),
+            Self::adjust_price(
+                st.bybit.bbo.ask_levels[0].map(|lvl| lvl.0),
+                &st.demean.bybit,
+            ),
             Self::adjust_levels(st.bybit.bbo.bid_levels, &st.demean.bybit),
             Self::adjust_levels(st.bybit.bbo.ask_levels, &st.demean.bybit),
             st.bybit.bbo.direction,
@@ -325,8 +340,14 @@ impl ReferencePublisher {
         // Bitget sources (adjusted)
         consider(
             Self::adjust_price(st.bitget.bbo.price, &st.demean.bitget),
-            Self::adjust_price(st.bitget.bbo.bid_levels[0].map(|lvl| lvl.0), &st.demean.bitget),
-            Self::adjust_price(st.bitget.bbo.ask_levels[0].map(|lvl| lvl.0), &st.demean.bitget),
+            Self::adjust_price(
+                st.bitget.bbo.bid_levels[0].map(|lvl| lvl.0),
+                &st.demean.bitget,
+            ),
+            Self::adjust_price(
+                st.bitget.bbo.ask_levels[0].map(|lvl| lvl.0),
+                &st.demean.bitget,
+            ),
             Self::adjust_levels(st.bitget.bbo.bid_levels, &st.demean.bitget),
             Self::adjust_levels(st.bitget.bbo.ask_levels, &st.demean.bitget),
             st.bitget.bbo.direction,
@@ -542,10 +563,7 @@ impl ReferencePublisher {
     }
 
     #[inline]
-    fn adjust_level(
-        level: Option<(f64, f64)>,
-        adj: &ExchangeAdjustment,
-    ) -> Option<(f64, f64)> {
+    fn adjust_level(level: Option<(f64, f64)>, adj: &ExchangeAdjustment) -> Option<(f64, f64)> {
         let (px, sz) = level?;
         let adjusted = Self::adjust_price(Some(px), adj)?;
         Some((adjusted, sz))

@@ -864,20 +864,14 @@ impl GateWsWorker {
         exchange_id: Option<String>,
     ) -> ExecutionReport {
         let entry_sample = entry.to_string();
-        let size_contracts = entry
-            .get("size")
-            .and_then(value_to_f64)
-            .unwrap_or_else(|| {
-                log_parse_drop("gate_ws", "missing_size", &"missing size", &entry_sample);
-                0.0
-            });
-        let left_contracts = entry
-            .get("left")
-            .and_then(value_to_f64)
-            .unwrap_or_else(|| {
-                log_parse_drop("gate_ws", "missing_left", &"missing left", &entry_sample);
-                0.0
-            });
+        let size_contracts = entry.get("size").and_then(value_to_f64).unwrap_or_else(|| {
+            log_parse_drop("gate_ws", "missing_size", &"missing size", &entry_sample);
+            0.0
+        });
+        let left_contracts = entry.get("left").and_then(value_to_f64).unwrap_or_else(|| {
+            log_parse_drop("gate_ws", "missing_left", &"missing left", &entry_sample);
+            0.0
+        });
         let filled_contracts = (size_contracts - left_contracts).max(0.0);
         let filled_qty = filled_contracts * self.cfg.contract_size;
 
@@ -885,7 +879,12 @@ impl GateWsWorker {
             .get("status")
             .and_then(|v| v.as_str())
             .unwrap_or_else(|| {
-                log_parse_drop("gate_ws", "missing_status", &"missing status", &entry_sample);
+                log_parse_drop(
+                    "gate_ws",
+                    "missing_status",
+                    &"missing status",
+                    &entry_sample,
+                );
                 "unknown"
             });
         let mut status = match status_raw {
@@ -922,7 +921,12 @@ impl GateWsWorker {
             .and_then(|s| match s.parse::<f64>() {
                 Ok(v) if v.is_finite() => Some(v),
                 Ok(_) => {
-                    log_parse_drop("gate_ws", "non_finite_fill_price", &"non-finite fill_price", s);
+                    log_parse_drop(
+                        "gate_ws",
+                        "non_finite_fill_price",
+                        &"non-finite fill_price",
+                        s,
+                    );
                     None
                 }
                 Err(err) => {

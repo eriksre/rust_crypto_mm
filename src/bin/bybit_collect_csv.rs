@@ -100,7 +100,12 @@ fn extract_first_price_after(key: &str, s: &str) -> Option<f64> {
     match px_str.parse::<f64>() {
         Ok(v) if v.is_finite() => Some(v),
         Ok(_) => {
-            log_parse_drop("bybit_collect_csv", "non_finite_px", &"non-finite px", px_str);
+            log_parse_drop(
+                "bybit_collect_csv",
+                "non_finite_px",
+                &"non-finite px",
+                px_str,
+            );
             None
         }
         Err(err) => {

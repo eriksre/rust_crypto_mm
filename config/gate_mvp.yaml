@@ -2,10 +2,10 @@ strategy:
   venue: gate
   symbol: XRP_USDT
   size: 10
-  spread_bps: 40.0
-  reprice_bps: 15.0
-  debounce_ms: 50 #this is the clock for the quoting system
-  cancel_buffer_ms: 50 #this is the buffer for after we submit our last cancellation till the time we can send off a new quote
+  min_half_spread_bps: 40.0
+  reprice_fraction: 0.375 # legacy reprice_bps/spread_bps = 15 / 40
+  quote_interval_ms: 50 # this is the clock for the quoting system
+  cancellation_delay_ms: 50 # buffer after first-side cancel before opposite-side cancel
 feeds: # valid options per exchange: true (force on), false (force off), auto (only run when symbol available)
   gate: true
   binance: auto
@@ -29,4 +29,3 @@ logging:
 credentials:
   api_key_env: gateio_api_key
   api_secret_env: gateio_secret_key
-

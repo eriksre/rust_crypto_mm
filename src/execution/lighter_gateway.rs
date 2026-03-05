@@ -632,17 +632,9 @@ pub fn resolve_lighter_signer_path(lib_path: &str) -> Result<String> {
         }
         // If the user hardcoded the wrong arch name, try swapping it.
         if cfg!(target_arch = "aarch64") {
-            candidates.push(
-                lib_path
-                    .replace("amd64", "arm64")
-                    .replace(".dylib", ".so"),
-            );
+            candidates.push(lib_path.replace("amd64", "arm64").replace(".dylib", ".so"));
         } else if cfg!(target_arch = "x86_64") {
-            candidates.push(
-                lib_path
-                    .replace("arm64", "amd64")
-                    .replace(".dylib", ".so"),
-            );
+            candidates.push(lib_path.replace("arm64", "amd64").replace(".dylib", ".so"));
         }
     }
 
@@ -960,10 +952,7 @@ impl SignerHandle {
         ready_rx
             .recv()
             .unwrap_or_else(|_| Err(anyhow!("signer thread failed to start")))?;
-        Ok(Self {
-            tx,
-            debug_prints,
-        })
+        Ok(Self { tx, debug_prints })
     }
 
     async fn init_client(
@@ -1175,7 +1164,9 @@ impl LighterWsWorker {
         Vec::new()
     }
 
-    fn parse_sendtx_response_obj(obj: &serde_json::Map<String, Value>) -> Result<SendTxBatchResponse> {
+    fn parse_sendtx_response_obj(
+        obj: &serde_json::Map<String, Value>,
+    ) -> Result<SendTxBatchResponse> {
         let code_val = obj
             .get("code")
             .ok_or_else(|| anyhow!("missing code in sendTxBatch response"))?;
@@ -1201,17 +1192,13 @@ impl LighterWsWorker {
             return Self::parse_sendtx_response_obj(obj);
         }
         if let Some(obj) = value.get("data").and_then(|v| v.as_object()) {
-            if obj.contains_key("code")
-                || obj.contains_key("tx_hash")
-                || obj.contains_key("txHash")
+            if obj.contains_key("code") || obj.contains_key("tx_hash") || obj.contains_key("txHash")
             {
                 return Self::parse_sendtx_response_obj(obj);
             }
         }
         if let Some(obj) = value.as_object() {
-            if obj.contains_key("code")
-                || obj.contains_key("tx_hash")
-                || obj.contains_key("txHash")
+            if obj.contains_key("code") || obj.contains_key("tx_hash") || obj.contains_key("txHash")
             {
                 return Self::parse_sendtx_response_obj(obj);
             }
@@ -1266,7 +1253,9 @@ impl LighterWsWorker {
         req_id: Option<String>,
         debug_prints: bool,
     ) -> Option<oneshot::Sender<Result<SendTxBatchResponse>>> {
-        let req_id = req_id.map(|id| id.trim().to_string()).filter(|id| !id.is_empty());
+        let req_id = req_id
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty());
         if let Some(req_id) = req_id {
             if let Some(tx) = pending.remove(&req_id) {
                 return Some(tx);
@@ -1379,9 +1368,7 @@ impl LighterWsWorker {
         }
     }
 
-    async fn connect_ws(
-        &self,
-    ) -> Result<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>> {
+    async fn connect_ws(&self) -> Result<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>> {
         let (ws, _) = connect_async_with_config(&self.cfg.ws_url, None, true).await?;
         Ok(ws)
     }
@@ -1506,10 +1493,7 @@ impl LighterWsWorker {
         Ok(false)
     }
 
-    fn build_send_batch_payload(
-        txs: &[(SignedTx, ClientOrderId)],
-        req_id: &str,
-    ) -> Result<String> {
+    fn build_send_batch_payload(txs: &[(SignedTx, ClientOrderId)], req_id: &str) -> Result<String> {
         let tx_types = txs.iter().map(|(tx, _)| tx.tx_type).collect::<Vec<_>>();
         let tx_infos = txs
             .iter()
@@ -1604,13 +1588,18 @@ impl LighterWsWorker {
             eprintln!("[lighter-ws] recv type={}", msg_type);
         }
         if msg_type == "ping" {
-            let _ = sink.send(Message::Text(r#"{"type":"pong"}"#.to_string())).await;
+            let _ = sink
+                .send(Message::Text(r#"{"type":"pong"}"#.to_string()))
+                .await;
             return;
         }
         if msg_type == "pong" {
             return;
         }
-        if matches!(msg_type, "update/account_orders" | "update/account_all_orders") {
+        if matches!(
+            msg_type,
+            "update/account_orders" | "update/account_all_orders"
+        ) {
             if let Ok(msg) = serde_json::from_value::<LighterAccountOrdersMsg>(value) {
                 self.handle_account_orders(msg);
             }
@@ -1646,11 +1635,11 @@ impl LighterWsWorker {
 #[cfg(test)]
 mod tests {
     use super::{
-        batch_observed_with_orders, ClientOrderId, LighterWsWorker, OrderState, OrderStatus, Side,
-        LIGHTER_TX_TYPE_CANCEL_ORDER, LIGHTER_TX_TYPE_CREATE_ORDER,
+        ClientOrderId, LIGHTER_TX_TYPE_CANCEL_ORDER, LIGHTER_TX_TYPE_CREATE_ORDER, LighterWsWorker,
+        OrderState, OrderStatus, Side, batch_observed_with_orders,
     };
-    use std::collections::HashMap;
     use serde_json::json;
+    use std::collections::HashMap;
 
     #[test]
     fn parse_sendtx_response_handles_data_attributes_shape() {
@@ -1922,7 +1911,13 @@ impl LighterResyncWorker {
         ];
         let query = format_query_string(&query_pairs);
         let full_url = format!("{}?{}", url.as_str(), query);
-        log_api_call(self.debug_prints, self.last_api_call.as_ref(), "GET", &full_url, None);
+        log_api_call(
+            self.debug_prints,
+            self.last_api_call.as_ref(),
+            "GET",
+            &full_url,
+            None,
+        );
         let resp = self
             .http
             .get(url)
@@ -1964,7 +1959,13 @@ impl LighterResyncWorker {
         ];
         let query = format_query_string(&query_pairs);
         let full_url = format!("{}?{}", url.as_str(), query);
-        log_api_call(self.debug_prints, self.last_api_call.as_ref(), "GET", &full_url, None);
+        log_api_call(
+            self.debug_prints,
+            self.last_api_call.as_ref(),
+            "GET",
+            &full_url,
+            None,
+        );
         let resp = self
             .http
             .get(url)
@@ -1975,7 +1976,10 @@ impl LighterResyncWorker {
             .context("inactiveOrders request failed")?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.context("inactiveOrders read body failed")?;
+            let body = resp
+                .text()
+                .await
+                .context("inactiveOrders read body failed")?;
             if status.as_u16() == 401 && self.debug_prints {
                 eprintln!(
                     "[lighter-resync] inactiveOrders unauthorized (token_len={})",
@@ -2347,7 +2351,10 @@ impl LighterGateway {
             for (id, state) in guard.iter_mut() {
                 if let Some(entry) = seen.get(&state.client_order_index) {
                     Self::update_from_entry(self.size_scale, entry, state, id, &mut reports);
-                } else if matches!(state.status, OrderStatus::New | OrderStatus::PartiallyFilled) {
+                } else if matches!(
+                    state.status,
+                    OrderStatus::New | OrderStatus::PartiallyFilled
+                ) {
                     missing_for_inactive.push(id.clone());
                 }
             }
@@ -2649,12 +2656,7 @@ impl LighterGateway {
         match value.parse::<f64>() {
             Ok(v) if v.is_finite() => Some(v),
             Ok(_) => {
-                log_parse_drop(
-                    "lighter_gateway",
-                    field,
-                    &"non-finite number",
-                    value,
-                );
+                log_parse_drop("lighter_gateway", field, &"non-finite number", value);
                 None
             }
             Err(err) => {
@@ -2667,15 +2669,8 @@ impl LighterGateway {
     fn map_status(status: &str) -> OrderStatus {
         match status {
             "filled" => OrderStatus::Filled,
-            "canceled"
-            | "cancelled"
-            | "canceled-oco"
-            | "cancelled-oco"
-            | "canceled-expired"
-            | "cancelled-expired"
-            | "canceled-child"
-            | "cancelled-child"
-            | "closed" => {
+            "canceled" | "cancelled" | "canceled-oco" | "cancelled-oco" | "canceled-expired"
+            | "cancelled-expired" | "canceled-child" | "cancelled-child" | "closed" => {
                 OrderStatus::Canceled
             }
             "rejected" => OrderStatus::Rejected,
@@ -2697,21 +2692,19 @@ impl LighterGateway {
         if let Some(idx) = entry.order_index {
             state.order_index = Some(idx);
         }
-        let filled_base = match Self::parse_f64(
-            "filled_base_amount",
-            entry.filled_base_amount.as_ref(),
-        ) {
-            Some(v) => v,
-            None => {
-                log_parse_drop(
-                    "lighter_gateway",
-                    "missing_filled_base_amount",
-                    &"missing filled_base_amount",
-                    "",
-                );
-                return;
-            }
-        };
+        let filled_base =
+            match Self::parse_f64("filled_base_amount", entry.filled_base_amount.as_ref()) {
+                Some(v) => v,
+                None => {
+                    log_parse_drop(
+                        "lighter_gateway",
+                        "missing_filled_base_amount",
+                        &"missing filled_base_amount",
+                        "",
+                    );
+                    return;
+                }
+            };
         let filled_size = filled_base / size_scale;
         if filled_size > state.filled + 1e-9 {
             state.filled = filled_size;
@@ -3039,10 +3032,7 @@ impl ExecutionGateway for LighterGateway {
     }
 }
 
-pub async fn lighter_auth_token(
-    creds: &LighterCredentials,
-    debug_prints: bool,
-) -> Result<String> {
+pub async fn lighter_auth_token(creds: &LighterCredentials, debug_prints: bool) -> Result<String> {
     let client = LighterAuthClient::connect(creds.clone(), debug_prints).await?;
     client.auth_token().await
 }

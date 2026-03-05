@@ -309,18 +309,15 @@ pub fn update_trades<const N: usize>(
                 None
             })
             .map(|v| v as Seq);
-        let side = entry
-            .get("side")
-            .and_then(|v| v.as_str())
-            .or_else(|| {
-                log_parse_drop(
-                    "okx_collector",
-                    "missing_side",
-                    &"missing side",
-                    sample.as_str(),
-                );
-                None
-            });
+        let side = entry.get("side").and_then(|v| v.as_str()).or_else(|| {
+            log_parse_drop(
+                "okx_collector",
+                "missing_side",
+                &"missing side",
+                sample.as_str(),
+            );
+            None
+        });
         if let (Some(seq), Some(side)) = (seq, side) {
             let is_buyer_maker = side.eq_ignore_ascii_case("sell");
             let trade = Trade::new(px_i, qty_i, ts_ns, seq, is_buyer_maker, None);
@@ -422,7 +419,12 @@ fn level_to_pair(value: &Value) -> Option<(f64, f64)> {
     let qty = match qty_str.parse::<f64>() {
         Ok(v) if v.is_finite() => v,
         Ok(_) => {
-            log_parse_drop("okx_collector", "non_finite_qty", &"non-finite qty", qty_str);
+            log_parse_drop(
+                "okx_collector",
+                "non_finite_qty",
+                &"non-finite qty",
+                qty_str,
+            );
             return None;
         }
         Err(err) => {
