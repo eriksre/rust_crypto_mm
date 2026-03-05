@@ -105,4 +105,11 @@ impl StrategyEngine {
             StrategyEngine::Momentum(strategy) => strategy.fill_context(order_id, now),
         }
     }
+
+    pub fn idle_reason(&self) -> Option<String> {
+        match self {
+            StrategyEngine::Simple(strategy) => strategy.idle_reason(),
+            StrategyEngine::Momentum(strategy) => strategy.idle_reason(),
+        }
+    }
 }

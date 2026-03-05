@@ -40,11 +40,8 @@ pub struct LighterCredentials {
 
 #[derive(Debug, Deserialize)]
 struct SendTxBatchResponse {
-    #[serde(default)]
     code: i32,
-    #[serde(default)]
     message: Option<String>,
-    #[serde(default)]
     tx_hash: Vec<String>,
 }
 
@@ -713,6 +710,42 @@ struct OrderState {
     exchange_order_id: Option<ExchangeOrderId>,
 }
 
+const LIGHTER_TX_TYPE_CREATE_ORDER: u8 = 14;
+const LIGHTER_TX_TYPE_CANCEL_ORDER: u8 = 15;
+
+fn batch_observed_with_orders(
+    orders: &HashMap<ClientOrderId, OrderState>,
+    tx_meta: &[(u8, ClientOrderId)],
+) -> bool {
+    tx_meta.iter().all(|(tx_type, id)| {
+        let state = orders.get(id);
+        match *tx_type {
+            LIGHTER_TX_TYPE_CREATE_ORDER => state
+                .map(|st| {
+                    st.order_index.is_some()
+                        || st.filled > 0.0
+                        || matches!(
+                            st.status,
+                            OrderStatus::PartiallyFilled
+                                | OrderStatus::Filled
+                                | OrderStatus::Canceled
+                                | OrderStatus::Rejected
+                        )
+                })
+                .unwrap_or(false),
+            LIGHTER_TX_TYPE_CANCEL_ORDER => state
+                .map(|st| {
+                    matches!(
+                        st.status,
+                        OrderStatus::Canceled | OrderStatus::Filled | OrderStatus::Rejected
+                    )
+                })
+                .unwrap_or(false),
+            _ => false,
+        }
+    })
+}
+
 enum LighterWsCommand {
     SendBatch {
         txs: Vec<(SignedTx, ClientOrderId)>,
@@ -1096,6 +1129,204 @@ impl SignerHandle {
 }
 
 impl LighterWsWorker {
+    fn extract_sendtx_req_id(value: &Value) -> Option<String> {
+        value
+            .get("data")
+            .and_then(|d| d.get("id"))
+            .or_else(|| value.get("id"))
+            .and_then(|v| {
+                if let Some(s) = v.as_str() {
+                    Some(s.to_string())
+                } else {
+                    v.as_i64().map(|n| n.to_string())
+                }
+            })
+    }
+
+    fn parse_sendtx_code(value: &Value) -> Result<i32> {
+        if let Some(code) = value.as_i64() {
+            return i32::try_from(code)
+                .map_err(|_| anyhow!("sendTxBatch code out of range: {code}"));
+        }
+        if let Some(code) = value.as_str() {
+            return code
+                .parse::<i32>()
+                .with_context(|| format!("invalid sendTxBatch code '{code}'"));
+        }
+        bail!("missing/invalid sendTxBatch code")
+    }
+
+    fn parse_sendtx_hashes(value: Option<&Value>) -> Vec<String> {
+        let Some(value) = value else {
+            return Vec::new();
+        };
+        if let Some(arr) = value.as_array() {
+            return arr
+                .iter()
+                .filter_map(|v| v.as_str().map(ToString::to_string))
+                .collect();
+        }
+        if let Some(single) = value.as_str() {
+            let trimmed = single.trim();
+            if !trimmed.is_empty() {
+                return vec![trimmed.to_string()];
+            }
+        }
+        Vec::new()
+    }
+
+    fn parse_sendtx_response_obj(obj: &serde_json::Map<String, Value>) -> Result<SendTxBatchResponse> {
+        let code_val = obj
+            .get("code")
+            .ok_or_else(|| anyhow!("missing code in sendTxBatch response"))?;
+        let code = Self::parse_sendtx_code(code_val)?;
+        let message = obj
+            .get("message")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string);
+        let tx_hash = Self::parse_sendtx_hashes(obj.get("tx_hash").or_else(|| obj.get("txHash")));
+        Ok(SendTxBatchResponse {
+            code,
+            message,
+            tx_hash,
+        })
+    }
+
+    fn parse_sendtx_response(value: &Value) -> Result<SendTxBatchResponse> {
+        if let Some(obj) = value
+            .get("data")
+            .and_then(|d| d.get("attributes"))
+            .and_then(|v| v.as_object())
+        {
+            return Self::parse_sendtx_response_obj(obj);
+        }
+        if let Some(obj) = value.get("data").and_then(|v| v.as_object()) {
+            if obj.contains_key("code")
+                || obj.contains_key("tx_hash")
+                || obj.contains_key("txHash")
+            {
+                return Self::parse_sendtx_response_obj(obj);
+            }
+        }
+        if let Some(obj) = value.as_object() {
+            if obj.contains_key("code")
+                || obj.contains_key("tx_hash")
+                || obj.contains_key("txHash")
+            {
+                return Self::parse_sendtx_response_obj(obj);
+            }
+        }
+        bail!("invalid sendtxbatch response: expected code/tx_hash fields")
+    }
+
+    fn value_has_sendtx_marker(value: &Value) -> bool {
+        let msg_type = value
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if msg_type.contains("jsonapi/sendtx") {
+            return true;
+        }
+        if value
+            .get("data")
+            .and_then(|d| d.get("type"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.contains("jsonapi/sendtx"))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        let has_code = value
+            .get("code")
+            .or_else(|| value.get("data").and_then(|d| d.get("code")))
+            .or_else(|| {
+                value
+                    .get("data")
+                    .and_then(|d| d.get("attributes"))
+                    .and_then(|a| a.get("code"))
+            })
+            .is_some();
+        let has_hash = value
+            .get("tx_hash")
+            .or_else(|| value.get("txHash"))
+            .or_else(|| value.get("data").and_then(|d| d.get("tx_hash")))
+            .or_else(|| value.get("data").and_then(|d| d.get("txHash")))
+            .or_else(|| {
+                value
+                    .get("data")
+                    .and_then(|d| d.get("attributes"))
+                    .and_then(|a| a.get("tx_hash").or_else(|| a.get("txHash")))
+            })
+            .is_some();
+        has_code || has_hash
+    }
+
+    fn remove_pending_sender(
+        pending: &mut HashMap<String, oneshot::Sender<Result<SendTxBatchResponse>>>,
+        req_id: Option<String>,
+        debug_prints: bool,
+    ) -> Option<oneshot::Sender<Result<SendTxBatchResponse>>> {
+        let req_id = req_id.map(|id| id.trim().to_string()).filter(|id| !id.is_empty());
+        if let Some(req_id) = req_id {
+            if let Some(tx) = pending.remove(&req_id) {
+                return Some(tx);
+            }
+            if let Some(stripped) = req_id.strip_prefix("txb-") {
+                if let Some(tx) = pending.remove(stripped) {
+                    if debug_prints {
+                        eprintln!(
+                            "[lighter-ws] matched sendtx response id {} to pending {}",
+                            req_id, stripped
+                        );
+                    }
+                    return Some(tx);
+                }
+            } else {
+                let prefixed = format!("txb-{req_id}");
+                if let Some(tx) = pending.remove(&prefixed) {
+                    if debug_prints {
+                        eprintln!(
+                            "[lighter-ws] matched sendtx response id {} to pending {}",
+                            req_id, prefixed
+                        );
+                    }
+                    return Some(tx);
+                }
+            }
+            if pending.len() == 1 {
+                let (only_id, tx) = pending.drain().next().expect("pending len checked");
+                eprintln!(
+                    "WARN: unmatched sendtx response id {}; pairing with only pending request {}",
+                    req_id, only_id
+                );
+                return Some(tx);
+            }
+            eprintln!(
+                "WARN: unmatched sendtx response id {}; pending requests={:?}",
+                req_id,
+                pending.keys().collect::<Vec<_>>()
+            );
+            return None;
+        }
+        if pending.len() == 1 {
+            let (only_id, tx) = pending.drain().next().expect("pending len checked");
+            if debug_prints {
+                eprintln!(
+                    "[lighter-ws] response missing id; pairing with pending {}",
+                    only_id
+                );
+            }
+            return Some(tx);
+        }
+        if !pending.is_empty() {
+            eprintln!(
+                "WARN: sendtx response missing id with multiple pending requests={:?}",
+                pending.keys().collect::<Vec<_>>()
+            );
+        }
+        None
+    }
+
     fn new(
         cfg: LighterWsConfig,
         signer: SignerHandle,
@@ -1385,61 +1616,159 @@ impl LighterWsWorker {
             }
             return;
         }
-        if msg_type.contains("jsonapi/sendtx") {
-            let req_id = value
-                .get("data")
-                .and_then(|d| d.get("id"))
-                .or_else(|| value.get("id"))
-                .and_then(|v| {
-                    if let Some(s) = v.as_str() {
-                        Some(s.to_string())
-                    } else {
-                        v.as_i64().map(|n| n.to_string())
-                    }
-                });
-            if let Some(req_id) = req_id {
-                if let Some(resp_tx) = pending.remove(&req_id) {
-                    let data = value.get("data").cloned().unwrap_or(value.clone());
-                    let parsed = serde_json::from_value::<SendTxBatchResponse>(data)
-                        .context("invalid sendtxbatch response")
-                        .and_then(|resp| {
-                            if resp.code == 200 || resp.code == 0 {
-                                Ok(resp)
-                            } else {
-                                Err(anyhow!(
-                                    "sendTxBatch error {}: {}",
-                                    resp.code,
-                                    resp.message.clone().unwrap_or_default()
-                                ))
-                            }
-                        });
-                    let _ = resp_tx.send(parsed);
-                }
-            } else if pending.len() == 1 {
-                let (only_id, resp_tx) = pending.drain().next().unwrap();
-                if self.cfg.debug_prints {
-                    eprintln!(
-                        "[lighter-ws] response missing id; pairing with pending {}",
-                        only_id
-                    );
-                }
-                let data = value.get("data").cloned().unwrap_or(value.clone());
-                let parsed = serde_json::from_value::<SendTxBatchResponse>(data)
-                    .context("invalid sendtxbatch response")
-                    .and_then(|resp| {
-                        if resp.code == 200 || resp.code == 0 {
-                            Ok(resp)
-                        } else {
-                            Err(anyhow!(
-                                "sendTxBatch error {}: {}",
-                                resp.code,
-                                resp.message.clone().unwrap_or_default()
-                            ))
-                        }
-                    });
-                let _ = resp_tx.send(parsed);
-            }
+        if pending.is_empty() {
+            return;
         }
+        if !Self::value_has_sendtx_marker(&value) {
+            return;
+        }
+
+        let req_id = Self::extract_sendtx_req_id(&value);
+        let Some(resp_tx) = Self::remove_pending_sender(pending, req_id, self.cfg.debug_prints)
+        else {
+            return;
+        };
+        let parsed = Self::parse_sendtx_response(&value).and_then(|resp| {
+            if resp.code == 200 || resp.code == 0 {
+                Ok(resp)
+            } else {
+                Err(anyhow!(
+                    "sendTxBatch error {}: {}",
+                    resp.code,
+                    resp.message.clone().unwrap_or_default()
+                ))
+            }
+        });
+        let _ = resp_tx.send(parsed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        batch_observed_with_orders, ClientOrderId, LighterWsWorker, OrderState, OrderStatus, Side,
+        LIGHTER_TX_TYPE_CANCEL_ORDER, LIGHTER_TX_TYPE_CREATE_ORDER,
+    };
+    use std::collections::HashMap;
+    use serde_json::json;
+
+    #[test]
+    fn parse_sendtx_response_handles_data_attributes_shape() {
+        let value = json!({
+            "type": "jsonapi/response",
+            "data": {
+                "id": "txb-7",
+                "attributes": {
+                    "code": "200",
+                    "message": "ok",
+                    "txHash": ["0xabc"]
+                }
+            }
+        });
+        let parsed = LighterWsWorker::parse_sendtx_response(&value).expect("parse sendtx response");
+        assert_eq!(parsed.code, 200);
+        assert_eq!(parsed.message.as_deref(), Some("ok"));
+        assert_eq!(parsed.tx_hash, vec!["0xabc".to_string()]);
+    }
+
+    #[test]
+    fn value_has_sendtx_marker_on_code_and_hash_fields() {
+        let value = json!({
+            "id": 3,
+            "code": 200,
+            "tx_hash": ["0x1"]
+        });
+        assert!(LighterWsWorker::value_has_sendtx_marker(&value));
+    }
+
+    #[test]
+    fn extract_sendtx_req_id_reads_numeric_id() {
+        let value = json!({"id": 42, "code": 200});
+        assert_eq!(
+            LighterWsWorker::extract_sendtx_req_id(&value).as_deref(),
+            Some("42")
+        );
+    }
+
+    #[test]
+    fn batch_observed_with_orders_recognizes_create_and_cancel_completion() {
+        let create_id = ClientOrderId::new("mf-lighter-b-1");
+        let cancel_id = ClientOrderId::new("mf-lighter-s-2");
+
+        let mut orders = HashMap::new();
+        orders.insert(
+            create_id.clone(),
+            OrderState {
+                client_order_index: 1,
+                order_index: Some(1001),
+                side: Side::Bid,
+                price: 100.0,
+                size: 1.0,
+                filled: 0.0,
+                status: OrderStatus::New,
+                exchange_order_id: None,
+            },
+        );
+        orders.insert(
+            cancel_id.clone(),
+            OrderState {
+                client_order_index: 2,
+                order_index: Some(1002),
+                side: Side::Ask,
+                price: 101.0,
+                size: 1.0,
+                filled: 0.0,
+                status: OrderStatus::Canceled,
+                exchange_order_id: None,
+            },
+        );
+
+        let tx_meta = vec![
+            (LIGHTER_TX_TYPE_CREATE_ORDER, create_id),
+            (LIGHTER_TX_TYPE_CANCEL_ORDER, cancel_id),
+        ];
+        assert!(batch_observed_with_orders(&orders, &tx_meta));
+    }
+
+    #[test]
+    fn batch_observed_with_orders_rejects_unconfirmed_create() {
+        let create_id = ClientOrderId::new("mf-lighter-b-3");
+        let mut orders = HashMap::new();
+        orders.insert(
+            create_id.clone(),
+            OrderState {
+                client_order_index: 3,
+                order_index: None,
+                side: Side::Bid,
+                price: 100.0,
+                size: 1.0,
+                filled: 0.0,
+                status: OrderStatus::New,
+                exchange_order_id: None,
+            },
+        );
+        let tx_meta = vec![(LIGHTER_TX_TYPE_CREATE_ORDER, create_id)];
+        assert!(!batch_observed_with_orders(&orders, &tx_meta));
+    }
+
+    #[test]
+    fn map_status_supports_common_terminal_aliases() {
+        assert_eq!(
+            super::LighterGateway::map_status("cancelled"),
+            OrderStatus::Canceled
+        );
+        assert_eq!(
+            super::LighterGateway::map_status("closed"),
+            OrderStatus::Canceled
+        );
+        assert_eq!(
+            super::LighterGateway::map_status("rejected"),
+            OrderStatus::Rejected
+        );
+        assert_eq!(
+            super::LighterGateway::map_status("partially_filled"),
+            OrderStatus::PartiallyFilled
+        );
     }
 }
 
@@ -1528,11 +1857,20 @@ impl LighterResyncWorker {
                                 id,
                                 &mut reports,
                             );
-                            let status = entry
+                            let mut status = entry
                                 .status
                                 .as_deref()
                                 .map(LighterGateway::map_status)
                                 .unwrap_or(OrderStatus::Unknown);
+                            if status == OrderStatus::Unknown {
+                                if let Some(raw) = entry.status.as_deref() {
+                                    eprintln!(
+                                        "WARN: unknown inactive order status '{}'; treating as canceled",
+                                        raw
+                                    );
+                                }
+                                status = OrderStatus::Canceled;
+                            }
                             if status != state.status {
                                 if matches!(
                                     status,
@@ -1893,6 +2231,10 @@ impl LighterGateway {
         if txs.is_empty() {
             return Ok(Vec::new());
         }
+        let tx_meta = txs
+            .iter()
+            .map(|(tx, id)| (tx.tx_type, id.clone()))
+            .collect::<Vec<_>>();
         let fallback_hashes = txs
             .iter()
             .map(|(tx, _)| tx.tx_hash.as_ref().cloned())
@@ -1904,16 +2246,36 @@ impl LighterGateway {
             .send(LighterWsCommand::SendBatch { txs, resp: resp_tx })
             .await
             .map_err(|e| anyhow!("lighter ws send queue closed: {e}"))?;
-        let payload = tokio::time::timeout(Duration::from_secs(5), resp_rx)
-            .await
-            .context("lighter ws sendTxBatch timeout")?
-            .context("lighter ws sendTxBatch response dropped")??;
+        let payload = match tokio::time::timeout(Duration::from_secs(5), resp_rx).await {
+            Ok(resp) => resp.context("lighter ws sendTxBatch response dropped")??,
+            Err(_) => {
+                eprintln!(
+                    "WARN: lighter ws sendTxBatch ack timeout after 5s; reconciling {} tx(s) via order-state sync",
+                    tx_meta.len()
+                );
+                self.reconcile_after_send_timeout(&tx_meta, Duration::from_secs(8))
+                    .await
+                    .context("lighter ws sendTxBatch timeout")?;
+                eprintln!(
+                    "WARN: sendTxBatch ack missing but order-state reconciliation confirmed batch outcome"
+                );
+                return Ok(self.build_acks_from_hashes(&client_ids, &fallback_hashes, None));
+            }
+        };
 
+        Ok(self.build_acks_from_hashes(&client_ids, &fallback_hashes, Some(&payload.tx_hash)))
+    }
+
+    fn build_acks_from_hashes(
+        &self,
+        client_ids: &[ClientOrderId],
+        fallback_hashes: &[Option<String>],
+        response_hashes: Option<&[String]>,
+    ) -> Vec<OrderAck> {
         let mut acks = Vec::with_capacity(client_ids.len());
         for (idx, client_id) in client_ids.iter().cloned().enumerate() {
-            let exch = payload
-                .tx_hash
-                .get(idx)
+            let exch = response_hashes
+                .and_then(|h| h.get(idx))
                 .or(fallback_hashes.get(idx).and_then(|h| h.as_ref()))
                 .cloned()
                 .map(ExchangeOrderId);
@@ -1922,7 +2284,137 @@ impl LighterGateway {
                 exchange_order_id: exch,
             });
         }
-        Ok(acks)
+        acks
+    }
+
+    fn batch_observed(&self, tx_meta: &[(u8, ClientOrderId)]) -> bool {
+        let orders = self.orders.lock();
+        batch_observed_with_orders(&orders, tx_meta)
+    }
+
+    async fn reconcile_after_send_timeout(
+        &self,
+        tx_meta: &[(u8, ClientOrderId)],
+        max_wait: Duration,
+    ) -> Result<()> {
+        let start = Instant::now();
+        let mut backoff_ms = 200u64;
+        while start.elapsed() < max_wait {
+            self.reconcile_orders_once().await?;
+            if self.batch_observed(tx_meta) {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+            backoff_ms = (backoff_ms.saturating_mul(2)).min(1_500);
+        }
+
+        let snapshot = {
+            let orders = self.orders.lock();
+            tx_meta
+                .iter()
+                .map(|(tx_type, id)| {
+                    let state = orders.get(id);
+                    (
+                        *tx_type,
+                        id.0.clone(),
+                        state.and_then(|s| s.order_index),
+                        state.map(|s| s.status.clone()),
+                        state.map(|s| s.filled),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        bail!(
+            "sendTxBatch timeout: reconciliation did not confirm batch within {}ms; snapshot={:?}",
+            max_wait.as_millis(),
+            snapshot
+        )
+    }
+
+    async fn reconcile_orders_once(&self) -> Result<()> {
+        let active = self.fetch_active_orders().await?;
+        let mut seen = HashMap::new();
+        for entry in active.iter() {
+            if let Some(coi) = entry.client_order_index {
+                seen.insert(coi, entry);
+            }
+        }
+
+        let mut missing_for_inactive = Vec::new();
+        let mut reports = Vec::new();
+        {
+            let mut guard = self.orders.lock();
+            for (id, state) in guard.iter_mut() {
+                if let Some(entry) = seen.get(&state.client_order_index) {
+                    Self::update_from_entry(self.size_scale, entry, state, id, &mut reports);
+                } else if matches!(state.status, OrderStatus::New | OrderStatus::PartiallyFilled) {
+                    missing_for_inactive.push(id.clone());
+                }
+            }
+        }
+
+        if !missing_for_inactive.is_empty() {
+            let inactive = self.fetch_inactive_orders(50).await?;
+            let mut guard = self.orders.lock();
+            for entry in inactive {
+                if let Some(coi) = entry.client_order_index {
+                    if let Some((id, state)) = guard.iter_mut().find(|(id, st)| {
+                        missing_for_inactive.contains(id) && st.client_order_index == coi
+                    }) {
+                        if let Some(price_str) = entry.price.as_ref() {
+                            if let Ok(price) = price_str.parse::<f64>() {
+                                state.price = price;
+                            }
+                        }
+                        if let Some(size_str) = entry.initial_base_amount.as_ref() {
+                            if let Ok(size_int) = size_str.parse::<f64>() {
+                                state.size = size_int / self.size_scale;
+                            }
+                        }
+                        Self::update_from_entry(self.size_scale, &entry, state, id, &mut reports);
+                        let mut status = entry
+                            .status
+                            .as_deref()
+                            .map(Self::map_status)
+                            .unwrap_or(OrderStatus::Unknown);
+                        if status == OrderStatus::Unknown {
+                            if let Some(raw) = entry.status.as_deref() {
+                                eprintln!(
+                                    "WARN: unknown inactive order status '{}'; treating as canceled",
+                                    raw
+                                );
+                            }
+                            status = OrderStatus::Canceled;
+                        }
+                        if status != state.status {
+                            if matches!(
+                                status,
+                                OrderStatus::Canceled | OrderStatus::Rejected | OrderStatus::Filled
+                            ) {
+                                state.status = status.clone();
+                                reports.push(ExecutionReport {
+                                    client_order_id: id.clone(),
+                                    exchange_order_id: state.exchange_order_id.clone(),
+                                    status,
+                                    filled_qty: 0.0,
+                                    avg_fill_price: None,
+                                    ts: entry.timestamp.map(|v| v as u64),
+                                });
+                            } else {
+                                state.status = status;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !reports.is_empty() {
+            let mut pending = self.pending_reports.lock();
+            pending.extend(reports);
+            self.report_notify.notify_one();
+        }
+        Ok(())
     }
 
     fn is_nonce_error(err: &anyhow::Error) -> bool {
@@ -2175,8 +2667,20 @@ impl LighterGateway {
     fn map_status(status: &str) -> OrderStatus {
         match status {
             "filled" => OrderStatus::Filled,
-            "canceled" | "canceled-oco" | "canceled-expired" | "canceled-child" => {
+            "canceled"
+            | "cancelled"
+            | "canceled-oco"
+            | "cancelled-oco"
+            | "canceled-expired"
+            | "cancelled-expired"
+            | "canceled-child"
+            | "cancelled-child"
+            | "closed" => {
                 OrderStatus::Canceled
+            }
+            "rejected" => OrderStatus::Rejected,
+            "partially_filled" | "partial_filled" | "partially-filled" => {
+                OrderStatus::PartiallyFilled
             }
             "in-progress" | "pending" | "open" => OrderStatus::New,
             _ => OrderStatus::Unknown,

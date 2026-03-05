@@ -105,17 +105,23 @@ pub async fn fetch_instrument_meta(
             return Ok(None);
         }
     };
-    if value
+    let code = value
         .get("code")
         .and_then(|code| code.as_str())
-        .unwrap_or_default()
-        != "0"
-    {
-        eprintln!(
-            "ERROR: OKX REST GET {} returned code {:?}",
-            url,
-            value.get("code")
-        );
+        .unwrap_or_default();
+    if code != "0" {
+        if code == "51001" {
+            eprintln!(
+                "WARN: OKX REST GET {} returned code 51001 (instrument not found/invalid); treating {} as unsupported",
+                url, inst_id
+            );
+        } else {
+            eprintln!(
+                "ERROR: OKX REST GET {} returned code {:?}",
+                url,
+                value.get("code")
+            );
+        }
         return Ok(None);
     }
     let entry = value

@@ -251,6 +251,16 @@ impl SimpleQuoteStrategy {
         }
     }
 
+    pub fn idle_reason(&self) -> Option<String> {
+        if !self.needs_requote {
+            return None;
+        }
+        if self.latest_price.is_none() {
+            return Some("waiting for first reference price update".to_string());
+        }
+        None
+    }
+
     pub fn on_market_update(&mut self, reference: &ReferenceEvent) -> Vec<ClientOrderId> {
         let price = reference.price;
         if !price.is_finite() || price <= 0.0 {

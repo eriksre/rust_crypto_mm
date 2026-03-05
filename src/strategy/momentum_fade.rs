@@ -392,6 +392,57 @@ impl MomentumFadeStrategy {
         }
     }
 
+    pub fn idle_reason(&self) -> Option<String> {
+        if !self.needs_quote {
+            return Some(format!(
+                "waiting for next momentum signal (entry_source={}, lookback_ms={}, threshold_bps={:.4}, min_interval_ms={})",
+                self.config.entry_price_source.as_str(),
+                self.config.lookback_ms,
+                self.config.entry_threshold_bps,
+                self.config.min_interval_ms
+            ));
+        }
+
+        let has_unknown_live_orders = self
+            .active_orders
+            .iter()
+            .any(|id| !self.pending_cancels.contains(id) && !self.active_quotes.contains_key(id));
+        if has_unknown_live_orders {
+            return Some("waiting for execution reports to reconcile live orders".to_string());
+        }
+
+        let has_lighter_bbo = self
+            .latest_lighter_bbo()
+            .or_else(Self::lighter_bbo_from_state)
+            .is_some();
+        if !has_lighter_bbo {
+            return Some("waiting for lighter orderbook top-of-book".to_string());
+        }
+
+        match self.config.entry_price_source {
+            EntryPriceSource::Model => {
+                if self.latest_fair_mid.is_none() {
+                    return Some(
+                        "waiting for pricing model output (no model:* reference yet)".to_string(),
+                    );
+                }
+            }
+            EntryPriceSource::Lighter => {
+                if self.latest_lighter_mid.is_none() {
+                    return Some("waiting for lighter mid reference".to_string());
+                }
+            }
+        }
+
+        Some(format!(
+            "waiting for momentum signal (entry_source={}, lookback_ms={}, threshold_bps={:.4}, min_interval_ms={})",
+            self.config.entry_price_source.as_str(),
+            self.config.lookback_ms,
+            self.config.entry_threshold_bps,
+            self.config.min_interval_ms
+        ))
+    }
+
     fn update_model(&mut self, reference: &ReferenceEvent) -> bool {
         let price = reference.price;
         if !is_valid_price(price) {
@@ -626,5 +677,46 @@ fn is_adverse(side: Side, order_price: f64, mid: f64, threshold_bps: f64) -> boo
     match side {
         Side::Bid => mid < order_price * (1.0 - buffer),
         Side::Ask => mid > order_price * (1.0 + buffer),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::execution::Venue;
+
+    fn base_config(entry_price_source: EntryPriceSource) -> MomentumFadeConfig {
+        MomentumFadeConfig {
+            entry_price_source,
+            lookback_ms: 140,
+            entry_threshold_bps: 5.0,
+            tick_offset: 1,
+            adverse_threshold_bps: 1.0,
+            max_age_ms: 2_000,
+            min_interval_ms: 50,
+            symbol: None,
+            min_tick: None,
+            max_order_notional: None,
+            max_position_notional: None,
+        }
+    }
+
+    #[test]
+    fn idle_reason_reports_missing_model_output_for_model_entry() {
+        let mut strategy = MomentumFadeStrategy::new(
+            base_config(EntryPriceSource::Model),
+            Venue::Lighter,
+            "XMR_USDT".to_string(),
+            0.001,
+            1.0,
+        );
+        strategy.latest_lighter_bid = Some(359.9);
+        strategy.latest_lighter_ask = Some(360.1);
+        strategy.latest_lighter_mid = Some(360.0);
+
+        let reason = strategy
+            .idle_reason()
+            .expect("expected idle reason when model output is missing");
+        assert!(reason.contains("pricing model output"));
     }
 }

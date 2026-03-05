@@ -1,7 +1,8 @@
 #![cfg(feature = "gate_exec")]
 
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow, bail};
 use clap::Parser;
@@ -426,6 +427,8 @@ const REF_WARN: Duration = Duration::from_millis(20);
 const STAGE_WARN: Duration = Duration::from_millis(5);
 const CANCEL_WARN: Duration = Duration::from_micros(500);
 const LIGHTER_MARKOUT_MAX_AGE: Duration = Duration::from_secs(2);
+const IDLE_WARN_THROTTLE_MS: u64 = 10_000;
+static LAST_IDLE_WARN_MS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
 struct OrderMinima {
@@ -437,6 +440,30 @@ struct OrderMinima {
 struct CancelMessage {
     reference: ReferenceEvent,
     dispatched_at: Instant,
+}
+
+fn maybe_warn_quote_idle(debug: &DebugLogger, symbol: &str, reason: Option<&str>) {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let last_ms = LAST_IDLE_WARN_MS.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(last_ms) < IDLE_WARN_THROTTLE_MS {
+        return;
+    }
+    if LAST_IDLE_WARN_MS
+        .compare_exchange(last_ms, now_ms, Ordering::SeqCst, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    let detail = reason.unwrap_or("no quote plan available");
+    debug.warn(|| {
+        format!(
+            "quote loop idle: strategy is not producing quote plans for {} ({})",
+            symbol, detail
+        )
+    });
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -1147,9 +1174,14 @@ async fn handle_quote_tick(
 ) -> Result<()> {
     let config_ref = config.as_ref();
 
-    let plan_opt = match strategy.try_lock() {
+    let (plan_opt, idle_reason) = match strategy.try_lock() {
         Some(mut guard) => {
             let plan = guard.plan_quotes(now);
+            let idle_reason = if plan.is_none() {
+                guard.idle_reason()
+            } else {
+                None
+            };
             let metrics = guard.state_metrics();
             drop(guard);
             if latency_debug_enabled() {
@@ -1160,7 +1192,7 @@ async fn handle_quote_tick(
                     )
                 });
             }
-            plan
+            (plan, idle_reason)
         }
         None => {
             if latency_debug_enabled() {
@@ -1169,6 +1201,10 @@ async fn handle_quote_tick(
             return Ok(());
         }
     };
+
+    if plan_opt.is_none() {
+        maybe_warn_quote_idle(&debug, &config_ref.strategy.symbol, idle_reason.as_deref());
+    }
 
     if let Some(mut plan) = plan_opt {
         let reference_price = plan.reference_price;

@@ -116,6 +116,9 @@ fn first_u64(value: &Value, keys: &[&str]) -> Option<u64> {
 }
 
 pub fn update_tickers(s: &str, store: &mut TickerStore) -> Option<(String, TickerSnapshot)> {
+    if s.eq_ignore_ascii_case("pong") || s.eq_ignore_ascii_case("ping") {
+        return None;
+    }
     let raw: Value = match serde_json::from_str(s) {
         Ok(val) => val,
         Err(err) => {
@@ -251,6 +254,13 @@ mod tests {
         assert_eq!(snap.open_interest_value, Some(19_610_280.0));
         assert_eq!(snap.ticker.seq, 123_456);
         assert_eq!(snap.ticker.ts, 1_700_000_000_000_000_000);
+    }
+
+    #[test]
+    fn test_update_tickers_ignores_heartbeat_frames() {
+        let mut store = TickerStore::default();
+        assert!(update_tickers("pong", &mut store).is_none());
+        assert!(update_tickers("ping", &mut store).is_none());
     }
 }
 

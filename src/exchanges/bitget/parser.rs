@@ -300,12 +300,34 @@ struct BitgetParseFlags {
 fn bitget_preparse_flags(text: &str) -> BitgetParseFlags {
     let is_books1 = text.contains("\"channel\":\"books1\"");
     let is_books = text.contains("\"channel\":\"books\"");
-    let needs_orderbook = is_books1 || is_books;
+    let has_action = text.contains("\"action\":\"");
+    let needs_orderbook = (is_books1 || is_books) && has_action;
     let needs_json = needs_orderbook
         || text.contains("\"channel\":\"ticker\"")
         || text.contains("\"channel\":\"trade\"");
     BitgetParseFlags {
         needs_json,
         needs_orderbook,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bitget_preparse_flags;
+
+    #[test]
+    fn subscribe_ack_does_not_require_orderbook_parse() {
+        let text = r#"{"event":"subscribe","arg":{"instType":"USDT-FUTURES","channel":"books1","instId":"XMRUSDT"}}"#;
+        let flags = bitget_preparse_flags(text);
+        assert!(!flags.needs_orderbook);
+        assert!(!flags.needs_json);
+    }
+
+    #[test]
+    fn orderbook_update_requires_orderbook_parse() {
+        let text = r#"{"action":"update","arg":{"channel":"books1","instId":"XMRUSDT"},"data":[{"asks":[["1","1"]],"bids":[["1","1"]],"ts":"1"}]}"#;
+        let flags = bitget_preparse_flags(text);
+        assert!(flags.needs_orderbook);
+        assert!(flags.needs_json);
     }
 }

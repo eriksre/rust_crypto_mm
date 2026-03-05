@@ -1,14 +1,14 @@
 strategy_kind: momentum_fade
 strategy:
   venue: lighter
-  symbol: XMR_USDT
+  symbol: SOL_USDT
   size: min
 momentum_fade:
   entry_price_source: model
   lookback_ms: 142
-  entry_threshold_bps: 5.0
+  entry_threshold_bps: 2.0
   tick_offset: 1
-  adverse_threshold_bps: 4.0
+  adverse_threshold_bps: 1.0
   max_age_ms: 2000
   min_interval_ms: 50
 pricing_model:
