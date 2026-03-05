@@ -9,9 +9,9 @@ momentum_fade:
   entry_threshold_bps: 1
   entry_threshold_bps_bid: 1
   entry_threshold_bps_ask: 1
-  tick_offset: 0
-  tick_offset_bid: 0
-  tick_offset_ask: 0
+  tick_offset: 1
+  tick_offset_bid: 1
+  tick_offset_ask: 1
   adverse_threshold_bps: 0
   adverse_threshold_bps_bid: 0
   adverse_threshold_bps_ask: 0
