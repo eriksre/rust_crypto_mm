@@ -1,4 +1,8 @@
 use std::collections::{HashMap, VecDeque};
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 
@@ -38,9 +42,115 @@ fn default_gamma_imb() -> f64 {
     0.0
 }
 
+fn default_stats_alpha() -> f64 {
+    0.02
+}
+
+fn default_stats_warmup_obs() -> u64 {
+    50
+}
+
+fn default_r_learn_alpha() -> f64 {
+    0.02
+}
+
+fn default_r_learn_warmup_obs() -> u64 {
+    200
+}
+
+fn default_r_floor() -> f64 {
+    1e-10
+}
+
+fn default_r_ceiling() -> f64 {
+    1e-2
+}
+
+fn default_r_clip_mult() -> f64 {
+    25.0
+}
+
+fn default_r_state_flush_interval_s() -> u64 {
+    30
+}
+
+fn default_r_state_flush_min_updates() -> u64 {
+    200
+}
+
 fn default_trade_dir_bps() -> f64 {
     0.5
 }
+
+/// Online EWMA estimator for a single metric (mean and MAD).
+#[derive(Debug, Clone)]
+struct EwmaStats {
+    mean: f64,
+    mad: f64,
+    n: u64,
+}
+
+impl Default for EwmaStats {
+    fn default() -> Self {
+        Self {
+            mean: 0.0,
+            mad: 1.0,
+            n: 0,
+        }
+    }
+}
+
+impl EwmaStats {
+    fn update(&mut self, value: f64, alpha: f64) {
+        let abs_dev = (value - self.mean).abs();
+        self.mean = (1.0 - alpha) * self.mean + alpha * value;
+        self.mad = ((1.0 - alpha) * self.mad + alpha * abs_dev).max(1e-10);
+        self.n += 1;
+    }
+
+    /// z = (value - mean) / mad, clamped to [0, 10]. Returns 0 during warmup.
+    fn z_above(&self, value: f64, warmup: u64) -> f64 {
+        if self.n < warmup {
+            return 0.0;
+        }
+        ((value - self.mean) / self.mad.max(1e-10))
+            .max(0.0)
+            .min(10.0)
+    }
+
+    /// z = (mean - value) / mad, clamped to [0, 10]. Used for top_ratio where
+    /// below-normal is suspicious (thin book). Returns 0 during warmup.
+    fn z_below(&self, value: f64, warmup: u64) -> f64 {
+        if self.n < warmup {
+            return 0.0;
+        }
+        ((self.mean - value) / self.mad.max(1e-10))
+            .max(0.0)
+            .min(10.0)
+    }
+}
+
+/// Per-stream online stats for all three adaptive-noise signals.
+#[derive(Debug, Default, Clone)]
+struct StreamOnlineStats {
+    latency: EwmaStats,
+    spread: EwmaStats,
+    top_ratio: EwmaStats,
+}
+
+#[derive(Debug, Clone)]
+struct StreamNoiseStats {
+    r: f64,
+    n: u64,
+}
+
+impl StreamNoiseStats {
+    fn new(r: f64) -> Self {
+        Self { r, n: 0 }
+    }
+}
+
+const LEARNED_R_STATE_HEADER: &str = "learned_r_state_v1";
 
 fn default_trade_r_mult() -> f64 {
     5.0
@@ -247,7 +357,7 @@ pub struct PricingModelConfig {
     pub tuning: FilterTuningConfig,
 }
 
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 #[serde(deny_unknown_fields)]
 pub struct KalmanParamsConfig {
@@ -262,20 +372,54 @@ pub struct KalmanParamsConfig {
     pub ref_stream: String,
     #[serde(default)]
     pub bias_by_stream: HashMap<String, f64>,
+    /// EWMA alpha for the online per-stream stats estimator.
+    /// ~0.02 gives a ~50-observation window. Tune slower (0.005) for stable
+    /// environments, faster (0.05) for rapidly-changing network conditions.
+    #[serde(default = "default_stats_alpha")]
+    pub stats_alpha: f64,
+    /// Minimum observations per stream before z-scores become active.
+    /// During warmup the adaptive adjustments are silently disabled (z = 0).
+    #[serde(default = "default_stats_warmup_obs")]
+    pub stats_warmup_obs: u64,
+    #[serde(default = "default_r_learn_alpha")]
+    pub r_learn_alpha: f64,
+    #[serde(default = "default_r_learn_warmup_obs")]
+    pub r_learn_warmup_obs: u64,
+    #[serde(default = "default_r_floor")]
+    pub r_floor: f64,
+    #[serde(default = "default_r_ceiling")]
+    pub r_ceiling: f64,
+    #[serde(default = "default_r_clip_mult")]
+    pub r_clip_mult: f64,
     #[serde(default)]
-    pub r_by_stream: HashMap<String, f64>,
-    #[serde(default)]
-    pub latency_median_us: HashMap<String, f64>,
-    #[serde(default)]
-    pub latency_mad_us: HashMap<String, f64>,
-    #[serde(default)]
-    pub spread_median_bps: HashMap<String, f64>,
-    #[serde(default)]
-    pub spread_mad_bps: HashMap<String, f64>,
-    #[serde(default)]
-    pub top_ratio_median: HashMap<String, f64>,
-    #[serde(default)]
-    pub top_ratio_mad: HashMap<String, f64>,
+    pub r_state_path: Option<String>,
+    #[serde(default = "default_r_state_flush_interval_s")]
+    pub r_state_flush_interval_s: u64,
+    #[serde(default = "default_r_state_flush_min_updates")]
+    pub r_state_flush_min_updates: u64,
+}
+
+impl Default for KalmanParamsConfig {
+    fn default() -> Self {
+        Self {
+            mu_log: None,
+            k_per_sec: default_k_per_sec(),
+            q_per_sec: default_q_per_sec(),
+            gamma_imb: default_gamma_imb(),
+            ref_stream: default_ref_stream(),
+            bias_by_stream: HashMap::new(),
+            stats_alpha: default_stats_alpha(),
+            stats_warmup_obs: default_stats_warmup_obs(),
+            r_learn_alpha: default_r_learn_alpha(),
+            r_learn_warmup_obs: default_r_learn_warmup_obs(),
+            r_floor: default_r_floor(),
+            r_ceiling: default_r_ceiling(),
+            r_clip_mult: default_r_clip_mult(),
+            r_state_path: None,
+            r_state_flush_interval_s: default_r_state_flush_interval_s(),
+            r_state_flush_min_updates: default_r_state_flush_min_updates(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -466,6 +610,13 @@ pub struct LighterPricingModel {
     biases: HashMap<String, f64>,
     ref_stream: String,
     default_r: f64,
+    learned_r_by_stream: HashMap<String, StreamNoiseStats>,
+    r_state_path: Option<PathBuf>,
+    r_state_flush_interval: Duration,
+    r_state_flush_min_updates: u64,
+    r_state_last_flush: Instant,
+    r_updates_since_flush: u64,
+    dropped_metric_samples: u64,
     start_ns: Option<i64>,
     last_t: f64,
     last_z: f64,
@@ -490,34 +641,28 @@ pub struct LighterPricingModel {
     last_t_by_exch: HashMap<String, f64>,
     spread_samples: VecDeque<f64>,
     base_half_spread_bps: Option<f64>,
+    online_stats: HashMap<String, StreamOnlineStats>,
 }
 
 impl LighterPricingModel {
     pub fn new(cfg: PricingModelConfig) -> Self {
-        let default_r = if cfg.kalman.r_by_stream.is_empty() {
-            1e-4
-        } else {
-            let mut vals: Vec<f64> = cfg
-                .kalman
-                .r_by_stream
-                .values()
-                .copied()
-                .filter(|v| v.is_finite() && *v > 0.0)
-                .collect();
-            if vals.is_empty() {
-                1e-4
-            } else {
-                vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                let med = vals[vals.len() / 2];
-                (10.0 * med).max(1e-10)
-            }
-        };
-
-        Self {
+        let r_floor = cfg.kalman.r_floor;
+        let r_ceiling = cfg.kalman.r_ceiling;
+        let default_r = (10.0 * cfg.kalman.q_per_sec.max(r_floor)).clamp(r_floor, r_ceiling);
+        let r_state_path = cfg.kalman.r_state_path.as_ref().map(PathBuf::from);
+        let r_state_flush_interval = Duration::from_secs(cfg.kalman.r_state_flush_interval_s.max(1));
+        let mut model = Self {
             mu_log: cfg.kalman.mu_log,
             biases: cfg.kalman.bias_by_stream.clone(),
             ref_stream: cfg.kalman.ref_stream.clone(),
             default_r,
+            learned_r_by_stream: HashMap::new(),
+            r_state_path,
+            r_state_flush_interval,
+            r_state_flush_min_updates: cfg.kalman.r_state_flush_min_updates.max(1),
+            r_state_last_flush: Instant::now(),
+            r_updates_since_flush: 0,
+            dropped_metric_samples: 0,
             cfg,
             start_ns: None,
             last_t: 0.0,
@@ -543,7 +688,10 @@ impl LighterPricingModel {
             last_t_by_exch: HashMap::new(),
             spread_samples: VecDeque::new(),
             base_half_spread_bps: None,
-        }
+            online_stats: HashMap::new(),
+        };
+        model.load_learned_r_state();
+        model
     }
 
     pub fn update(&mut self, obs: &PricingObservation) -> Option<ModelOutput> {
@@ -596,6 +744,8 @@ impl LighterPricingModel {
         let spread_bps = self.spread_bps(mid, bid_px, ask_px);
         let (_bid_depth, _ask_depth, top_ratio, imbalance) = self.depth_metrics(obs);
 
+        self.update_online_stats(&stream, latency_us, spread_bps, top_ratio);
+
         let dt = (t_sec - self.last_t).max(0.0);
         // Use configured drift/reversion directly; validation happens at config load.
         let k = self.cfg.kalman.k_per_sec;
@@ -607,6 +757,8 @@ impl LighterPricingModel {
         self.p = (phi * phi) * self.p + q;
         self.x_c = phi * self.x_c;
         self.p_c = (phi * phi) * self.p_c + q;
+        let x_prior = self.x;
+        let p_prior = self.p.max(0.0);
 
         if z_obs.is_finite() && dt > 0.0 {
             let dz = z_obs - self.last_z;
@@ -634,14 +786,7 @@ impl LighterPricingModel {
             self.biases.insert(stream.clone(), b);
         }
 
-        let mut r_eff = self
-            .cfg
-            .kalman
-            .r_by_stream
-            .get(&stream)
-            .copied()
-            .unwrap_or(self.default_r)
-            .max(1e-12);
+        let mut r_eff = self.current_base_r(&stream);
         let is_ref = stream == self.ref_stream;
         if is_ref {
             r_eff = (r_eff * self.cfg.tuning.lighter_r_mult.max(1e-6)).max(1e-12);
@@ -657,41 +802,30 @@ impl LighterPricingModel {
         let mut z_lat = 0.0;
         if !is_ref && self.cfg.tuning.latency_alpha > 0.0 {
             if let Some(lat) = latency_us {
-                let med = *self
-                    .cfg
-                    .kalman
-                    .latency_median_us
+                z_lat = self
+                    .online_stats
                     .get(&stream)
-                    .unwrap_or(&0.0);
-                let mad = *self.cfg.kalman.latency_mad_us.get(&stream).unwrap_or(&1.0);
-                z_lat = ((lat - med) / mad).max(0.0).min(10.0);
+                    .map(|s| s.latency.z_above(lat, self.cfg.kalman.stats_warmup_obs))
+                    .unwrap_or(0.0);
                 r_eff *= 1.0 + self.cfg.tuning.latency_alpha * z_lat;
             }
         }
 
         let mut stale_score = 0.0;
         if !is_ref && self.cfg.tuning.stale_alpha > 0.0 && is_book {
+            let warmup = self.cfg.kalman.stats_warmup_obs;
+            let stream_stats = self.online_stats.get(&stream);
             let z_sp = if spread_bps.is_finite() {
-                let med = *self
-                    .cfg
-                    .kalman
-                    .spread_median_bps
-                    .get(&stream)
-                    .unwrap_or(&0.0);
-                let mad = *self.cfg.kalman.spread_mad_bps.get(&stream).unwrap_or(&1.0);
-                ((spread_bps - med) / mad).max(0.0).min(10.0)
+                stream_stats
+                    .map(|s| s.spread.z_above(spread_bps, warmup))
+                    .unwrap_or(0.0)
             } else {
                 0.0
             };
             let z_top = if top_ratio.is_finite() {
-                let med = *self
-                    .cfg
-                    .kalman
-                    .top_ratio_median
-                    .get(&stream)
-                    .unwrap_or(&0.0);
-                let mad = *self.cfg.kalman.top_ratio_mad.get(&stream).unwrap_or(&1.0);
-                ((med - top_ratio) / mad).max(0.0).min(10.0)
+                stream_stats
+                    .map(|s| s.top_ratio.z_below(top_ratio, warmup))
+                    .unwrap_or(0.0)
             } else {
                 0.0
             };
@@ -709,6 +843,7 @@ impl LighterPricingModel {
         }
 
         let y = y_raw - b;
+        let innovation = y - x_prior;
         let mut s_var = self.p + r_eff;
         let mut std = s_var.max(1e-12).sqrt();
         let mut _nu = (y - self.x) / std;
@@ -748,6 +883,8 @@ impl LighterPricingModel {
                 self.last_common_t = t_sec;
             }
         }
+        self.update_stream_r(&stream, innovation, p_prior);
+        self.maybe_persist_learned_r_state();
 
         if obs.exchange != TARGET_EXCHANGE && is_book && obs_price.is_finite() && obs_price > 0.0 {
             self.last_px_by_exch.insert(obs.exchange.clone(), obs_price);
@@ -1169,11 +1306,10 @@ impl LighterPricingModel {
         };
 
         let spread_med = self
-            .cfg
-            .kalman
-            .spread_median_bps
+            .online_stats
             .get(&self.ref_stream)
-            .copied()
+            .filter(|s| s.spread.n >= self.cfg.kalman.stats_warmup_obs)
+            .map(|s| s.spread.mean)
             .unwrap_or(0.0)
             .max(0.0);
         let delta = 0.5 * spread_med * 1e-4;
@@ -1210,21 +1346,16 @@ impl LighterPricingModel {
         age_ask: f64,
         common_n: i32,
     ) -> (f64, bool) {
-        let spread_med = self
-            .cfg
-            .kalman
-            .spread_median_bps
-            .get(&self.ref_stream)
-            .copied()
+        let warmup = self.cfg.kalman.stats_warmup_obs;
+        let ref_stats = self.online_stats.get(&self.ref_stream);
+        let spread_med = ref_stats
+            .filter(|s| s.spread.n >= warmup)
+            .map(|s| s.spread.mean)
             .unwrap_or(0.0);
-        let spread_mad = self
-            .cfg
-            .kalman
-            .spread_mad_bps
-            .get(&self.ref_stream)
-            .copied()
-            .unwrap_or(1.0)
-            .max(1e-6);
+        let spread_mad = ref_stats
+            .filter(|s| s.spread.n >= warmup)
+            .map(|s| s.spread.mad.max(1e-6))
+            .unwrap_or(1.0);
         let z_sp = if spread_now.is_finite() {
             ((spread_now - spread_med) / spread_mad).max(0.0)
         } else {
@@ -1341,6 +1472,276 @@ impl LighterPricingModel {
         let ask = (log_f + d).exp();
         (Some(bid), Some(ask))
     }
+
+    fn update_online_stats(
+        &mut self,
+        stream: &str,
+        latency_us: Option<f64>,
+        spread_bps: f64,
+        top_ratio: f64,
+    ) {
+        let alpha = self.cfg.kalman.stats_alpha;
+        if let Some(lat) = latency_us {
+            if lat.is_finite() && lat >= 0.0 {
+                self.online_stats
+                    .entry(stream.to_string())
+                    .or_default()
+                    .latency
+                    .update(lat, alpha);
+            } else {
+                self.warn_invalid_metric_sample(stream, "latency_us", lat);
+            }
+        }
+        if spread_bps.is_finite() && spread_bps >= 0.0 {
+            self.online_stats
+                .entry(stream.to_string())
+                .or_default()
+                .spread
+                .update(spread_bps, alpha);
+        } else {
+            self.warn_invalid_metric_sample(stream, "spread_bps", spread_bps);
+        }
+        if top_ratio.is_finite() && top_ratio >= 0.0 {
+            self.online_stats
+                .entry(stream.to_string())
+                .or_default()
+                .top_ratio
+                .update(top_ratio, alpha);
+        } else {
+            self.warn_invalid_metric_sample(stream, "top_ratio", top_ratio);
+        }
+    }
+
+    fn current_base_r(&self, stream: &str) -> f64 {
+        self.learned_r_by_stream
+            .get(stream)
+            .map(|stats| stats.r)
+            .unwrap_or(self.default_r)
+            .clamp(self.cfg.kalman.r_floor, self.cfg.kalman.r_ceiling)
+    }
+
+    fn update_stream_r(&mut self, stream: &str, innovation: f64, p_prior: f64) {
+        if !innovation.is_finite() || !p_prior.is_finite() || p_prior < 0.0 {
+            self.warn_invalid_metric_sample(stream, "innovation_or_p_prior", innovation);
+            return;
+        }
+        let raw_sample = innovation * innovation - p_prior;
+        if !raw_sample.is_finite() {
+            self.warn_invalid_metric_sample(stream, "r_sample", raw_sample);
+            return;
+        }
+        let r_floor = self.cfg.kalman.r_floor;
+        let r_ceiling = self.cfg.kalman.r_ceiling;
+        let r_clip_mult = self.cfg.kalman.r_clip_mult;
+        let clipped_sample = raw_sample.clamp(r_floor, r_ceiling);
+        let stats = self
+            .learned_r_by_stream
+            .entry(stream.to_string())
+            .or_insert_with(|| StreamNoiseStats::new(self.default_r));
+        let low_clip = (stats.r / r_clip_mult).max(r_floor);
+        let high_clip = (stats.r * r_clip_mult).min(r_ceiling);
+        let bounded_sample = clipped_sample.clamp(low_clip, high_clip);
+        stats.n += 1;
+        let alpha = if stats.n <= self.cfg.kalman.r_learn_warmup_obs {
+            self.cfg.kalman.r_learn_alpha.max(1.0 / stats.n as f64)
+        } else {
+            self.cfg.kalman.r_learn_alpha
+        };
+        stats.r = ((1.0 - alpha) * stats.r + alpha * bounded_sample).clamp(r_floor, r_ceiling);
+        self.r_updates_since_flush = self.r_updates_since_flush.saturating_add(1);
+    }
+
+    fn load_learned_r_state(&mut self) {
+        let Some(path) = self.r_state_path.as_ref() else {
+            return;
+        };
+        if path.as_os_str().is_empty() {
+            panic!("pricing_model.kalman.r_state_path resolved to an empty path");
+        }
+        if !path.exists() {
+            eprintln!(
+                "INFO: pricing model learned-r state file not found at {}; starting cold",
+                path.display()
+            );
+            return;
+        }
+        if path.is_dir() {
+            panic!(
+                "pricing_model.kalman.r_state_path points to a directory, expected a file: {}",
+                path.display()
+            );
+        }
+        let file = File::open(path).unwrap_or_else(|err| {
+            panic!(
+                "failed to open pricing model learned-r state file {}: {}",
+                path.display(),
+                err
+            )
+        });
+        let mut lines = BufReader::new(file).lines();
+        let header_line = match lines.next() {
+            Some(Ok(line)) => line,
+            Some(Err(err)) => {
+                panic!(
+                    "failed reading pricing model learned-r state header from {}: {}",
+                    path.display(),
+                    err
+                )
+            }
+            None => {
+                panic!(
+                    "pricing model learned-r state file is empty: {}",
+                    path.display()
+                )
+            }
+        };
+        if !header_line.starts_with(&format!("# {}", LEARNED_R_STATE_HEADER)) {
+            panic!(
+                "invalid learned-r state header in {}: '{}'",
+                path.display(),
+                header_line
+            );
+        }
+        let mut loaded = HashMap::new();
+        for (idx, line_result) in lines.enumerate() {
+            let line_no = idx + 2;
+            let line = line_result.unwrap_or_else(|err| {
+                panic!(
+                    "failed reading learned-r state line {} from {}: {}",
+                    line_no,
+                    path.display(),
+                    err
+                )
+            });
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let (stream, raw_r) = trimmed.split_once(',').unwrap_or_else(|| {
+                panic!(
+                    "invalid learned-r line {} in {} (expected '<stream>,<r>'): {}",
+                    line_no,
+                    path.display(),
+                    trimmed
+                )
+            });
+            let stream = stream.trim();
+            if stream.is_empty() || !stream.contains(':') {
+                panic!(
+                    "invalid stream key at line {} in {}: '{}'",
+                    line_no,
+                    path.display(),
+                    stream
+                );
+            }
+            let parsed_r: f64 = raw_r.trim().parse().unwrap_or_else(|err| {
+                panic!(
+                    "invalid r value at line {} in {}: {} ({})",
+                    line_no,
+                    path.display(),
+                    raw_r.trim(),
+                    err
+                )
+            });
+            if !parsed_r.is_finite() || parsed_r <= 0.0 {
+                panic!(
+                    "invalid non-positive r at line {} in {}: {}",
+                    line_no,
+                    path.display(),
+                    parsed_r
+                );
+            }
+            loaded.insert(
+                stream.to_string(),
+                StreamNoiseStats::new(parsed_r.clamp(self.cfg.kalman.r_floor, self.cfg.kalman.r_ceiling)),
+            );
+        }
+        eprintln!(
+            "INFO: loaded {} learned-r stream values from {} (warm-start only; live relearning enabled)",
+            loaded.len(),
+            path.display()
+        );
+        self.learned_r_by_stream = loaded;
+    }
+
+    fn maybe_persist_learned_r_state(&mut self) {
+        if self.r_state_path.is_none() || self.r_updates_since_flush == 0 {
+            return;
+        }
+        let enough_updates = self.r_updates_since_flush >= self.r_state_flush_min_updates;
+        let enough_time = self.r_state_last_flush.elapsed() >= self.r_state_flush_interval;
+        if !enough_updates && !enough_time {
+            return;
+        }
+        if let Err(err) = self.persist_learned_r_state() {
+            let path = self
+                .r_state_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<unset>".to_string());
+            panic!(
+                "failed to persist pricing model learned-r state to {}: {}",
+                path, err
+            );
+        }
+        self.r_updates_since_flush = 0;
+        self.r_state_last_flush = Instant::now();
+    }
+
+    fn persist_learned_r_state(&self) -> std::io::Result<()> {
+        let Some(path) = self.r_state_path.as_ref() else {
+            return Ok(());
+        };
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        fs::create_dir_all(&parent)?;
+        let tmp_path = path.with_extension("tmp");
+        let file = File::create(&tmp_path)?;
+        let mut writer = BufWriter::new(file);
+        writeln!(
+            writer,
+            "# {} saved_unix_ms={}",
+            LEARNED_R_STATE_HEADER,
+            now_unix_ms()
+        )?;
+        let mut streams: Vec<_> = self.learned_r_by_stream.iter().collect();
+        streams.sort_by(|(a, _), (b, _)| a.cmp(b));
+        for (stream, stats) in streams {
+            let r = stats.r;
+            if !r.is_finite() || r <= 0.0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("stream {} has invalid learned r {}", stream, r),
+                ));
+            }
+            writeln!(writer, "{},{}", stream, r)?;
+        }
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        fs::rename(&tmp_path, path)?;
+        Ok(())
+    }
+
+    fn warn_invalid_metric_sample(&mut self, stream: &str, metric: &str, value: f64) {
+        self.dropped_metric_samples = self.dropped_metric_samples.saturating_add(1);
+        let count = self.dropped_metric_samples;
+        if count <= 20 || count % 1000 == 0 {
+            eprintln!(
+                "WARNING: dropped invalid pricing metric sample stream={} metric={} value={} dropped_count={}",
+                stream, metric, value, count
+            );
+        }
+    }
+}
+
+fn now_unix_ms() -> u128 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(dur) => dur.as_millis(),
+        Err(err) => panic!("system clock is before UNIX_EPOCH: {}", err),
+    }
 }
 
 fn side_fresh(age_ms: f64, tau_ms: f64) -> f64 {
@@ -1360,5 +1761,77 @@ fn sigmoid(x: f64) -> f64 {
         1.0
     } else {
         0.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_cfg() -> PricingModelConfig {
+        PricingModelConfig {
+            enabled: true,
+            time_basis: TimeBasis::Wire,
+            kalman: KalmanParamsConfig::default(),
+            tuning: FilterTuningConfig::default(),
+        }
+    }
+
+    #[test]
+    fn learned_r_updates_and_stays_bounded() {
+        let mut cfg = base_cfg();
+        cfg.kalman.r_floor = 1e-8;
+        cfg.kalman.r_ceiling = 1e-4;
+        cfg.kalman.r_clip_mult = 10.0;
+        let mut model = LighterPricingModel::new(cfg);
+        model.update_stream_r("binance:bbo", 10.0, 0.0);
+        let stats = model
+            .learned_r_by_stream
+            .get("binance:bbo")
+            .expect("stream noise stats missing");
+        assert!(stats.r.is_finite());
+        assert!(stats.r >= 1e-8);
+        assert!(stats.r <= 1e-4);
+        assert_eq!(stats.n, 1);
+    }
+
+    #[test]
+    fn learned_r_state_load_is_warm_start_only() {
+        let tmp_path = std::env::temp_dir().join(format!(
+            "pricing_r_state_{}_{}.csv",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        std::fs::write(
+            &tmp_path,
+            format!("# {} saved_unix_ms=1\nbinance:bbo,0.0002\n", LEARNED_R_STATE_HEADER),
+        )
+        .expect("failed writing temp state file");
+
+        let mut cfg = base_cfg();
+        cfg.kalman.r_floor = 1e-8;
+        cfg.kalman.r_ceiling = 1e-2;
+        cfg.kalman.r_state_path = Some(tmp_path.to_string_lossy().to_string());
+        let mut model = LighterPricingModel::new(cfg);
+        let loaded = model
+            .learned_r_by_stream
+            .get("binance:bbo")
+            .expect("expected loaded stream");
+        assert_eq!(loaded.n, 0, "loaded values must not skip relearning warmup");
+
+        model.update_stream_r("binance:bbo", 0.001, 0.0);
+        let updated = model
+            .learned_r_by_stream
+            .get("binance:bbo")
+            .expect("stream missing after update");
+        assert_eq!(updated.n, 1);
+        std::fs::remove_file(&tmp_path).expect("failed removing temp state file");
+    }
+
+    #[test]
+    fn invalid_online_stats_are_counted() {
+        let mut model = LighterPricingModel::new(base_cfg());
+        model.update_online_stats("gate:bbo", Some(f64::NAN), -1.0, f64::INFINITY);
+        assert_eq!(model.dropped_metric_samples, 3);
     }
 }

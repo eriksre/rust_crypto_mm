@@ -66,7 +66,8 @@ pub fn update_tickers(
             .and_then(|v| v.as_str())
     })?;
 
-    let mut snapshot = store.get(inst_id).copied().unwrap_or_default();
+    let prev = store.get(inst_id).copied();
+    let mut snapshot = prev.unwrap_or_default();
 
     if let Some(last_px) = value_to_f64(payload, &["last"]) {
         snapshot.ticker.last_px = (last_px * PRICE_SCALE).round() as Price;
@@ -93,17 +94,31 @@ pub fn update_tickers(
     if let Some(seq) = value_to_u64(payload, &["seqId", "seq"]) {
         snapshot.ticker.seq = seq;
     } else {
-        log_parse_drop(
-            "okx_collector",
-            "missing_seq",
-            &"missing seq",
-            sample.as_str(),
-        );
+        // OKX tickers payloads do not guarantee seq fields; use local monotonic fallback.
+        snapshot.ticker.seq = 0;
     }
 
-    if let Some(ts_ms) = value_to_u64(payload, &["ts"]) {
-        snapshot.ticker.ts = ms_to_ns(ts_ms);
+    let ts_ns = match value_to_u64(payload, &["ts"]) {
+        Some(ts_ms) => ms_to_ns(ts_ms),
+        None => {
+            log_parse_drop(
+                "okx_collector",
+                "missing_ts",
+                &"missing ts",
+                sample.as_str(),
+            );
+            return None;
+        }
+    };
+    if let Some(prev) = prev {
+        let prev_ts = prev.ticker.ts;
+        if prev_ts != 0 && ts_ns < prev_ts {
+            let err = format!("stale ticker ts {} < {}", ts_ns, prev_ts);
+            log_parse_drop("okx_collector", "stale_ts", &err, sample.as_str());
+            return None;
+        }
     }
+    snapshot.ticker.ts = ts_ns;
 
     let stored = store.update(inst_id.to_string(), snapshot);
     Some((inst_id.to_string(), stored))
@@ -433,4 +448,49 @@ fn level_to_pair(value: &Value) -> Option<(f64, f64)> {
         }
     };
     Some((px, qty))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::update_tickers;
+    use crate::base_classes::tickers::TickerStore;
+    use crate::exchanges::okx::OkxFrame;
+    use crate::utils::time::ms_to_ns;
+    use std::time::Instant;
+
+    #[test]
+    fn update_tickers_accepts_missing_seq_with_local_monotonic_fallback() {
+        let mut store = TickerStore::default();
+        let msg1 = r#"{"arg":{"channel":"tickers","instId":"SOL-USDT-SWAP"},"data":[{"instType":"SWAP","instId":"SOL-USDT-SWAP","last":"90.1","lastSz":"0.01","askPx":"90.2","askSz":"10","bidPx":"90.0","bidSz":"11","ts":"1000"}]}"#;
+        let msg2 = r#"{"arg":{"channel":"tickers","instId":"SOL-USDT-SWAP"},"data":[{"instType":"SWAP","instId":"SOL-USDT-SWAP","last":"90.2","lastSz":"0.02","askPx":"90.3","askSz":"12","bidPx":"90.1","bidSz":"13","ts":"1001"}]}"#;
+
+        let mut frame1 = OkxFrame::from_text(msg1, 1, Instant::now());
+        let (_, snap1) = update_tickers(&mut frame1, &mut store, 1.0).expect("first ticker");
+        assert_eq!(snap1.ticker.seq, 1);
+        assert_eq!(snap1.ticker.ts, ms_to_ns(1000));
+
+        let mut frame2 = OkxFrame::from_text(msg2, 2, Instant::now());
+        let (_, snap2) = update_tickers(&mut frame2, &mut store, 1.0).expect("second ticker");
+        assert_eq!(snap2.ticker.seq, 2);
+        assert_eq!(snap2.ticker.ts, ms_to_ns(1001));
+    }
+
+    #[test]
+    fn update_tickers_rejects_stale_timestamp() {
+        let mut store = TickerStore::default();
+        let newer = r#"{"arg":{"channel":"tickers","instId":"SOL-USDT-SWAP"},"data":[{"instType":"SWAP","instId":"SOL-USDT-SWAP","last":"90.2","lastSz":"0.02","askPx":"90.3","askSz":"12","bidPx":"90.1","bidSz":"13","ts":"2000"}]}"#;
+        let older = r#"{"arg":{"channel":"tickers","instId":"SOL-USDT-SWAP"},"data":[{"instType":"SWAP","instId":"SOL-USDT-SWAP","last":"90.1","lastSz":"0.01","askPx":"90.2","askSz":"10","bidPx":"90.0","bidSz":"11","ts":"1999"}]}"#;
+
+        let mut newer_frame = OkxFrame::from_text(newer, 1, Instant::now());
+        update_tickers(&mut newer_frame, &mut store, 1.0).expect("newer ticker");
+
+        let mut older_frame = OkxFrame::from_text(older, 2, Instant::now());
+        let stale = update_tickers(&mut older_frame, &mut store, 1.0);
+        assert!(stale.is_none(), "stale ticker update must be rejected");
+
+        let stored = store
+            .get("SOL-USDT-SWAP")
+            .expect("store must retain last accepted ticker");
+        assert_eq!(stored.ticker.ts, ms_to_ns(2000));
+    }
 }

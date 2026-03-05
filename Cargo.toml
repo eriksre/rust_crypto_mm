@@ -156,3 +156,8 @@ required-features = ["gate_exec"]
 name = "price_predictor"
 path = "src/bin/price_predictor.rs"
 required-features = ["gate_exec"]
+
+[[bin]]
+name = "lighter_position_watch"
+path = "src/bin/lighter_position_watch.rs"
+required-features = ["gate_exec"]

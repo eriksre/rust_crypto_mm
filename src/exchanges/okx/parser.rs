@@ -48,6 +48,9 @@ impl ExchangeHandler for OkxHandler {
 
     #[inline(always)]
     fn parse_text(&self, text: &str, ts: Ts, recv_instant: Instant) -> Option<Self::Out> {
+        if !is_json_object_text(text) {
+            return None;
+        }
         let mut frame = OkxFrame::from_text(text, ts, recv_instant);
         frame.preparse_text(text);
         Some(frame)
@@ -313,5 +316,32 @@ fn okx_preparse_flags(text: &str) -> OkxParseFlags {
     OkxParseFlags {
         needs_json,
         needs_orderbook,
+    }
+}
+
+#[inline(always)]
+fn is_json_object_text(text: &str) -> bool {
+    text.trim_start().starts_with('{')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OkxHandler;
+    use crate::base_classes::ws::ExchangeHandler;
+    use std::time::Instant;
+
+    #[test]
+    fn parse_text_ignores_plain_pong_control_frame() {
+        let handler = OkxHandler::new("SOL_USDT");
+        let parsed = handler.parse_text("pong", 1, Instant::now());
+        assert!(parsed.is_none(), "plain pong control frame must be ignored");
+    }
+
+    #[test]
+    fn parse_text_accepts_json_channel_frame() {
+        let handler = OkxHandler::new("SOL_USDT");
+        let text = r#"{"arg":{"channel":"tickers","instId":"SOL-USDT-SWAP"},"data":[{"instId":"SOL-USDT-SWAP","last":"1","lastSz":"1","bidPx":"1","askPx":"2","ts":"1"}]}"#;
+        let parsed = handler.parse_text(text, 1, Instant::now());
+        assert!(parsed.is_some(), "json channel frame must be parsed");
     }
 }

@@ -28,99 +28,16 @@ pricing_model:
     q_per_sec: 0.000001
     gamma_imb: 0.0
     bias_by_stream: {}
-    r_by_stream:
-      binance:bbo: 1e-10
-      binance:orderbook: 1e-10
-      binance:trade: 6.6181521569e-09
-      bitget:bbo: 1e-10
-      bitget:orderbook: 1e-10
-      bybit:bbo: 1e-10
-      bybit:orderbook: 1e-10
-      bybit:trade: 1e-10
-      gate:bbo: 1e-10
-      gate:orderbook: 1e-10
-      lighter:orderbook: 1e-10
-      okx:bbo: 1e-10
-      okx:orderbook: 1e-10
-      okx:trade: 1e-10
-    latency_median_us:
-      binance:bbo: 48410.2915
-      binance:orderbook: 46152.875
-      binance:trade: 161914.708
-      bitget:bbo: 62598.2495
-      bitget:orderbook: 50385.25
-      bybit:bbo: 47396.541
-      bybit:orderbook: 49032.5625
-      bybit:trade: 48364.4785
-      gate:bbo: 49586.8745
-      gate:orderbook: 50067.562
-      lighter:orderbook: 47893.166
-      okx:bbo: 146937.25
-      okx:orderbook: 147073.229
-      okx:trade: 147616.875
-    latency_mad_us:
-      binance:bbo: 1430.5835
-      binance:orderbook: 1609.125
-      binance:trade: 41145.896
-      bitget:bbo: 2212.896
-      bitget:orderbook: 1905.667
-      bybit:bbo: 2072.416
-      bybit:orderbook: 3529.3955
-      bybit:trade: 1119.1665
-      gate:bbo: 657.7915
-      gate:orderbook: 2272.0415
-      lighter:orderbook: 1035.458
-      okx:bbo: 735.3755
-      okx:orderbook: 842.0415
-      okx:trade: 1291.5415
-    spread_median_bps:
-      binance:bbo: 1.10430125338
-      binance:orderbook: 0.274623422631
-      bitget:bbo: 0.110587051363
-      bitget:orderbook: 4.93840708936
-      bybit:bbo: 1.09772496501
-      bybit:orderbook: 0.274608339857
-      gate:bbo: 1.10564431422
-      gate:orderbook: 1.10601117071
-      lighter:orderbook: 3.08945062947
-      okx:bbo: 1.10539987841
-      okx:orderbook: 1.10539987841
-    spread_mad_bps:
-      binance:bbo: 0.00195462360243
-      binance:orderbook: 0.000354007785513
-      bitget:bbo: 8.73718086392e-05
-      bitget:orderbook: 1.92774415822
-      bybit:bbo: 0.82309400037
-      bybit:orderbook: 0.000323879442947
-      gate:bbo: 0.00036685648871
-      gate:orderbook: 0.000489520848536
-      lighter:orderbook: 2.97885990914
-      okx:bbo: 0.000244435818101
-      okx:orderbook: 0.000244435818101
-    top_ratio_median:
-      binance:bbo: 1.000000
-      binance:orderbook: 0.399466
-      bitget:bbo: 1.000000
-      bitget:orderbook: 0.131090
-      bybit:bbo: 1.000000
-      bybit:orderbook: 0.162791
-      gate:bbo: 1.000000
-      gate:orderbook: 0.116599
-      lighter:orderbook: 0.097024
-      okx:bbo: 1.000000
-      okx:orderbook: 0.114623
-    top_ratio_mad:
-      binance:bbo: 1e-09
-      binance:orderbook: 0.232203468649
-      bitget:bbo: 1e-09
-      bitget:orderbook: 0.0837362883579
-      bybit:bbo: 1e-09
-      bybit:orderbook: 0.104631818382
-      gate:bbo: 1e-09
-      gate:orderbook: 0.0545968174551
-      lighter:orderbook: 0.0663161677535
-      okx:bbo: 1e-09
-      okx:orderbook: 0.0329298691528
+    stats_alpha: 0.02
+    stats_warmup_obs: 50
+    r_learn_alpha: 0.02
+    r_learn_warmup_obs: 200
+    r_floor: 1e-10
+    r_ceiling: 0.01
+    r_clip_mult: 25.0
+    r_state_path: logs/pricing_r_state.csv
+    r_state_flush_interval_s: 30
+    r_state_flush_min_updates: 200
   tuning:
     trade_dir_bps: 0.5
     trade_r_mult: 5.0

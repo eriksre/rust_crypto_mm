@@ -389,48 +389,45 @@ fn validate_pricing_model_config(cfg: &PricingModelConfig) -> Result<()> {
         |v| v.is_finite(),
         "finite",
     )?;
-    validate_f64_map(
-        "pricing_model.kalman.r_by_stream",
-        &kalman.r_by_stream,
-        |v| v.is_finite() && v > 0.0,
-        "finite and > 0",
+    ensure_finite_gt("pricing_model.kalman.stats_alpha", kalman.stats_alpha, 0.0)?;
+    if kalman.stats_alpha > 1.0 {
+        bail!("pricing_model.kalman.stats_alpha must be <= 1.0");
+    }
+    if kalman.stats_warmup_obs == 0 {
+        bail!("pricing_model.kalman.stats_warmup_obs must be > 0");
+    }
+    ensure_finite_gt(
+        "pricing_model.kalman.r_learn_alpha",
+        kalman.r_learn_alpha,
+        0.0,
     )?;
-    validate_f64_map(
-        "pricing_model.kalman.latency_median_us",
-        &kalman.latency_median_us,
-        |v| v.is_finite() && v >= 0.0,
-        "finite and >= 0",
+    if kalman.r_learn_alpha > 1.0 {
+        bail!("pricing_model.kalman.r_learn_alpha must be <= 1.0");
+    }
+    if kalman.r_learn_warmup_obs == 0 {
+        bail!("pricing_model.kalman.r_learn_warmup_obs must be > 0");
+    }
+    ensure_finite_gt("pricing_model.kalman.r_floor", kalman.r_floor, 0.0)?;
+    ensure_finite_gt("pricing_model.kalman.r_ceiling", kalman.r_ceiling, 0.0)?;
+    if kalman.r_ceiling < kalman.r_floor {
+        bail!("pricing_model.kalman.r_ceiling must be >= pricing_model.kalman.r_floor");
+    }
+    ensure_finite_ge(
+        "pricing_model.kalman.r_clip_mult",
+        kalman.r_clip_mult,
+        1.0,
     )?;
-    validate_f64_map(
-        "pricing_model.kalman.latency_mad_us",
-        &kalman.latency_mad_us,
-        |v| v.is_finite() && v > 0.0,
-        "finite and > 0",
-    )?;
-    validate_f64_map(
-        "pricing_model.kalman.spread_median_bps",
-        &kalman.spread_median_bps,
-        |v| v.is_finite() && v >= 0.0,
-        "finite and >= 0",
-    )?;
-    validate_f64_map(
-        "pricing_model.kalman.spread_mad_bps",
-        &kalman.spread_mad_bps,
-        |v| v.is_finite() && v > 0.0,
-        "finite and > 0",
-    )?;
-    validate_f64_map(
-        "pricing_model.kalman.top_ratio_median",
-        &kalman.top_ratio_median,
-        |v| v.is_finite() && v >= 0.0,
-        "finite and >= 0",
-    )?;
-    validate_f64_map(
-        "pricing_model.kalman.top_ratio_mad",
-        &kalman.top_ratio_mad,
-        |v| v.is_finite() && v > 0.0,
-        "finite and > 0",
-    )?;
+    if let Some(path) = kalman.r_state_path.as_ref() {
+        if path.trim().is_empty() {
+            bail!("pricing_model.kalman.r_state_path must be non-empty when set");
+        }
+    }
+    if kalman.r_state_flush_interval_s == 0 {
+        bail!("pricing_model.kalman.r_state_flush_interval_s must be > 0");
+    }
+    if kalman.r_state_flush_min_updates == 0 {
+        bail!("pricing_model.kalman.r_state_flush_min_updates must be > 0");
+    }
 
     ensure_finite("pricing_model.tuning.trade_dir_bps", tuning.trade_dir_bps)?;
     ensure_finite_ge(
@@ -653,6 +650,13 @@ fn ensure_finite_ge(name: &str, value: f64, min: f64) -> Result<()> {
     Ok(())
 }
 
+fn ensure_finite_gt(name: &str, value: f64, min: f64) -> Result<()> {
+    if !value.is_finite() || value <= min {
+        bail!("{name} must be finite and > {min}");
+    }
+    Ok(())
+}
+
 fn validate_f64_map<F>(
     map_name: &str,
     map: &std::collections::HashMap<String, f64>,
@@ -809,5 +813,31 @@ pricing_model:
 "#;
         let cfg = serde_yaml::from_str::<RunnerConfig>(yaml).expect("valid config");
         validate_runner_config(&cfg).expect("validation should pass");
+    }
+
+    #[test]
+    fn pricing_model_validation_rejects_invalid_stats_alpha() {
+        let yaml = r#"
+strategy:
+  venue: gate
+  symbol: BTC_USDT
+  size: 1
+risk:
+  max_order_notional: 10
+  max_position_notional: 20
+mode:
+  dry_run: true
+pricing_model:
+  enabled: true
+  kalman:
+    ref_stream: gate:orderbook
+    stats_alpha: 0.0
+"#;
+        let cfg = serde_yaml::from_str::<RunnerConfig>(yaml).expect("yaml parse");
+        let err = validate_runner_config(&cfg).expect_err("validation should fail");
+        assert!(
+            err.to_string().contains("pricing_model.kalman.stats_alpha"),
+            "unexpected error: {err}"
+        );
     }
 }

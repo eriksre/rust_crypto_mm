@@ -70,57 +70,62 @@ impl<const N: usize> OkxEngine<N> {
                 Self::is_bbo_frame,
             );
             let ts = f.ts;
+            let channel = f.channel().to_string();
             {
-                for (feed, _) in okx::events_for(&mut f, &mut self.book) {
-                    match feed {
-                        "orderbook" => {
-                            if let Some(mid) = self.book.mid_price_f64() {
-                                let ob_ts = self.book.last_ts();
-                                match feed_gate.evaluate(
-                                    ExchangeFeed::Okx,
-                                    FeedKind::OrderBook,
-                                    ob_ts,
-                                ) {
-                                    GateDecision::Accept => {
-                                        let (bid_vec, ask_vec) =
-                                            self.book.top_levels_f64(SNAPSHOT_DEPTH);
-                                        let bid_levels = levels_to_array(&bid_vec);
-                                        let ask_levels = levels_to_array(&ask_vec);
-                                        {
-                                            let mut st = lock_state();
-                                            let snap = &mut st.okx.orderbook;
-                                            snap.price = Some(mid);
-                                            snap.seq = snap.seq.wrapping_add(1);
-                                            snap.ts_ns = Some(ts);
-                                            snap.source_engine_ts_ns = Some(ob_ts);
-                                            snap.source_system_ts_ns =
-                                                self.book.last_system_ts_ns();
-                                            snap.bid_levels = bid_levels;
-                                            snap.ask_levels = ask_levels;
-                                            snap.direction = None;
-                                            snap.received_at = Some(f.recv_instant);
+                if channel == OkxWs::BOOKS || channel == OkxWs::BBO_TBT {
+                    for (feed, _) in okx::events_for(&mut f, &mut self.book) {
+                        match feed {
+                            "orderbook" => {
+                                if let Some(mid) = self.book.mid_price_f64() {
+                                    let ob_ts = self.book.last_ts();
+                                    match feed_gate.evaluate(
+                                        ExchangeFeed::Okx,
+                                        FeedKind::OrderBook,
+                                        ob_ts,
+                                    ) {
+                                        GateDecision::Accept => {
+                                            let (bid_vec, ask_vec) =
+                                                self.book.top_levels_f64(SNAPSHOT_DEPTH);
+                                            let bid_levels = levels_to_array(&bid_vec);
+                                            let ask_levels = levels_to_array(&ask_vec);
+                                            {
+                                                let mut st = lock_state();
+                                                let snap = &mut st.okx.orderbook;
+                                                snap.price = Some(mid);
+                                                snap.seq = snap.seq.wrapping_add(1);
+                                                snap.ts_ns = Some(ts);
+                                                snap.source_engine_ts_ns = Some(ob_ts);
+                                                snap.source_system_ts_ns =
+                                                    self.book.last_system_ts_ns();
+                                                snap.bid_levels = bid_levels;
+                                                snap.ask_levels = ask_levels;
+                                                snap.direction = None;
+                                                snap.received_at = Some(f.recv_instant);
+                                            }
+                                            publisher.publish();
                                         }
-                                        publisher.publish();
-                                    }
-                                    GateDecision::Reject {
-                                        last_ts,
-                                        reject_count,
-                                    } => {
-                                        log_stale_update(
-                                            ExchangeFeed::Okx,
-                                            FeedKind::OrderBook,
-                                            ob_ts,
+                                        GateDecision::Reject {
                                             last_ts,
                                             reject_count,
-                                        );
+                                        } => {
+                                            log_stale_update(
+                                                ExchangeFeed::Okx,
+                                                FeedKind::OrderBook,
+                                                ob_ts,
+                                                last_ts,
+                                                reject_count,
+                                            );
+                                        }
                                     }
                                 }
                             }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
-                if okx::update_bbo_store(&mut f, &mut self.bbo, self.qty_multiplier) {
+                if channel == OkxWs::BBO_TBT
+                    && okx::update_bbo_store(&mut f, &mut self.bbo, self.qty_multiplier)
+                {
                     if let Some(mid) = self
                         .bbo
                         .mid_price_f64_for(&self.inst_id)
@@ -177,115 +182,134 @@ impl<const N: usize> OkxEngine<N> {
                         }
                     }
                 }
-                let new_trades = okx::update_trades(&mut f, &mut self.trades, self.qty_multiplier);
-                if new_trades > 0 {
-                    for trade in self.trades.iter_last(new_trades) {
-                        let trade_ts = trade.ts;
-                        match feed_gate.evaluate(ExchangeFeed::Okx, FeedKind::Trades, trade_ts) {
-                            GateDecision::Accept => {
-                                let px = (trade.px as f64) / okx::PRICE_SCALE;
-                                let direction = if trade.is_buyer_maker {
-                                    TradeDirection::Sell
-                                } else {
-                                    TradeDirection::Buy
-                                };
-                                {
-                                    let mut st = lock_state();
-                                    let snap = &mut st.okx;
-                                    snap.trade.price = Some(px);
-                                    snap.trade.seq = snap.trade.seq.wrapping_add(1);
-                                    snap.trade.ts_ns = Some(ts);
-                                    snap.trade.source_engine_ts_ns = Some(trade_ts);
-                                    snap.trade.source_system_ts_ns = trade.system_ts_ns;
-                                    snap.trade.direction = Some(direction);
-                                    snap.trade.bid_levels = [None; SNAPSHOT_DEPTH];
-                                    snap.trade.ask_levels = [None; SNAPSHOT_DEPTH];
-                                    snap.trade.received_at = Some(f.recv_instant);
+                if channel == OkxWs::TRADES {
+                    let new_trades =
+                        okx::update_trades(&mut f, &mut self.trades, self.qty_multiplier);
+                    if new_trades > 0 {
+                        for trade in self.trades.iter_last(new_trades) {
+                            let trade_ts = trade.ts;
+                            match feed_gate.evaluate(ExchangeFeed::Okx, FeedKind::Trades, trade_ts)
+                            {
+                                GateDecision::Accept => {
+                                    let px = (trade.px as f64) / okx::PRICE_SCALE;
+                                    let direction = if trade.is_buyer_maker {
+                                        TradeDirection::Sell
+                                    } else {
+                                        TradeDirection::Buy
+                                    };
+                                    {
+                                        let mut st = lock_state();
+                                        let snap = &mut st.okx;
+                                        snap.trade.price = Some(px);
+                                        snap.trade.seq = snap.trade.seq.wrapping_add(1);
+                                        snap.trade.ts_ns = Some(ts);
+                                        snap.trade.source_engine_ts_ns = Some(trade_ts);
+                                        snap.trade.source_system_ts_ns = trade.system_ts_ns;
+                                        snap.trade.direction = Some(direction);
+                                        snap.trade.bid_levels = [None; SNAPSHOT_DEPTH];
+                                        snap.trade.ask_levels = [None; SNAPSHOT_DEPTH];
+                                        snap.trade.received_at = Some(f.recv_instant);
 
-                                    let qty = (trade.qty as f64).abs() / okx::QTY_SCALE;
-                                    snap.trade.size = Some(qty);
-                                    snap.trade_events.push_back(TradeEvent {
-                                        ts_ns: trade_ts,
-                                        price: px,
-                                        direction: Some(direction),
-                                        quantity: Some(qty),
-                                    });
-                                    if snap.trade_events.len() > 256 {
-                                        snap.trade_events.pop_front();
+                                        let qty = (trade.qty as f64).abs() / okx::QTY_SCALE;
+                                        snap.trade.size = Some(qty);
+                                        snap.trade_events.push_back(TradeEvent {
+                                            ts_ns: trade_ts,
+                                            price: px,
+                                            direction: Some(direction),
+                                            quantity: Some(qty),
+                                        });
+                                        if snap.trade_events.len() > 256 {
+                                            snap.trade_events.pop_front();
+                                        }
                                     }
+                                    publisher.publish();
                                 }
-                                publisher.publish();
-                            }
-                            GateDecision::Reject {
-                                last_ts,
-                                reject_count,
-                            } => {
-                                log_stale_update(
-                                    ExchangeFeed::Okx,
-                                    FeedKind::Trades,
-                                    trade_ts,
+                                GateDecision::Reject {
                                     last_ts,
                                     reject_count,
-                                );
+                                } => {
+                                    log_stale_update(
+                                        ExchangeFeed::Okx,
+                                        FeedKind::Trades,
+                                        trade_ts,
+                                        last_ts,
+                                        reject_count,
+                                    );
+                                }
                             }
                         }
                     }
                 }
-                if let Some((_, ticker)) =
-                    okx::update_tickers(&mut f, &mut self.tickers, self.qty_multiplier)
-                {
-                    let mut st = lock_state();
-                    let entry = &mut st.okx.ticker;
-                    let price_scale = okx::PRICE_SCALE;
-                    let qty_scale = okx::QTY_SCALE;
+                if channel == OkxWs::TICKERS {
+                    if let Some((_, ticker)) =
+                        okx::update_tickers(&mut f, &mut self.tickers, self.qty_multiplier)
+                    {
+                        let mut st = lock_state();
+                        let entry = &mut st.okx.ticker;
+                        let price_scale = okx::PRICE_SCALE;
+                        let qty_scale = okx::QTY_SCALE;
 
-                    if ticker.ticker.last_px != 0 {
-                        entry.last_price = Some((ticker.ticker.last_px as f64) / price_scale);
-                    }
-                    if ticker.ticker.last_qty != 0 {
-                        entry.last_qty = Some((ticker.ticker.last_qty as f64) / qty_scale);
-                    }
-                    if ticker.ticker.best_bid != 0 {
-                        entry.best_bid = Some((ticker.ticker.best_bid as f64) / price_scale);
-                    }
-                    if ticker.ticker.best_ask != 0 {
-                        entry.best_ask = Some((ticker.ticker.best_ask as f64) / price_scale);
-                    }
+                        if ticker.ticker.last_px != 0 {
+                            entry.last_price = Some((ticker.ticker.last_px as f64) / price_scale);
+                        }
+                        if ticker.ticker.last_qty != 0 {
+                            entry.last_qty = Some((ticker.ticker.last_qty as f64) / qty_scale);
+                        }
+                        if ticker.ticker.best_bid != 0 {
+                            entry.best_bid = Some((ticker.ticker.best_bid as f64) / price_scale);
+                        }
+                        if ticker.ticker.best_ask != 0 {
+                            entry.best_ask = Some((ticker.ticker.best_ask as f64) / price_scale);
+                        }
 
-                    if let Some(mark) = ticker.mark_px {
-                        entry.mark_price = Some(mark);
-                    }
-                    if let Some(index) = ticker.index_px {
-                        entry.index_price = Some(index);
-                    }
-                    if let Some(rate) = ticker.funding_rate {
-                        entry.funding_rate = Some(rate);
-                    }
-                    if let Some(turnover) = ticker.turnover_24h {
-                        entry.turnover_24h = Some(turnover);
-                    }
-                    if let Some(oi) = ticker.open_interest {
-                        entry.open_interest = Some(oi);
-                    }
-                    if let Some(oi_val) = ticker.open_interest_value {
-                        entry.open_interest_value = Some(oi_val);
-                    } else if let (Some(oi), Some(mark)) = (entry.open_interest, entry.mark_price) {
-                        entry.open_interest_value = Some(oi * mark);
-                    }
+                        if let Some(mark) = ticker.mark_px {
+                            entry.mark_price = Some(mark);
+                        }
+                        if let Some(index) = ticker.index_px {
+                            entry.index_price = Some(index);
+                        }
+                        if let Some(rate) = ticker.funding_rate {
+                            entry.funding_rate = Some(rate);
+                        }
+                        if let Some(turnover) = ticker.turnover_24h {
+                            entry.turnover_24h = Some(turnover);
+                        }
+                        if let Some(oi) = ticker.open_interest {
+                            entry.open_interest = Some(oi);
+                        }
+                        if let Some(oi_val) = ticker.open_interest_value {
+                            entry.open_interest_value = Some(oi_val);
+                        } else if let (Some(oi), Some(mark)) =
+                            (entry.open_interest, entry.mark_price)
+                        {
+                            entry.open_interest_value = Some(oi * mark);
+                        }
 
-                    let seq = if ticker.ticker.seq != 0 {
-                        ticker.ticker.seq
-                    } else {
-                        entry.seq.wrapping_add(1)
-                    };
-                    entry.seq = seq;
+                        let seq = if ticker.ticker.seq != 0 {
+                            ticker.ticker.seq
+                        } else {
+                            entry.seq.wrapping_add(1)
+                        };
+                        entry.seq = seq;
 
-                    let ticker_ts = if ticker.ticker.ts != 0 {
-                        ticker.ticker.ts
-                    } else {
-                        ts
-                    };
-                    entry.ts_ns = Some(ticker_ts);
+                        let ticker_ts = if ticker.ticker.ts != 0 {
+                            ticker.ticker.ts
+                        } else {
+                            ts
+                        };
+                        if let Some(last_ts) = entry.ts_ns {
+                            if ticker_ts < last_ts {
+                                eprintln!(
+                                    "WARN: dropping stale okx ticker update in engine: ts={} last_ts={}",
+                                    ticker_ts, last_ts
+                                );
+                            } else {
+                                entry.ts_ns = Some(ticker_ts);
+                            }
+                        } else {
+                            entry.ts_ns = Some(ticker_ts);
+                        }
+                    }
                 }
             }
             true

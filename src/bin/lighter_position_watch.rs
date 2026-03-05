@@ -60,7 +60,7 @@ struct LighterMarketStatsMsg {
     market_stats: LighterMarketStats,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 struct LighterMarketStats {
     #[serde(default)]
     mark_price: Option<String>,

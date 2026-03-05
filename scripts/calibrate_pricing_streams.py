@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
-"""Calibrate per-stream pricing model statistics from market activity CSV logs.
+"""Estimate per-stream pricing diagnostics from market activity CSV logs.
 
-Outputs YAML snippets for:
-- pricing_model.kalman.r_by_stream
-- pricing_model.kalman.latency_median_us
-- pricing_model.kalman.latency_mad_us
-- pricing_model.kalman.spread_median_bps
-- pricing_model.kalman.spread_mad_bps
-- pricing_model.kalman.top_ratio_median
-- pricing_model.kalman.top_ratio_mad
+This script is for diagnostics and sanity checks only. Runtime pricing now learns
+stream noise and adaptive baselines online; these outputs are not intended to be
+copied into static YAML config.
 """
 
 from __future__ import annotations
@@ -197,8 +192,8 @@ def main() -> None:
 
     print(f"# calibration_source: {args.input}")
     print(f"# min_samples: {args.min_samples}")
-    print("kalman:")
-    print(format_map("    r_by_stream", r_by_stream, "{:.12g}"))
+    print("diagnostics:")
+    print(format_map("    r_by_stream_estimate", r_by_stream, "{:.12g}"))
     print(format_map("    latency_median_us", latency_median_us, "{:.12g}"))
     print(format_map("    latency_mad_us", latency_mad_us, "{:.12g}"))
     print(format_map("    spread_median_bps", spread_median_bps, "{:.12g}"))
