@@ -744,7 +744,7 @@ impl LighterPricingModel {
         let spread_bps = self.spread_bps(mid, bid_px, ask_px);
         let (_bid_depth, _ask_depth, top_ratio, imbalance) = self.depth_metrics(obs);
 
-        self.update_online_stats(&stream, latency_us, spread_bps, top_ratio);
+        self.update_online_stats(&stream, latency_us, spread_bps, top_ratio, is_book);
 
         let dt = (t_sec - self.last_t).max(0.0);
         // Use configured drift/reversion directly; validation happens at config load.
@@ -1479,6 +1479,7 @@ impl LighterPricingModel {
         latency_us: Option<f64>,
         spread_bps: f64,
         top_ratio: f64,
+        is_book: bool,
     ) {
         let alpha = self.cfg.kalman.stats_alpha;
         if let Some(lat) = latency_us {
@@ -1492,23 +1493,25 @@ impl LighterPricingModel {
                 self.warn_invalid_metric_sample(stream, "latency_us", lat);
             }
         }
-        if spread_bps.is_finite() && spread_bps >= 0.0 {
-            self.online_stats
-                .entry(stream.to_string())
-                .or_default()
-                .spread
-                .update(spread_bps, alpha);
-        } else {
-            self.warn_invalid_metric_sample(stream, "spread_bps", spread_bps);
-        }
-        if top_ratio.is_finite() && top_ratio >= 0.0 {
-            self.online_stats
-                .entry(stream.to_string())
-                .or_default()
-                .top_ratio
-                .update(top_ratio, alpha);
-        } else {
-            self.warn_invalid_metric_sample(stream, "top_ratio", top_ratio);
+        if is_book {
+            if spread_bps.is_finite() && spread_bps >= 0.0 {
+                self.online_stats
+                    .entry(stream.to_string())
+                    .or_default()
+                    .spread
+                    .update(spread_bps, alpha);
+            } else {
+                self.warn_invalid_metric_sample(stream, "spread_bps", spread_bps);
+            }
+            if top_ratio.is_finite() && top_ratio >= 0.0 {
+                self.online_stats
+                    .entry(stream.to_string())
+                    .or_default()
+                    .top_ratio
+                    .update(top_ratio, alpha);
+            } else {
+                self.warn_invalid_metric_sample(stream, "top_ratio", top_ratio);
+            }
         }
     }
 
@@ -1831,7 +1834,14 @@ mod tests {
     #[test]
     fn invalid_online_stats_are_counted() {
         let mut model = LighterPricingModel::new(base_cfg());
-        model.update_online_stats("gate:bbo", Some(f64::NAN), -1.0, f64::INFINITY);
+        model.update_online_stats("gate:bbo", Some(f64::NAN), -1.0, f64::INFINITY, true);
         assert_eq!(model.dropped_metric_samples, 3);
+    }
+
+    #[test]
+    fn trade_online_stats_do_not_warn_on_book_only_metrics() {
+        let mut model = LighterPricingModel::new(base_cfg());
+        model.update_online_stats("binance:trade", None, f64::NAN, f64::NAN, false);
+        assert_eq!(model.dropped_metric_samples, 0);
     }
 }
