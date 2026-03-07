@@ -1,7 +1,7 @@
 strategy_kind: momentum_fade
 strategy:
   venue: lighter
-  symbol: SOL_USDT
+  symbol: XRP_USDT
   size: min
 momentum_fade:
   entry_price_source: model

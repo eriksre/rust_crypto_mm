@@ -704,6 +704,8 @@ struct OrderState {
 
 const LIGHTER_TX_TYPE_CREATE_ORDER: u8 = 14;
 const LIGHTER_TX_TYPE_CANCEL_ORDER: u8 = 15;
+const RECONCILE_WAIT_DEFAULT: Duration = Duration::from_secs(8);
+const RECONCILE_WAIT_WITH_CANCEL: Duration = Duration::from_secs(20);
 
 fn batch_observed_with_orders(
     orders: &HashMap<ClientOrderId, OrderState>,
@@ -736,6 +738,17 @@ fn batch_observed_with_orders(
             _ => false,
         }
     })
+}
+
+fn reconcile_wait_for_batch(tx_meta: &[(u8, ClientOrderId)]) -> Duration {
+    if tx_meta
+        .iter()
+        .any(|(tx_type, _)| *tx_type == LIGHTER_TX_TYPE_CANCEL_ORDER)
+    {
+        RECONCILE_WAIT_WITH_CANCEL
+    } else {
+        RECONCILE_WAIT_DEFAULT
+    }
 }
 
 enum LighterWsCommand {
@@ -1636,10 +1649,11 @@ impl LighterWsWorker {
 mod tests {
     use super::{
         ClientOrderId, LIGHTER_TX_TYPE_CANCEL_ORDER, LIGHTER_TX_TYPE_CREATE_ORDER, LighterWsWorker,
-        OrderState, OrderStatus, Side, batch_observed_with_orders,
+        OrderState, OrderStatus, Side, batch_observed_with_orders, reconcile_wait_for_batch,
     };
     use serde_json::json;
     use std::collections::HashMap;
+    use std::time::Duration;
 
     #[test]
     fn parse_sendtx_response_handles_data_attributes_shape() {
@@ -1738,6 +1752,22 @@ mod tests {
         );
         let tx_meta = vec![(LIGHTER_TX_TYPE_CREATE_ORDER, create_id)];
         assert!(!batch_observed_with_orders(&orders, &tx_meta));
+    }
+
+    #[test]
+    fn reconcile_wait_for_batch_extends_when_cancel_present() {
+        let tx_meta_with_cancel =
+            vec![(LIGHTER_TX_TYPE_CANCEL_ORDER, ClientOrderId::new("mf-lighter-c-1"))];
+        let tx_meta_create_only =
+            vec![(LIGHTER_TX_TYPE_CREATE_ORDER, ClientOrderId::new("mf-lighter-n-1"))];
+        assert_eq!(
+            reconcile_wait_for_batch(&tx_meta_with_cancel),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            reconcile_wait_for_batch(&tx_meta_create_only),
+            Duration::from_secs(8)
+        );
     }
 
     #[test]
@@ -2253,11 +2283,13 @@ impl LighterGateway {
         let payload = match tokio::time::timeout(Duration::from_secs(5), resp_rx).await {
             Ok(resp) => resp.context("lighter ws sendTxBatch response dropped")??,
             Err(_) => {
+                let reconcile_wait = reconcile_wait_for_batch(&tx_meta);
                 eprintln!(
-                    "WARN: lighter ws sendTxBatch ack timeout after 5s; reconciling {} tx(s) via order-state sync",
-                    tx_meta.len()
+                    "WARN: lighter ws sendTxBatch ack timeout after 5s; reconciling {} tx(s) via order-state sync for up to {}s",
+                    tx_meta.len(),
+                    reconcile_wait.as_secs()
                 );
-                self.reconcile_after_send_timeout(&tx_meta, Duration::from_secs(8))
+                self.reconcile_after_send_timeout(&tx_meta, reconcile_wait)
                     .await
                     .context("lighter ws sendTxBatch timeout")?;
                 eprintln!(
@@ -2329,7 +2361,7 @@ impl LighterGateway {
                 .collect::<Vec<_>>()
         };
         bail!(
-            "sendTxBatch timeout: reconciliation did not confirm batch within {}ms; snapshot={:?}",
+            "sendTxBatch timeout: reconciliation did not confirm batch within {}ms; order may still be live; snapshot={:?}",
             max_wait.as_millis(),
             snapshot
         )
