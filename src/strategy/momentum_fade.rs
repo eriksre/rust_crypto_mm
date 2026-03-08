@@ -150,7 +150,14 @@ struct ActiveOrder {
     side: Side,
     price: f64,
     entry_reference_price: f64,
+    entry_move_bps: f64,
     placed_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EntrySignal {
+    side: Side,
+    move_bps: f64,
 }
 
 pub struct MomentumFadeStrategy {
@@ -255,15 +262,18 @@ impl MomentumFadeStrategy {
             .unwrap_or((None, None));
 
         let mut intents = Vec::new();
+        let mut entry_move_bps = None;
         let mut blocked_by_min_interval = false;
 
-        if let Some(side) = self.entry_signal(now) {
+        if let Some(signal) = self.entry_signal(now) {
+            let side = signal.side;
             if self.has_live_order(side) {
                 // Already have a live order on this side.
             } else if !self.min_interval_elapsed(now) {
                 blocked_by_min_interval = true;
             } else if let (Some(bid), Some(ask)) = (best_bid, best_ask) {
                 if let Some(price) = self.entry_price_for_side(side, bid, ask) {
+                    entry_move_bps = Some(signal.move_bps);
                     intents.push(QuoteIntent::new(
                         self.venue,
                         self.symbol.clone(),
@@ -311,6 +321,7 @@ impl MomentumFadeStrategy {
 
         Some(QuotePlan {
             reference_price,
+            entry_move_bps,
             reference_best_bid: best_bid,
             reference_best_ask: best_ask,
             cancels,
@@ -329,6 +340,14 @@ impl MomentumFadeStrategy {
         if !plan.intents.is_empty() {
             self.last_submit_at = Some(plan.planned_at);
         }
+        let entry_move_bps = if plan.intents.is_empty() {
+            None
+        } else {
+            Some(
+                plan.entry_move_bps
+                    .expect("momentum fade commit_plan missing entry_move_bps for submitted intent"),
+            )
+        };
         for intent in &plan.intents {
             if !self
                 .active_orders
@@ -343,6 +362,9 @@ impl MomentumFadeStrategy {
                     side: intent.side,
                     price: intent.price,
                     entry_reference_price: plan.reference_price,
+                    entry_move_bps: entry_move_bps.expect(
+                        "momentum fade commit_plan lost entry_move_bps before active order insert",
+                    ),
                     placed_at: plan.planned_at,
                 },
             );
@@ -429,6 +451,7 @@ impl MomentumFadeStrategy {
                 .active_quotes
                 .get(order_id)
                 .map(|order| order.entry_reference_price),
+            entry_move_bps: self.active_quotes.get(order_id).map(|order| order.entry_move_bps),
             order_age_ms,
         }
     }
@@ -577,7 +600,7 @@ impl MomentumFadeStrategy {
         cancels
     }
 
-    fn entry_signal(&mut self, now: Instant) -> Option<Side> {
+    fn entry_signal(&mut self, now: Instant) -> Option<EntrySignal> {
         let price_now = match self.config.entry_price_source {
             EntryPriceSource::Model => self.latest_fair_mid,
             EntryPriceSource::Lighter => self.latest_lighter_mid,
@@ -595,9 +618,15 @@ impl MomentumFadeStrategy {
 
         let move_bps = (price_now - price_old) / price_old * 10_000.0;
         if move_bps >= self.entry_threshold_bps_for_side(Side::Bid) {
-            Some(Side::Bid)
+            Some(EntrySignal {
+                side: Side::Bid,
+                move_bps,
+            })
         } else if move_bps <= -self.entry_threshold_bps_for_side(Side::Ask) {
-            Some(Side::Ask)
+            Some(EntrySignal {
+                side: Side::Ask,
+                move_bps,
+            })
         } else {
             None
         }
@@ -820,10 +849,12 @@ mod tests {
             .push(now - Duration::from_millis(140), 100.0);
 
         strategy.latest_fair_mid = Some(100.05); // +5 bps
-        assert_eq!(strategy.entry_signal(now), None);
+        assert!(strategy.entry_signal(now).is_none());
 
         strategy.latest_fair_mid = Some(99.97); // -3 bps
-        assert_eq!(strategy.entry_signal(now), Some(Side::Ask));
+        let signal = strategy.entry_signal(now).expect("expected ask signal");
+        assert_eq!(signal.side, Side::Ask);
+        assert!((signal.move_bps + 3.0).abs() < 1e-9);
     }
 
     #[test]
@@ -844,6 +875,7 @@ mod tests {
                 side: Side::Bid,
                 price: 100.0,
                 entry_reference_price: 100.0,
+                entry_move_bps: 5.0,
                 placed_at: now - Duration::from_millis(150),
             },
         );
@@ -853,6 +885,7 @@ mod tests {
                 side: Side::Ask,
                 price: 100.0,
                 entry_reference_price: 100.0,
+                entry_move_bps: -5.0,
                 placed_at: now - Duration::from_millis(150),
             },
         );
@@ -884,12 +917,14 @@ mod tests {
                 side: Side::Bid,
                 price: 100.0,
                 entry_reference_price: 100.0,
+                entry_move_bps: 5.0,
                 placed_at: now - Duration::from_secs(1),
             },
         );
 
         let plan = QuotePlan {
             reference_price: 100.0,
+            entry_move_bps: Some(-5.0),
             reference_best_bid: Some(99.9),
             reference_best_ask: Some(100.1),
             cancels: vec![existing_id.clone()],
@@ -920,7 +955,7 @@ mod tests {
     }
 
     #[test]
-    fn fill_context_carries_entry_reference_price() {
+    fn fill_context_carries_entry_metadata() {
         let mut strategy = MomentumFadeStrategy::new(
             base_config(EntryPriceSource::Model),
             Venue::Lighter,
@@ -929,33 +964,27 @@ mod tests {
             1.0,
         );
         let now = Instant::now();
-        let order_id = ClientOrderId::new("mf-lighter-b-3");
         let reference_price = 100.25;
+        let move_bps = 12.5;
 
-        let plan = QuotePlan {
-            reference_price,
-            reference_best_bid: Some(100.0),
-            reference_best_ask: Some(100.1),
-            cancels: Vec::new(),
-            intents: vec![QuoteIntent::new(
-                Venue::Lighter,
-                "XMR_USDT",
-                Side::Bid,
-                100.0,
-                1.0,
-                TimeInForce::PostOnly,
-                order_id.clone(),
-            )],
-            planned_at: now,
-            reference_meta: None,
-            prior_submit_at: None,
-        };
-
+        strategy
+            .history
+            .push(now - Duration::from_millis(140), 100.0);
         strategy.latest_fair_mid = Some(reference_price);
+        let plan = strategy
+            .plan_quotes(now)
+            .expect("expected momentum fade quote plan");
+        assert_eq!(plan.reference_price, reference_price);
+        assert_eq!(plan.entry_move_bps, Some(move_bps));
+        let signal = strategy.entry_signal(now).expect("expected signal");
+        assert!((signal.move_bps - move_bps).abs() < 1e-9);
+        assert_eq!(plan.intents.len(), 1);
+        let order_id = plan.intents[0].client_order_id.clone();
         strategy.commit_plan(&plan);
 
         let context = strategy.fill_context(&order_id, now + Duration::from_millis(25));
         assert_eq!(context.entry_reference_price, Some(reference_price));
+        assert_eq!(context.entry_move_bps, Some(move_bps));
         assert_eq!(context.order_age_ms, Some(25));
     }
 
@@ -973,6 +1002,7 @@ mod tests {
 
         let plan = QuotePlan {
             reference_price: 100.0,
+            entry_move_bps: Some(5.0),
             reference_best_bid: Some(99.9),
             reference_best_ask: Some(100.1),
             cancels: Vec::new(),
@@ -1021,6 +1051,7 @@ mod tests {
                 side: Side::Ask,
                 price: 100.0,
                 entry_reference_price: 100.0,
+                entry_move_bps: -5.0,
                 placed_at: now,
             },
         );

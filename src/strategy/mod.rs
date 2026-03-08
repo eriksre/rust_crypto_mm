@@ -43,6 +43,7 @@ pub struct FillContext {
     pub fair_mid: Option<f64>,
     pub lighter_mid: Option<f64>,
     pub entry_reference_price: Option<f64>,
+    pub entry_move_bps: Option<f64>,
     pub order_age_ms: Option<u64>,
 }
 

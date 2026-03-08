@@ -168,6 +168,7 @@ struct ActiveQuote {
 #[derive(Debug, Clone)]
 pub struct QuotePlan {
     pub reference_price: f64,
+    pub entry_move_bps: Option<f64>,
     pub reference_best_bid: Option<f64>,
     pub reference_best_ask: Option<f64>,
     pub cancels: Vec<ClientOrderId>,
@@ -250,6 +251,7 @@ impl SimpleQuoteStrategy {
             fair_mid: self.latest_price,
             lighter_mid: Self::lighter_mid_from_state(),
             entry_reference_price: None,
+            entry_move_bps: None,
             order_age_ms,
         }
     }
@@ -494,6 +496,7 @@ impl SimpleQuoteStrategy {
 
         Some(QuotePlan {
             reference_price: price,
+            entry_move_bps: None,
             reference_best_bid: best_bid,
             reference_best_ask: best_ask,
             cancels,
@@ -764,6 +767,7 @@ mod tests {
 
         let plan = QuotePlan {
             reference_price: 100.0,
+            entry_move_bps: None,
             reference_best_bid: Some(99.9),
             reference_best_ask: Some(100.1),
             cancels: vec![existing_id.clone()],
@@ -800,6 +804,7 @@ mod tests {
 
         let plan = QuotePlan {
             reference_price: 100.0,
+            entry_move_bps: None,
             reference_best_bid: Some(99.9),
             reference_best_ask: Some(100.1),
             cancels: Vec::new(),

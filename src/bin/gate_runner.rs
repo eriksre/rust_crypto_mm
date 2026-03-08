@@ -159,6 +159,7 @@ struct MarkoutLogRow {
     raw_markout_bps: Option<f64>,
     pnl_markout_bps: Option<f64>,
     predicted_pnl_bps: Option<f64>,
+    entry_move_bps: Option<f64>,
     fill_qty: f64,
     fill_order_age_ms: Option<u64>,
     report_ts_ns: Option<u64>,
@@ -210,6 +211,10 @@ impl MarkoutLogHandle {
                     .predicted_pnl_bps
                     .map(|v| format!("{v:.6}"))
                     .unwrap_or_default();
+                let entry_move_bps = row
+                    .entry_move_bps
+                    .map(|v| format!("{v:.6}"))
+                    .unwrap_or_default();
                 let report_ts_ns = row.report_ts_ns.map(|v| v.to_string()).unwrap_or_default();
                 let fill_order_age_ms = row
                     .fill_order_age_ms
@@ -218,7 +223,7 @@ impl MarkoutLogHandle {
                 let side = row.side.map(markout_side_label).unwrap_or("unknown");
                 if let Err(err) = writeln!(
                     file,
-                    "{},{},{},{},{},{},{},{:.8},{},{},{},{:.8},{},{},{}",
+                    "{},{},{},{},{},{},{},{:.8},{},{},{},{},{:.8},{},{},{}",
                     row.captured_at_ns,
                     row.observed_at_ns,
                     row.venue.as_str(),
@@ -231,6 +236,7 @@ impl MarkoutLogHandle {
                     raw_markout_bps,
                     pnl_markout_bps,
                     predicted_pnl_bps,
+                    entry_move_bps,
                     row.fill_qty,
                     fill_order_age_ms,
                     report_ts_ns
@@ -283,7 +289,7 @@ fn markout_log_path(config: &RunnerConfig) -> PathBuf {
     parent.join(format!("{markout_stem}.{ext}"))
 }
 
-const MARKOUT_LOG_HEADER: &str = "captured_at_ns,observed_at_ns,venue,symbol,client_order_id,side,horizon_ms,fill_price,observed_mid,raw_markout_bps,pnl_markout_bps,predicted_pnl_bps,fill_qty,fill_order_age_ms,report_ts_ns";
+const MARKOUT_LOG_HEADER: &str = "captured_at_ns,observed_at_ns,venue,symbol,client_order_id,side,horizon_ms,fill_price,observed_mid,raw_markout_bps,pnl_markout_bps,predicted_pnl_bps,entry_move_bps,fill_qty,fill_order_age_ms,report_ts_ns";
 
 fn side_from_client_order_id(id: &ClientOrderId) -> Option<Side> {
     let lower = id.0.to_ascii_lowercase();
@@ -1858,6 +1864,7 @@ async fn process_reports(
         };
         let fill_order_age_ms = fill_context.order_age_ms;
         let entry_reference_price = fill_context.entry_reference_price;
+        let entry_move_bps = fill_context.entry_move_bps;
         fill_contexts.push(fill_context);
         let outcome = {
             let mut guard = inventory.lock();
@@ -1935,6 +1942,9 @@ async fn process_reports(
                         let pnl_markout_bps = sign_corrected_markout_bps(side, raw_markout_bps);
                         let predicted_pnl_bps =
                             predicted_pnl_bps(side, entry_reference_price, fill_price);
+                        let entry_move_bps_str = entry_move_bps
+                            .map(|v| format!("{v:.2}"))
+                            .unwrap_or_else(|| "NA".to_string());
 
                         if let Some(logger) = markout_logger.as_ref() {
                             logger.log(MarkoutLogRow {
@@ -1950,6 +1960,7 @@ async fn process_reports(
                                 raw_markout_bps,
                                 pnl_markout_bps,
                                 predicted_pnl_bps,
+                                entry_move_bps,
                                 fill_qty,
                                 fill_order_age_ms,
                                 report_ts_ns,
@@ -1964,7 +1975,7 @@ async fn process_reports(
                             (observed_mid, raw_markout_bps, pnl_markout_bps)
                         {
                             println!(
-                                "[markout] id={} side={} h={}ms fill={:.6} mid={:.6} raw_bps={:.2} pnl_bps={:.2} pred_bps={} age_ms={}",
+                                "[markout] id={} side={} h={}ms fill={:.6} mid={:.6} raw_bps={:.2} pnl_bps={:.2} pred_bps={} move_bps={} age_ms={}",
                                 id.0,
                                 side.map(markout_side_label).unwrap_or("unknown"),
                                 horizon_ms,
@@ -1973,13 +1984,14 @@ async fn process_reports(
                                 raw_bps,
                                 pnl_bps,
                                 predicted_bps,
+                                entry_move_bps_str,
                                 fill_order_age_ms
                                     .map(|v| v.to_string())
                                     .unwrap_or_else(|| "NA".to_string())
                             );
                         } else if let (Some(mid), Some(raw_bps)) = (observed_mid, raw_markout_bps) {
                             println!(
-                                "[markout] id={} side={} h={}ms fill={:.6} mid={:.6} raw_bps={:.2} pnl_bps=NA pred_bps={} age_ms={}",
+                                "[markout] id={} side={} h={}ms fill={:.6} mid={:.6} raw_bps={:.2} pnl_bps=NA pred_bps={} move_bps={} age_ms={}",
                                 id.0,
                                 side.map(markout_side_label).unwrap_or("unknown"),
                                 horizon_ms,
@@ -1987,18 +1999,20 @@ async fn process_reports(
                                 mid,
                                 raw_bps,
                                 predicted_bps,
+                                entry_move_bps_str,
                                 fill_order_age_ms
                                     .map(|v| v.to_string())
                                     .unwrap_or_else(|| "NA".to_string())
                             );
                         } else {
                             println!(
-                                "[markout] id={} side={} h={}ms fill={:.6} mid=NA raw_bps=NA pnl_bps=NA pred_bps={} age_ms={}",
+                                "[markout] id={} side={} h={}ms fill={:.6} mid=NA raw_bps=NA pnl_bps=NA pred_bps={} move_bps={} age_ms={}",
                                 id.0,
                                 side.map(markout_side_label).unwrap_or("unknown"),
                                 horizon_ms,
                                 fill_price,
                                 predicted_bps,
+                                entry_move_bps_str,
                                 fill_order_age_ms
                                     .map(|v| v.to_string())
                                     .unwrap_or_else(|| "NA".to_string())
