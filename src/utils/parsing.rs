@@ -1,13 +1,37 @@
 #[cfg(any(feature = "parsing", feature = "parse_binance", feature = "gate_exec"))]
 use serde_json::Value;
 #[cfg(any(feature = "parsing", feature = "parse_binance", feature = "gate_exec"))]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::HashMap;
+#[cfg(any(feature = "parsing", feature = "parse_binance", feature = "gate_exec"))]
+use std::sync::{Mutex, OnceLock};
 
 #[cfg(any(feature = "parsing", feature = "parse_binance", feature = "gate_exec"))]
 const PARSE_LOG_EVERY: u64 = 100;
 
 #[cfg(any(feature = "parsing", feature = "parse_binance", feature = "gate_exec"))]
-static PARSE_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
+type ParseDropKey = (String, String);
+
+#[cfg(any(feature = "parsing", feature = "parse_binance", feature = "gate_exec"))]
+static PARSE_FAIL_COUNTS: OnceLock<Mutex<HashMap<ParseDropKey, u64>>> = OnceLock::new();
+
+#[cfg(any(feature = "parsing", feature = "parse_binance", feature = "gate_exec"))]
+fn parse_fail_counts() -> &'static Mutex<HashMap<ParseDropKey, u64>> {
+    PARSE_FAIL_COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(any(feature = "parsing", feature = "parse_binance", feature = "gate_exec"))]
+fn next_parse_drop_count(source: &str, event: &str) -> u64 {
+    let mut counts = parse_fail_counts().lock().unwrap_or_else(|poisoned| {
+        panic!(
+            "ERROR: parse drop counter lock poisoned while recording source={} event={}: {}",
+            source, event, poisoned
+        )
+    });
+    let key = (source.to_string(), event.to_string());
+    let count = counts.entry(key).or_insert(0);
+    *count += 1;
+    *count
+}
 
 #[cfg(any(feature = "parsing", feature = "parse_binance", feature = "gate_exec"))]
 fn truncate_payload(payload: &str, max_chars: usize) -> String {
@@ -19,7 +43,7 @@ fn truncate_payload(payload: &str, max_chars: usize) -> String {
 
 #[cfg(any(feature = "parsing", feature = "parse_binance", feature = "gate_exec"))]
 pub fn log_parse_drop(source: &str, event: &str, err: &dyn std::fmt::Display, payload: &str) {
-    let count = PARSE_FAIL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    let count = next_parse_drop_count(source, event);
     if count == 1 || count % PARSE_LOG_EVERY == 0 {
         let sample = truncate_payload(payload, 256);
         eprintln!(
@@ -156,6 +180,29 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn reset_parse_drop_counts_for_tests() {
+        let mut counts = parse_fail_counts().lock().unwrap_or_else(|poisoned| {
+            panic!(
+                "ERROR: parse drop counter lock poisoned during test reset: {}",
+                poisoned
+            )
+        });
+        counts.clear();
+    }
+
+    fn parse_drop_count_for_tests(source: &str, event: &str) -> u64 {
+        let counts = parse_fail_counts().lock().unwrap_or_else(|poisoned| {
+            panic!(
+                "ERROR: parse drop counter lock poisoned during test read: {}",
+                poisoned
+            )
+        });
+        counts
+            .get(&(source.to_string(), event.to_string()))
+            .copied()
+            .unwrap_or(0)
+    }
+
     #[test]
     fn test_value_to_f64() {
         assert_eq!(value_to_f64(&json!(42.5)), Some(42.5));
@@ -187,5 +234,23 @@ mod tests {
 
         let direct = json!({"uid": 67890});
         assert_eq!(extract_user_id(&direct), Some("67890".to_string()));
+    }
+
+    #[test]
+    fn parse_drop_counts_are_tracked_per_source_and_event() {
+        reset_parse_drop_counts_for_tests();
+
+        log_parse_drop("gate_collector", "missing_ts", &"missing ts", "{}");
+        log_parse_drop("gate_collector", "missing_ts", &"missing ts", "{}");
+        log_parse_drop("okx_collector", "missing_seq", &"missing seq", "{}");
+
+        assert_eq!(
+            parse_drop_count_for_tests("gate_collector", "missing_ts"),
+            2
+        );
+        assert_eq!(
+            parse_drop_count_for_tests("okx_collector", "missing_seq"),
+            1
+        );
     }
 }

@@ -2,7 +2,7 @@ use crate::base_classes::bbo_store::BboStore;
 use crate::base_classes::tickers::{TickerSnapshot, TickerStore};
 use crate::base_classes::trades::{FixedTrades, Trade};
 use crate::base_classes::types::{Price, Qty};
-use crate::collectors::helpers::{find_first_bool, find_json_string};
+use crate::collectors::helpers::find_json_string;
 use crate::exchanges::bybit::orderbook::{
     BybitBook, BybitData, BybitDataCont, BybitMsg, PRICE_SCALE, QTY_SCALE,
 };
@@ -346,35 +346,15 @@ pub fn update_trades<const N: usize>(s: &str, trades: &mut FixedTrades<N>) -> us
                         .and_then(|v| v.as_bool())
                         .map(|buyer_is_taker| !buyer_is_taker)
                 })
-                .or_else(|| find_first_bool(s, &["BT"]).map(|buyer_is_taker| !buyer_is_taker))
                 .or_else(|| {
                     log_parse_drop("bybit_collector", "missing_side", &"missing side", s);
                     None
                 });
 
-            let seq = entry
-                .get("seq")
-                .and_then(|v| match v {
-                    Value::Number(n) => n.as_u64().or_else(|| {
-                        log_parse_drop("bybit_collector", "seq", &"non-u64 seq", s);
-                        None
-                    }),
-                    Value::String(raw) => match raw.parse::<u64>() {
-                        Ok(v) => Some(v),
-                        Err(err) => {
-                            log_parse_drop("bybit_collector", "seq", &err, raw);
-                            None
-                        }
-                    },
-                    _ => {
-                        log_parse_drop("bybit_collector", "seq", &"unexpected seq type", s);
-                        None
-                    }
-                })
-                .or_else(|| {
-                    log_parse_drop("bybit_collector", "missing_seq", &"missing seq", s);
-                    None
-                });
+            let seq = value_to_u64(entry, &["seq", "t", "tradeId", "execId"]).or_else(|| {
+                log_parse_drop("bybit_collector", "missing_seq", &"missing seq", s);
+                None
+            });
 
             if let (Some(is_buyer_maker), Some(seq)) = (is_buyer_maker, seq) {
                 let trade = Trade::new(px_i, qty_i, ts, seq, is_buyer_maker, Some(system_ts_ns));
@@ -464,17 +444,24 @@ pub fn update_tickers(s: &str, store: &mut TickerStore) -> Option<(String, Ticke
             }
         })
     });
-    if let Some(seq) = seq {
-        snapshot.ticker.seq = seq;
-    } else {
-        snapshot.ticker.seq = 0;
-    }
+    let seq = match seq {
+        Some(seq) if seq > 0 => seq,
+        _ => {
+            log_parse_drop("bybit_collector", "missing_seq", &"missing seq", s);
+            return None;
+        }
+    };
+    snapshot.ticker.seq = seq;
 
-    if let Some(ts_ms) =
-        value_to_u64(payload, &["ts"]).or_else(|| root.get("ts").and_then(|v| v.as_u64()))
-    {
-        snapshot.ticker.ts = ms_to_ns(ts_ms);
-    }
+    let ts_ms =
+        match value_to_u64(payload, &["ts"]).or_else(|| root.get("ts").and_then(|v| v.as_u64())) {
+            Some(ts_ms) if ts_ms > 0 => ts_ms,
+            _ => {
+                log_parse_drop("bybit_collector", "missing_ts", &"missing ts", s);
+                return None;
+            }
+        };
+    snapshot.ticker.ts = ms_to_ns(ts_ms);
 
     let stored = store.update(symbol.to_string(), snapshot);
     Some((symbol.to_string(), stored))
@@ -545,6 +532,7 @@ mod tests {
         let json = r#"{
             "topic":"tickers.BTCUSDT",
             "ts":1700000000000,
+            "cs":1700000000123,
             "data":{
                 "symbol":"BTCUSDT",
                 "lastPrice":"43000",
@@ -582,8 +570,21 @@ mod tests {
         assert_eq!(snap.turnover_24h, Some(1_234_567.89));
         assert_eq!(snap.open_interest, Some(456.0));
         assert_eq!(snap.open_interest_value, Some(1234.5));
-        assert_ne!(snap.ticker.seq, 0);
+        assert_eq!(snap.ticker.seq, 1_700_000_000_123);
         assert_eq!(snap.ticker.ts, 1_700_000_000_000_000_000);
+    }
+
+    #[test]
+    fn test_update_tickers_bybit_rejects_missing_seq() {
+        let json = r#"{
+            "topic":"tickers.BTCUSDT",
+            "ts":1700000000000,
+            "data":{"symbol":"BTCUSDT","lastPrice":"43000"}
+        }"#;
+
+        let mut store = TickerStore::default();
+        assert!(update_tickers(json, &mut store).is_none());
+        assert!(store.get("BTCUSDT").is_none());
     }
 
     #[test]

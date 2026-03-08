@@ -95,6 +95,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--market-symbol", default=os.getenv("LIGHTER_MARKET", "BTC"))
     parser.add_argument("--order-size", type=float, default=float(os.getenv("LIGHTER_ORDER_SIZE", "0.001")), help="Order size in base units (e.g. BTC)")
     parser.add_argument("--side", choices=["buy", "sell"], default=os.getenv("LIGHTER_SIDE", "buy"))
+    parser.add_argument(
+        "--fixed-price",
+        type=str,
+        default=os.getenv("LIGHTER_FIXED_PRICE"),
+        help="Explicit order price in quote units. When set, bypasses top-of-book price discovery.",
+    )
     parser.add_argument("--price-offset", type=float, default=None, help="Multiplier relative to best bid/ask (None picks 0.5 for buys, 1.5 for sells)")
     parser.add_argument("--iterations", type=int, default=int(os.getenv("LIGHTER_ITERATIONS", "0")), help="0 = run forever")
     parser.add_argument("--ack-timeout", type=float, default=float(os.getenv("LIGHTER_ACK_TIMEOUT", "5.0")), help="Seconds to wait for a WS ack")
@@ -146,17 +152,18 @@ async def send_and_measure(ws, payload: Dict, timeout: float) -> Tuple[Optional[
     return latency_ms, raw
 
 
-def next_nonce_and_switch(client: lighter.SignerClient) -> Tuple[int, int]:
-    api_key_index, nonce = client.nonce_manager.next_nonce()
-    err = client.switch_api_key(api_key_index)
-    if err:
-        raise RuntimeError(f"switch_api_key failed: {err}")
-    return api_key_index, nonce
+def next_api_key_and_nonce(client: lighter.SignerClient, api_key_index: int) -> Tuple[int, int]:
+    resolved_api_key_index, nonce = client.get_api_key_nonce(
+        api_key_index=api_key_index,
+        nonce=lighter.SignerClient.DEFAULT_NONCE,
+    )
+    return resolved_api_key_index, nonce
 
 
 async def sign_and_send_order(
     ws,
     client: lighter.SignerClient,
+    api_key_index: int,
     market_id: int,
     order_idx: int,
     base_amount: int,
@@ -164,8 +171,8 @@ async def sign_and_send_order(
     is_ask: bool,
     timeout: float,
 ) -> Tuple[Optional[float], Optional[str], int]:
-    _, nonce = next_nonce_and_switch(client)
-    tx_type, tx_info, err = client.sign_create_order(
+    resolved_api_key_index, nonce = next_api_key_and_nonce(client, api_key_index)
+    tx_type, tx_info, _tx_hash, err = client.sign_create_order(
         market_index=market_id,
         client_order_index=order_idx,
         base_amount=base_amount,
@@ -176,6 +183,7 @@ async def sign_and_send_order(
         reduce_only=False,
         trigger_price=0,
         nonce=nonce,
+        api_key_index=resolved_api_key_index,
     )
     if err is not None:
         raise RuntimeError(f"sign_create_order failed: {err}")
@@ -195,15 +203,17 @@ async def sign_and_send_order(
 async def sign_and_send_cancel(
     ws,
     client: lighter.SignerClient,
+    api_key_index: int,
     market_id: int,
     order_idx: int,
     timeout: float,
 ) -> Tuple[Optional[float], Optional[str], int]:
-    _, nonce = next_nonce_and_switch(client)
-    tx_type, tx_info, err = client.sign_cancel_order(
+    resolved_api_key_index, nonce = next_api_key_and_nonce(client, api_key_index)
+    tx_type, tx_info, _tx_hash, err = client.sign_cancel_order(
         market_index=market_id,
         order_index=order_idx,
         nonce=nonce,
+        api_key_index=resolved_api_key_index,
     )
     if err is not None:
         raise RuntimeError(f"sign_cancel_order failed: {err}")
@@ -261,6 +271,14 @@ async def main() -> None:
     price_decimals = int(market_cfg["supported_price_decimals"])
     min_base = Decimal(str(market_cfg["min_base_amount"]))
     min_quote = Decimal(str(market_cfg["min_quote_amount"]))
+    fixed_price = None
+    if args.fixed_price is not None:
+        try:
+            fixed_price = Decimal(str(args.fixed_price))
+        except InvalidOperation as exc:
+            raise SystemExit(f"Invalid --fixed-price value {args.fixed_price!r}: {exc}") from exc
+        if fixed_price <= 0:
+            raise SystemExit(f"Invalid --fixed-price value {args.fixed_price!r}: must be > 0")
 
     order_size = Decimal(str(args.order_size))
     if order_size < min_base:
@@ -283,9 +301,8 @@ async def main() -> None:
 
     client = lighter.SignerClient(
         url=base_url,
-        private_key=args.api_key,
         account_index=args.account_index,
-        api_key_index=args.api_key_index,
+        api_private_keys={args.api_key_index: args.api_key},
     )
     err = client.check_client()
     if err is not None:
@@ -302,8 +319,12 @@ async def main() -> None:
                     iteration += 1
                     await asyncio.sleep(random.uniform(3, 5))
 
-                    best_bid, best_ask = fetch_top_of_book(base_url, market_id)
-                    target_price = build_price(best_bid, best_ask, args.side, price_offset, min_quote, order_size)
+                    if fixed_price is not None:
+                        best_bid, best_ask = None, None
+                        target_price = fixed_price
+                    else:
+                        best_bid, best_ask = fetch_top_of_book(base_url, market_id)
+                        target_price = build_price(best_bid, best_ask, args.side, price_offset, min_quote, order_size)
                     price_int = price_to_int(target_price, price_decimals)
 
                     client_order_index = int(time.time() * 1000)
@@ -319,6 +340,7 @@ async def main() -> None:
                     place_latency, place_resp, place_nonce = await sign_and_send_order(
                         ws=ws,
                         client=client,
+                        api_key_index=args.api_key_index,
                         market_id=market_id,
                         order_idx=client_order_index,
                         base_amount=base_amount_int,
@@ -343,6 +365,7 @@ async def main() -> None:
                     cancel_latency, cancel_resp, cancel_nonce = await sign_and_send_cancel(
                         ws=ws,
                         client=client,
+                        api_key_index=args.api_key_index,
                         market_id=market_id,
                         order_idx=client_order_index,
                         timeout=args.ack_timeout,

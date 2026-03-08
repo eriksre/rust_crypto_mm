@@ -108,13 +108,24 @@ impl ReferencePublisher {
             }
         }
 
+        let received_at = match candidate.received_at {
+            Some(received_at) => received_at,
+            None => {
+                eprintln!(
+                    "ERROR: refusing to publish reference event without received_at: source={} seq={} ts_ns={:?}",
+                    candidate.source, candidate.seq, candidate.ts_ns
+                );
+                return;
+            }
+        };
+
         let event = ReferenceEvent {
             price,
             best_bid,
             best_ask,
             ts_ns,
             source,
-            received_at: candidate.received_at.unwrap_or_else(Instant::now),
+            received_at,
         };
 
         if let Err(err) = tx.send(event) {
@@ -591,10 +602,11 @@ impl ReferencePublisher {
     /// Prioritizes: timestamp > sequence > source index.
     #[inline]
     fn is_newer(candidate: &Candidate, current: &Candidate) -> bool {
-        let cand_ts = candidate.ts_ns.unwrap_or(0);
-        let cur_ts = current.ts_ns.unwrap_or(0);
-        if cand_ts != cur_ts {
-            return cand_ts > cur_ts;
+        match (candidate.ts_ns, current.ts_ns) {
+            (Some(cand_ts), Some(cur_ts)) if cand_ts != cur_ts => return cand_ts > cur_ts,
+            (Some(_), None) => return true,
+            (None, Some(_)) => return false,
+            _ => {}
         }
         if candidate.seq != current.seq {
             return candidate.seq > current.seq;
@@ -630,4 +642,49 @@ struct Candidate {
     exchange: &'static str,
     feed: &'static str,
     received_at: Option<Instant>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Candidate, ReferencePublisher};
+    use std::time::Instant;
+
+    fn candidate(seq: u64, ts_ns: Option<u64>, source_idx: u8) -> Candidate {
+        Candidate {
+            price: 100.0,
+            best_bid: Some(99.0),
+            best_ask: Some(101.0),
+            bid_levels: [None; crate::base_classes::state::SNAPSHOT_DEPTH],
+            ask_levels: [None; crate::base_classes::state::SNAPSHOT_DEPTH],
+            direction: None,
+            size: None,
+            seq,
+            ts_ns,
+            source_engine_ts_ns: ts_ns,
+            source_system_ts_ns: ts_ns,
+            source_idx,
+            source: format!("source_{source_idx}"),
+            exchange: "test",
+            feed: "bbo",
+            received_at: Some(Instant::now()),
+        }
+    }
+
+    #[test]
+    fn candidate_with_real_timestamp_beats_missing_timestamp() {
+        let with_ts = candidate(1, Some(5), 1);
+        let without_ts = candidate(999, None, 2);
+
+        assert!(ReferencePublisher::is_newer(&with_ts, &without_ts));
+        assert!(!ReferencePublisher::is_newer(&without_ts, &with_ts));
+    }
+
+    #[test]
+    fn missing_timestamps_compare_by_sequence() {
+        let newer = candidate(11, None, 1);
+        let older = candidate(10, None, 2);
+
+        assert!(ReferencePublisher::is_newer(&newer, &older));
+        assert!(!ReferencePublisher::is_newer(&older, &newer));
+    }
 }

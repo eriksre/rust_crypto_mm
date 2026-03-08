@@ -78,6 +78,13 @@ impl StrategyEngine {
         }
     }
 
+    pub fn rollback_plan(&mut self, plan: &QuotePlan) {
+        match self {
+            StrategyEngine::Simple(strategy) => strategy.rollback_plan(plan),
+            StrategyEngine::Momentum(strategy) => strategy.rollback_plan(plan),
+        }
+    }
+
     pub fn state_metrics(&self) -> QuoteStateMetrics {
         match self {
             StrategyEngine::Simple(strategy) => strategy.state_metrics(),

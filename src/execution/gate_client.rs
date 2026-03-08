@@ -83,7 +83,7 @@ impl GateClient {
     }
 
     pub async fn poll_reports(&self) -> Result<Vec<ExecutionReport>> {
-        Ok(Vec::new())
+        Err(anyhow!("GateClient REST poll_reports not implemented yet"))
     }
 
     async fn signed_request(

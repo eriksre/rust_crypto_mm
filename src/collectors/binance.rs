@@ -2,7 +2,6 @@ use crate::base_classes::bbo_store::BboStore;
 use crate::base_classes::tickers::{TickerSnapshot, TickerStore};
 use crate::base_classes::trades::{FixedTrades, Trade};
 use crate::base_classes::types::{Price, Qty, Seq};
-use crate::collectors::helpers::{find_first_string_number, find_json_string};
 use crate::utils::parsing::log_parse_drop;
 use crate::utils::time::ms_to_ns;
 use serde_json::{self, Value};
@@ -88,7 +87,13 @@ pub fn update_tickers(s: &str, store: &mut TickerStore) -> Option<(String, Ticke
         return None;
     }
 
-    let symbol = payload.get("s").and_then(|v| v.as_str())?.to_string();
+    let symbol = match payload.get("s").and_then(|v| v.as_str()) {
+        Some(symbol) => symbol.to_string(),
+        None => {
+            log_parse_drop("binance_collector", "missing_symbol", &"missing symbol", s);
+            return None;
+        }
+    };
     let mut snapshot = store.get(&symbol).copied().unwrap_or_default();
 
     if let Some(mark) = payload.get("p").and_then(as_f64) {
@@ -101,19 +106,27 @@ pub fn update_tickers(s: &str, store: &mut TickerStore) -> Option<(String, Ticke
         snapshot.funding_rate = Some(rate);
     }
 
-    if let Some(ts_ms) = payload
+    let ts_ms = match payload
         .get("T")
         .and_then(as_u64)
         .or_else(|| payload.get("E").and_then(as_u64))
     {
-        snapshot.ticker.ts = ms_to_ns(ts_ms);
-    }
+        Some(ts_ms) if ts_ms > 0 => ts_ms,
+        _ => {
+            log_parse_drop("binance_collector", "missing_ts", &"missing ts", s);
+            return None;
+        }
+    };
+    snapshot.ticker.ts = ms_to_ns(ts_ms);
 
-    if let Some(seq) = payload.get("E").and_then(as_u64) {
-        snapshot.ticker.seq = seq;
-    } else {
-        log_parse_drop("binance_collector", "missing_seq", &"missing seq", s);
-    }
+    let seq = match payload.get("E").and_then(as_u64) {
+        Some(seq) if seq > 0 => seq,
+        _ => {
+            log_parse_drop("binance_collector", "missing_seq", &"missing seq", s);
+            return None;
+        }
+    };
+    snapshot.ticker.seq = seq;
 
     let stored = store.update(symbol.clone(), snapshot);
     Some((symbol, stored))
@@ -133,64 +146,48 @@ pub fn update_bbo_store(s: &str, store: &mut BboStore) -> bool {
         return false;
     }
 
-    let bid = match payload
-        .get("b")
-        .and_then(as_f64)
-        .or_else(|| find_first_string_number(s, &["b"]))
-        .or_else(|| {
-            log_parse_drop("binance_collector", "missing_bid", &"missing bid", s);
-            None
-        }) {
+    let bid = match payload.get("b").and_then(as_f64).or_else(|| {
+        log_parse_drop("binance_collector", "missing_bid", &"missing bid", s);
+        None
+    }) {
         Some(v) => v,
         None => return false,
     };
-    let ask = match payload
-        .get("a")
-        .and_then(as_f64)
-        .or_else(|| find_first_string_number(s, &["a"]))
-        .or_else(|| {
-            log_parse_drop("binance_collector", "missing_ask", &"missing ask", s);
-            None
-        }) {
+    let ask = match payload.get("a").and_then(as_f64).or_else(|| {
+        log_parse_drop("binance_collector", "missing_ask", &"missing ask", s);
+        None
+    }) {
         Some(v) => v,
         None => return false,
     };
-    let bid_qty = match payload
-        .get("B")
-        .and_then(as_f64)
-        .or_else(|| find_first_string_number(s, &["B"]))
-        .or_else(|| {
-            log_parse_drop(
-                "binance_collector",
-                "missing_bid_qty",
-                &"missing bid qty",
-                s,
-            );
-            None
-        }) {
+    let bid_qty = match payload.get("B").and_then(as_f64).or_else(|| {
+        log_parse_drop(
+            "binance_collector",
+            "missing_bid_qty",
+            &"missing bid qty",
+            s,
+        );
+        None
+    }) {
         Some(v) => v,
         None => return false,
     };
-    let ask_qty = match payload
-        .get("A")
-        .and_then(as_f64)
-        .or_else(|| find_first_string_number(s, &["A"]))
-        .or_else(|| {
-            log_parse_drop(
-                "binance_collector",
-                "missing_ask_qty",
-                &"missing ask qty",
-                s,
-            );
-            None
-        }) {
+    let ask_qty = match payload.get("A").and_then(as_f64).or_else(|| {
+        log_parse_drop(
+            "binance_collector",
+            "missing_ask_qty",
+            &"missing ask qty",
+            s,
+        );
+        None
+    }) {
         Some(v) => v,
         None => return false,
     };
     let ts_ms = match payload
         .get("T")
-        .and_then(|v| v.as_u64())
-        .or_else(|| payload.get("E").and_then(|v| v.as_u64()))
+        .and_then(as_u64)
+        .or_else(|| payload.get("E").and_then(as_u64))
         .or_else(|| {
             log_parse_drop("binance_collector", "missing_ts", &"missing ts", s);
             None
@@ -199,15 +196,11 @@ pub fn update_bbo_store(s: &str, store: &mut BboStore) -> bool {
         None => return false,
     };
     let ts_ns = ms_to_ns(ts_ms);
-    let system_ts_ns = payload.get("E").and_then(|v| v.as_u64()).map(ms_to_ns);
-    let symbol = match payload
-        .get("s")
-        .and_then(|v| v.as_str())
-        .or_else(|| find_json_string(s, "s"))
-        .or_else(|| {
-            log_parse_drop("binance_collector", "missing_symbol", &"missing symbol", s);
-            None
-        }) {
+    let system_ts_ns = payload.get("E").and_then(as_u64).map(ms_to_ns);
+    let symbol = match payload.get("s").and_then(|v| v.as_str()).or_else(|| {
+        log_parse_drop("binance_collector", "missing_symbol", &"missing symbol", s);
+        None
+    }) {
         Some(v) => v,
         None => return false,
     };
@@ -220,20 +213,27 @@ pub fn events_for_book<const N: usize>(
     s: &str,
     book: &mut BinanceBook<N>,
 ) -> Option<(&'static str, f64)> {
-    if let Some(ev) = find_json_string(s, "e") {
-        if ev == "depthUpdate" {
-            match serde_json::from_str::<DepthUpdate>(s) {
-                Ok(evt) => {
-                    if book.apply_depth_update(&evt) {
-                        if let Some(mid) = book.mid_price_f64() {
-                            return Some(("orderbook", mid));
-                        }
-                    }
-                }
-                Err(err) => {
-                    log_parse_drop("binance_collector", "depth_update", &err, s);
+    let raw: Value = match serde_json::from_str::<Value>(s) {
+        Ok(val) => val,
+        Err(err) => {
+            log_parse_drop("binance_collector", "json", &err, s);
+            return None;
+        }
+    };
+    let payload = event_payload(&raw);
+    if payload.get("e").and_then(|v| v.as_str()) != Some("depthUpdate") {
+        return None;
+    }
+    match serde_json::from_value::<DepthUpdate>(payload.clone()) {
+        Ok(evt) => {
+            if book.apply_depth_update(&evt) {
+                if let Some(mid) = book.mid_price_f64() {
+                    return Some(("orderbook", mid));
                 }
             }
+        }
+        Err(err) => {
+            log_parse_drop("binance_collector", "depth_update", &err, s);
         }
     }
     None
@@ -259,21 +259,17 @@ pub fn update_trades<const N: usize>(s: &str, trades: &mut FixedTrades<N>) -> us
         Some(v) => v,
         None => return 0,
     };
-    let qty = match payload
-        .get("q")
-        .and_then(as_f64)
-        .or_else(|| find_first_string_number(s, &["q"]))
-        .or_else(|| {
-            log_parse_drop("binance_collector", "missing_qty", &"missing qty", s);
-            None
-        }) {
+    let qty = match payload.get("q").and_then(as_f64).or_else(|| {
+        log_parse_drop("binance_collector", "missing_qty", &"missing qty", s);
+        None
+    }) {
         Some(v) => v,
         None => return 0,
     };
     let ts_ms = match payload
         .get("T")
-        .and_then(|v| v.as_u64())
-        .or_else(|| payload.get("E").and_then(|v| v.as_u64()))
+        .and_then(as_u64)
+        .or_else(|| payload.get("E").and_then(as_u64))
         .or_else(|| {
             log_parse_drop("binance_collector", "missing_ts", &"missing ts", s);
             None
@@ -281,7 +277,7 @@ pub fn update_trades<const N: usize>(s: &str, trades: &mut FixedTrades<N>) -> us
         Some(v) => v,
         None => return 0,
     };
-    let agg_id = match payload.get("a").and_then(|v| v.as_u64()).or_else(|| {
+    let agg_id = match payload.get("a").and_then(as_u64).or_else(|| {
         log_parse_drop("binance_collector", "missing_agg_id", &"missing agg_id", s);
         None
     }) {
@@ -303,7 +299,7 @@ pub fn update_trades<const N: usize>(s: &str, trades: &mut FixedTrades<N>) -> us
     let px_i = (price * PRICE_SCALE).round() as Price;
     let qty_i = (qty * QTY_SCALE).round() as Qty;
     let ts_ns = ms_to_ns(ts_ms);
-    let system_ts_ns = payload.get("E").and_then(|v| v.as_u64()).map(ms_to_ns);
+    let system_ts_ns = payload.get("E").and_then(as_u64).map(ms_to_ns);
     let trade = Trade::new(px_i, qty_i, ts_ns, agg_id, is_buyer_maker, system_ts_ns);
     trades.push(trade);
     1
@@ -336,5 +332,57 @@ mod tests {
         assert_eq!(snap.funding_rate, Some(0.000123));
         assert_eq!(snap.ticker.seq, 1_600_000_000_000);
         assert_eq!(snap.ticker.ts, 1_600_000_005_000_000_000);
+    }
+
+    #[test]
+    fn test_update_tickers_binance_rejects_missing_seq() {
+        let json = r#"{
+            "data":{
+                "e":"markPriceUpdate",
+                "s":"BTCUSDT",
+                "p":"11794.1500",
+                "T":1600000005000
+            }
+        }"#;
+
+        let mut store = TickerStore::default();
+        assert!(update_tickers(json, &mut store).is_none());
+        assert!(store.get("BTCUSDT").is_none());
+    }
+
+    #[test]
+    fn test_update_bbo_store_binance_rejects_nested_fallback_bid() {
+        let json = r#"{
+            "e":"bookTicker",
+            "s":"BTCUSDT",
+            "other":{"b":"42000.5"},
+            "a":"42001.0",
+            "B":"1.5",
+            "A":"2.0",
+            "T":1700000000000,
+            "E":1700000000001
+        }"#;
+
+        let mut store = BboStore::default();
+        assert!(!update_bbo_store(json, &mut store));
+        assert!(store.get("BTCUSDT").is_none());
+    }
+
+    #[test]
+    fn test_update_trades_binance_rejects_nested_fallback_qty() {
+        let json = r#"{
+            "e":"aggTrade",
+            "s":"BTCUSDT",
+            "a":101,
+            "p":"42000.5",
+            "other":{"q":"0.25"},
+            "T":1700000000000,
+            "E":1700000000001,
+            "m":true
+        }"#;
+
+        let mut trades = FixedTrades::<4>::default();
+        assert_eq!(update_trades(json, &mut trades), 0);
+        assert!(trades.last().is_none());
     }
 }

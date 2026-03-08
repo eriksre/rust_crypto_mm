@@ -20,12 +20,16 @@ pub struct OkxDatum {
     pub asks: Vec<Vec<String>>,
     #[serde(default)]
     pub bids: Vec<Vec<String>>,
-    #[serde(rename = "seqId", default, deserialize_with = "deserialize_seq_opt")]
+    #[serde(
+        rename = "seqId",
+        default,
+        deserialize_with = "deserialize_strict_seq_opt"
+    )]
     pub seq_id: Option<u64>,
     #[serde(
         rename = "prevSeqId",
         default,
-        deserialize_with = "deserialize_seq_opt"
+        deserialize_with = "deserialize_prev_seq_opt"
     )]
     pub prev_seq_id: Option<u64>,
     #[serde(default)]
@@ -61,7 +65,7 @@ where
     })
 }
 
-fn deserialize_seq_opt<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+fn deserialize_strict_seq_opt<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -81,6 +85,44 @@ where
                 None
             }
         },
+        serde_json::Value::Null => None,
+        _ => None,
+    })
+}
+
+fn deserialize_prev_seq_opt<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Number(n) => {
+            if let Some(u) = n.as_u64() {
+                Some(u)
+            } else if n.as_i64() == Some(-1) {
+                None
+            } else {
+                log_parse_drop(
+                    "okx_orderbook",
+                    "prev_seq",
+                    &"invalid prevSeqId",
+                    &n.to_string(),
+                );
+                None
+            }
+        }
+        serde_json::Value::String(s) => {
+            if s == "-1" {
+                None
+            } else {
+                match s.parse::<u64>() {
+                    Ok(v) => Some(v),
+                    Err(err) => {
+                        log_parse_drop("okx_orderbook", "prev_seq", &err, &s);
+                        None
+                    }
+                }
+            }
+        }
         serde_json::Value::Null => None,
         _ => None,
     })
@@ -475,5 +517,40 @@ impl<const N: usize> OrderBookOps for OkxBook<N> {
         self.last_system_ts_ns = None;
         self.last_bbo_system_ts_ns = None;
         self.last_checksum = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OkxBook, OkxMsg};
+
+    #[test]
+    fn snapshot_accepts_prev_seq_id_negative_one_sentinel() {
+        let msg: OkxMsg = serde_json::from_str(
+            r#"{
+                "arg":{"channel":"books","instId":"BTC-USDT-SWAP"},
+                "action":"snapshot",
+                "data":[{
+                    "asks":[["2.0","1.0","0","1"]],
+                    "bids":[["1.0","1.0","0","1"]],
+                    "seqId":"10",
+                    "prevSeqId":"-1",
+                    "ts":"1000"
+                }]
+            }"#,
+        )
+        .expect("okx snapshot parsed");
+
+        let mut book = OkxBook::<16>::new(
+            "BTC-USDT-SWAP",
+            OkxBook::<16>::PRICE_SCALE,
+            OkxBook::<16>::QTY_SCALE,
+            1.0,
+        );
+        assert!(
+            book.apply(&msg),
+            "snapshot with prevSeqId=-1 must be accepted"
+        );
+        assert_eq!(book.last_seq(), 10);
     }
 }

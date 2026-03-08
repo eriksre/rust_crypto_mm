@@ -650,7 +650,8 @@ impl LighterPricingModel {
         let r_ceiling = cfg.kalman.r_ceiling;
         let default_r = (10.0 * cfg.kalman.q_per_sec.max(r_floor)).clamp(r_floor, r_ceiling);
         let r_state_path = cfg.kalman.r_state_path.as_ref().map(PathBuf::from);
-        let r_state_flush_interval = Duration::from_secs(cfg.kalman.r_state_flush_interval_s.max(1));
+        let r_state_flush_interval =
+            Duration::from_secs(cfg.kalman.r_state_flush_interval_s.max(1));
         let mut model = Self {
             mu_log: cfg.kalman.mu_log,
             biases: cfg.kalman.bias_by_stream.clone(),
@@ -1656,7 +1657,9 @@ impl LighterPricingModel {
             }
             loaded.insert(
                 stream.to_string(),
-                StreamNoiseStats::new(parsed_r.clamp(self.cfg.kalman.r_floor, self.cfg.kalman.r_ceiling)),
+                StreamNoiseStats::new(
+                    parsed_r.clamp(self.cfg.kalman.r_floor, self.cfg.kalman.r_ceiling),
+                ),
             );
         }
         eprintln!(
@@ -1807,7 +1810,10 @@ mod tests {
         ));
         std::fs::write(
             &tmp_path,
-            format!("# {} saved_unix_ms=1\nbinance:bbo,0.0002\n", LEARNED_R_STATE_HEADER),
+            format!(
+                "# {} saved_unix_ms=1\nbinance:bbo,0.0002\n",
+                LEARNED_R_STATE_HEADER
+            ),
         )
         .expect("failed writing temp state file");
 

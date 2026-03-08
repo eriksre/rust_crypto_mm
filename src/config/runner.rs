@@ -412,11 +412,7 @@ fn validate_pricing_model_config(cfg: &PricingModelConfig) -> Result<()> {
     if kalman.r_ceiling < kalman.r_floor {
         bail!("pricing_model.kalman.r_ceiling must be >= pricing_model.kalman.r_floor");
     }
-    ensure_finite_ge(
-        "pricing_model.kalman.r_clip_mult",
-        kalman.r_clip_mult,
-        1.0,
-    )?;
+    ensure_finite_ge("pricing_model.kalman.r_clip_mult", kalman.r_clip_mult, 1.0)?;
     if let Some(path) = kalman.r_state_path.as_ref() {
         if path.trim().is_empty() {
             bail!("pricing_model.kalman.r_state_path must be non-empty when set");

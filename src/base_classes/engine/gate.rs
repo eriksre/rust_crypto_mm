@@ -2,7 +2,7 @@ use crate::base_classes::feed_gate::{ExchangeFeed, FeedKind, FeedTimestampGate, 
 use crate::base_classes::reference_publisher::ReferencePublisher;
 use crate::base_classes::ring_buffer::Consumer;
 use crate::base_classes::state::{SNAPSHOT_DEPTH, TradeDirection, TradeEvent};
-use crate::base_classes::tickers::TickerStore;
+use crate::base_classes::tickers::{TickerSnapshot, TickerStore};
 use crate::collectors::gate;
 use crate::exchanges::endpoints::GateioWs;
 use crate::exchanges::gate::{GateContractMeta, GateFrame};
@@ -21,20 +21,30 @@ pub struct GateEngine<const N: usize> {
     trades: crate::base_classes::trades::FixedTrades<64>,
     tickers: TickerStore,
     symbol: String,
-    contract_meta: Option<GateContractMeta>,
     qty_multiplier: f64,
+}
+
+#[inline(always)]
+fn enrich_ticker_from_contract_meta(ticker: &mut TickerSnapshot, qty_multiplier: f64) {
+    ticker.quanto_multiplier = Some(qty_multiplier);
+    ticker.open_interest_value = match (ticker.open_interest, ticker.mark_px) {
+        (Some(oi), Some(mark)) => Some(oi * mark * qty_multiplier),
+        _ => None,
+    };
 }
 
 impl<const N: usize> GateEngine<N> {
     pub fn new(
         symbol: String,
         consumer: Consumer<GateFrame, N>,
-        contract_meta: Option<GateContractMeta>,
+        contract_meta: GateContractMeta,
     ) -> Self {
         let qty_multiplier = contract_meta
-            .as_ref()
-            .and_then(|meta| meta.quanto_multiplier)
-            .unwrap_or(1.0);
+            .quanto_multiplier
+            .filter(|mult| mult.is_finite() && *mult > 0.0)
+            .unwrap_or_else(|| {
+                panic!("ERROR: Gate contract metadata missing valid quanto_multiplier for {symbol}")
+            });
         Self {
             consumer,
             pending: None,
@@ -48,7 +58,6 @@ impl<const N: usize> GateEngine<N> {
             trades: crate::base_classes::trades::FixedTrades::<64>::default(),
             tickers: TickerStore::default(),
             symbol,
-            contract_meta,
             qty_multiplier,
         }
     }
@@ -261,44 +270,8 @@ impl<const N: usize> GateEngine<N> {
                 if let Some((symbol, mut ticker)) =
                     gate::update_tickers(text, &mut self.tickers, self.qty_multiplier)
                 {
-                    let mut needs_store_update = false;
-
-                    if ticker.quanto_multiplier.is_none() {
-                        if let Some(mult) = self
-                            .contract_meta
-                            .as_ref()
-                            .and_then(|meta| meta.quanto_multiplier)
-                        {
-                            ticker.quanto_multiplier = Some(mult);
-                            needs_store_update = true;
-                        }
-                    }
-
-                    if ticker.open_interest_value.is_none() {
-                        if let (Some(oi), Some(mark)) = (ticker.open_interest, ticker.mark_px) {
-                            let multiplier = ticker
-                                .quanto_multiplier
-                                .or_else(|| {
-                                    self.contract_meta
-                                        .as_ref()
-                                        .and_then(|meta| meta.quanto_multiplier)
-                                })
-                                .unwrap_or(1.0);
-                            ticker.open_interest_value = Some(oi * mark * multiplier);
-                            needs_store_update = true;
-                        }
-                    }
-
-                    if needs_store_update {
-                        ticker = self.tickers.update(symbol.clone(), ticker);
-                    }
-
-                    if let Some(mult) = ticker.quanto_multiplier {
-                        if mult > 0.0 && (mult - self.qty_multiplier).abs() > f64::EPSILON {
-                            self.qty_multiplier = mult;
-                            self.book.set_qty_multiplier(mult);
-                        }
-                    }
+                    enrich_ticker_from_contract_meta(&mut ticker, self.qty_multiplier);
+                    ticker = self.tickers.update(symbol.clone(), ticker);
 
                     let mut st = lock_state();
                     let entry = &mut st.gate.ticker;
@@ -331,25 +304,9 @@ impl<const N: usize> GateEngine<N> {
                     if let Some(oi) = ticker.open_interest {
                         entry.open_interest = Some(oi);
                     }
-                    if let Some(mult) = ticker.quanto_multiplier {
-                        entry.quanto_multiplier = Some(mult);
-                    } else if entry.quanto_multiplier.is_none() {
-                        if let Some(mult) = self
-                            .contract_meta
-                            .as_ref()
-                            .and_then(|meta| meta.quanto_multiplier)
-                        {
-                            entry.quanto_multiplier = Some(mult);
-                        }
-                    }
-
-                    if entry.open_interest_value.is_none() {
+                    entry.quanto_multiplier = Some(self.qty_multiplier);
+                    if ticker.open_interest_value.is_some() {
                         entry.open_interest_value = ticker.open_interest_value;
-                    } else if ticker.open_interest_value.is_some() {
-                        entry.open_interest_value = ticker.open_interest_value;
-                    } else if let (Some(oi), Some(mark)) = (entry.open_interest, entry.mark_price) {
-                        let multiplier = entry.quanto_multiplier.unwrap_or(1.0);
-                        entry.open_interest_value = Some(oi * mark * multiplier);
                     }
 
                     let seq = if ticker.ticker.seq != 0 {
@@ -365,5 +322,35 @@ impl<const N: usize> GateEngine<N> {
         } else {
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::enrich_ticker_from_contract_meta;
+    use crate::base_classes::tickers::TickerSnapshot;
+
+    #[test]
+    fn gate_ticker_enrichment_uses_rest_multiplier() {
+        let mut ticker = TickerSnapshot {
+            mark_px: Some(43005.0),
+            open_interest: Some(456.0),
+            ..TickerSnapshot::default()
+        };
+
+        enrich_ticker_from_contract_meta(&mut ticker, 0.01);
+
+        assert_eq!(ticker.quanto_multiplier, Some(0.01));
+        assert_eq!(ticker.open_interest_value, Some(456.0 * 43005.0 * 0.01));
+    }
+
+    #[test]
+    fn gate_ticker_enrichment_leaves_oi_value_unset_without_inputs() {
+        let mut ticker = TickerSnapshot::default();
+
+        enrich_ticker_from_contract_meta(&mut ticker, 0.01);
+
+        assert_eq!(ticker.quanto_multiplier, Some(0.01));
+        assert_eq!(ticker.open_interest_value, None);
     }
 }

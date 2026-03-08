@@ -791,21 +791,8 @@ impl GateWsWorker {
         for cid in ids {
             map_guard.remove(&cid);
             let key = cid.to_string();
-            let message = results_map.get(&key).cloned().unwrap_or_default();
-            let status = if message.is_empty() || message.eq_ignore_ascii_case("success") {
-                OrderStatus::Canceled
-            } else if message.eq_ignore_ascii_case("order_not_exists")
-                || message.eq_ignore_ascii_case("order_not_found")
-                || message.eq_ignore_ascii_case("order_finished")
-            {
-                OrderStatus::Canceled
-            } else {
-                eprintln!(
-                    "warning: cancel response for {} returned message '{}'",
-                    key, message
-                );
-                OrderStatus::Unknown
-            };
+            let message = results_map.get(&key).cloned();
+            let status = cancel_status_from_message(message.as_deref(), &key);
 
             reports.push(ExecutionReport {
                 client_order_id: cid,
@@ -1016,6 +1003,133 @@ impl GateWsWorker {
     }
 }
 
+fn cancel_status_from_message(message: Option<&str>, key: &str) -> OrderStatus {
+    match message {
+        Some(message) if message.eq_ignore_ascii_case("success") => OrderStatus::Canceled,
+        Some(message)
+            if message.eq_ignore_ascii_case("order_not_exists")
+                || message.eq_ignore_ascii_case("order_not_found")
+                || message.eq_ignore_ascii_case("order_finished") =>
+        {
+            OrderStatus::Canceled
+        }
+        Some(message) if message.is_empty() => {
+            eprintln!(
+                "ERROR: cancel response for {} returned empty message; treating status as unknown",
+                key
+            );
+            OrderStatus::Unknown
+        }
+        Some(message) => {
+            eprintln!(
+                "warning: cancel response for {} returned message '{}'",
+                key, message
+            );
+            OrderStatus::Unknown
+        }
+        None => {
+            eprintln!(
+                "ERROR: cancel response missing per-order result for {}; treating status as unknown",
+                key
+            );
+            OrderStatus::Unknown
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ResponseData, ResponseError, ResponseHeader, WsResponse, cancel_status_from_message,
+    };
+    use crate::execution::types::OrderStatus;
+    use serde_json::json;
+
+    #[test]
+    fn cancel_status_requires_explicit_result() {
+        assert_eq!(
+            cancel_status_from_message(None, "cid-1"),
+            OrderStatus::Unknown
+        );
+        assert_eq!(
+            cancel_status_from_message(Some(""), "cid-1"),
+            OrderStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn cancel_status_accepts_known_terminal_messages() {
+        assert_eq!(
+            cancel_status_from_message(Some("success"), "cid-1"),
+            OrderStatus::Canceled
+        );
+        assert_eq!(
+            cancel_status_from_message(Some("order_not_found"), "cid-1"),
+            OrderStatus::Canceled
+        );
+    }
+
+    #[test]
+    fn ws_response_requires_explicit_success_status() {
+        let missing_status = WsResponse {
+            request_id: Some("1".to_string()),
+            ack: None,
+            header: None,
+            data: Some(ResponseData {
+                result: Some(json!([])),
+                errs: None,
+            }),
+        };
+        assert!(!missing_status.is_success());
+
+        let ok = WsResponse {
+            request_id: Some("1".to_string()),
+            ack: None,
+            header: Some(ResponseHeader {
+                status: Some("200".to_string()),
+            }),
+            data: Some(ResponseData {
+                result: Some(json!([])),
+                errs: None,
+            }),
+        };
+        assert!(ok.is_success());
+    }
+
+    #[test]
+    fn ws_response_error_message_fails_closed_without_error_details() {
+        let missing_status = WsResponse {
+            request_id: Some("1".to_string()),
+            ack: None,
+            header: None,
+            data: None,
+        };
+        assert_eq!(
+            missing_status.error_message().as_deref(),
+            Some("gate ws response missing status header")
+        );
+
+        let api_error = WsResponse {
+            request_id: Some("1".to_string()),
+            ack: None,
+            header: Some(ResponseHeader {
+                status: Some("400".to_string()),
+            }),
+            data: Some(ResponseData {
+                result: None,
+                errs: Some(ResponseError {
+                    label: Some("INVALID_PARAM".to_string()),
+                    message: Some("bad request".to_string()),
+                }),
+            }),
+        };
+        assert_eq!(
+            api_error.error_message().as_deref(),
+            Some("INVALID_PARAM: bad request")
+        );
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct WsResponse {
     #[serde(rename = "request_id")]
@@ -1035,22 +1149,30 @@ impl WsResponse {
             .as_ref()
             .and_then(|h| h.status.as_deref())
             .map(|s| s == "200")
-            .unwrap_or(true);
+            .unwrap_or(false);
         let err_empty = self.data.as_ref().map(|d| d.errs.is_none()).unwrap_or(true);
         status_ok && err_empty
     }
 
     fn error_message(&self) -> Option<String> {
-        self.data.as_ref().and_then(|d| d.errs.as_ref()).map(|err| {
+        if let Some(err) = self.data.as_ref().and_then(|d| d.errs.as_ref()) {
             let label = err.label.clone().unwrap_or_default();
             let message = err.message.clone().unwrap_or_default();
-            format!(
-                "{}{}{}",
-                label,
-                if label.is_empty() { "" } else { ": " },
-                message
-            )
-        })
+            if !label.is_empty() || !message.is_empty() {
+                return Some(format!(
+                    "{}{}{}",
+                    label,
+                    if label.is_empty() { "" } else { ": " },
+                    message
+                ));
+            }
+            return Some("gate ws response contained an empty error payload".to_string());
+        }
+
+        match self.header.as_ref().and_then(|h| h.status.as_deref()) {
+            Some(status) => Some(format!("gate ws request failed with status {status}")),
+            None => Some("gate ws response missing status header".to_string()),
+        }
     }
 }
 

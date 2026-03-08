@@ -102,14 +102,56 @@ impl RevisionKey {
     }
 
     pub fn is_newer_than(&self, other: &Self) -> bool {
-        let cand_ts = self.ts_ns.unwrap_or(0);
-        let cur_ts = other.ts_ns.unwrap_or(0);
-        if cand_ts != cur_ts {
-            return cand_ts > cur_ts;
+        match (self.ts_ns, other.ts_ns) {
+            (Some(cand_ts), Some(cur_ts)) if cand_ts != cur_ts => {
+                return cand_ts > cur_ts;
+            }
+            (Some(_), None) => return true,
+            (None, Some(_)) => return false,
+            _ => {}
         }
         if self.seq != other.seq {
             return self.seq > other.seq;
         }
         self.source_idx > other.source_idx
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RevisionKey;
+
+    #[test]
+    fn known_timestamp_outranks_missing_timestamp() {
+        let newer = RevisionKey {
+            source_idx: 1,
+            seq: 1,
+            ts_ns: Some(10),
+        };
+        let older = RevisionKey {
+            source_idx: 2,
+            seq: 99,
+            ts_ns: None,
+        };
+
+        assert!(newer.is_newer_than(&older));
+        assert!(!older.is_newer_than(&newer));
+    }
+
+    #[test]
+    fn missing_timestamps_fall_back_to_sequence() {
+        let newer = RevisionKey {
+            source_idx: 1,
+            seq: 11,
+            ts_ns: None,
+        };
+        let older = RevisionKey {
+            source_idx: 2,
+            seq: 10,
+            ts_ns: None,
+        };
+
+        assert!(newer.is_newer_than(&older));
+        assert!(!older.is_newer_than(&newer));
     }
 }

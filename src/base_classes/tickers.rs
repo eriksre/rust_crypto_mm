@@ -69,20 +69,20 @@ impl TickerStore {
     pub fn update<S: Into<String>>(
         &mut self,
         symbol: S,
-        mut snapshot: TickerSnapshot,
+        snapshot: TickerSnapshot,
     ) -> TickerSnapshot {
         let symbol = symbol.into();
         if snapshot.ticker.seq == 0 {
-            if let Some(prev) = self.entries.get(&symbol) {
-                snapshot.ticker.seq = prev.ticker.seq.wrapping_add(1);
-            } else {
-                snapshot.ticker.seq = 1;
-            }
+            panic!(
+                "TickerStore::update requires non-zero seq for symbol {}: {:?}",
+                symbol, snapshot.ticker
+            );
         }
         if snapshot.ticker.ts == 0 {
-            if let Some(prev) = self.entries.get(&symbol) {
-                snapshot.ticker.ts = prev.ticker.ts;
-            }
+            panic!(
+                "TickerStore::update requires non-zero ts for symbol {}: {:?}",
+                symbol, snapshot.ticker
+            );
         }
         self.entries.insert(symbol.clone(), snapshot);
         self.last_symbol = Some(symbol);
@@ -104,5 +104,44 @@ impl TickerStore {
     #[inline(always)]
     pub fn last_symbol(&self) -> Option<&str> {
         self.last_symbol.as_deref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot(seq: Seq, ts: Ts) -> TickerSnapshot {
+        TickerSnapshot {
+            ticker: Ticker {
+                seq,
+                ts,
+                ..Ticker::default()
+            },
+            ..TickerSnapshot::default()
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "non-zero seq")]
+    fn update_rejects_missing_sequence() {
+        let mut store = TickerStore::default();
+        let _ = store.update("BTCUSDT", snapshot(0, 123));
+    }
+
+    #[test]
+    #[should_panic(expected = "non-zero ts")]
+    fn update_rejects_missing_timestamp() {
+        let mut store = TickerStore::default();
+        let _ = store.update("BTCUSDT", snapshot(123, 0));
+    }
+
+    #[test]
+    fn update_preserves_explicit_sequence_and_timestamp() {
+        let mut store = TickerStore::default();
+        let stored = store.update("BTCUSDT", snapshot(123, 456));
+        assert_eq!(stored.ticker.seq, 123);
+        assert_eq!(stored.ticker.ts, 456);
+        assert_eq!(store.get("BTCUSDT").copied(), Some(stored));
     }
 }

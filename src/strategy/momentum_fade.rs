@@ -316,6 +316,7 @@ impl MomentumFadeStrategy {
             intents,
             planned_at: now,
             reference_meta,
+            prior_submit_at: self.last_submit_at,
         })
     }
 
@@ -390,6 +391,24 @@ impl MomentumFadeStrategy {
                 }
             }
         }
+    }
+
+    pub fn rollback_plan(&mut self, plan: &QuotePlan) {
+        for id in &plan.cancels {
+            self.pending_cancels.remove(id);
+            self.scheduled_cancels.insert(id.clone());
+        }
+        for intent in &plan.intents {
+            self.pending_cancels.remove(&intent.client_order_id);
+            self.scheduled_cancels.remove(&intent.client_order_id);
+            self.active_orders
+                .retain(|id| id != &intent.client_order_id);
+            self.active_quotes.remove(&intent.client_order_id);
+        }
+        if !plan.intents.is_empty() && self.last_submit_at == Some(plan.planned_at) {
+            self.last_submit_at = plan.prior_submit_at;
+        }
+        self.needs_quote = true;
     }
 
     pub fn fill_context(&self, order_id: &ClientOrderId, now: Instant) -> FillContext {
@@ -833,5 +852,144 @@ mod tests {
         let cancels = strategy.evaluate_cancels(now);
         assert!(cancels.contains(&bid_id));
         assert!(!cancels.contains(&ask_id));
+    }
+
+    #[test]
+    fn rollback_plan_restores_previous_submit_state() {
+        let mut strategy = MomentumFadeStrategy::new(
+            base_config(EntryPriceSource::Model),
+            Venue::Lighter,
+            "XMR_USDT".to_string(),
+            0.001,
+            1.0,
+        );
+        let now = Instant::now();
+        let existing_id = ClientOrderId::new("mf-lighter-b-1");
+        let new_id = ClientOrderId::new("mf-lighter-s-2");
+        let previous_submit = now - Duration::from_secs(5);
+
+        strategy.last_submit_at = Some(previous_submit);
+        strategy.active_orders.push(existing_id.clone());
+        strategy.active_quotes.insert(
+            existing_id.clone(),
+            ActiveOrder {
+                side: Side::Bid,
+                price: 100.0,
+                placed_at: now - Duration::from_secs(1),
+            },
+        );
+
+        let plan = QuotePlan {
+            reference_price: 100.0,
+            reference_best_bid: Some(99.9),
+            reference_best_ask: Some(100.1),
+            cancels: vec![existing_id.clone()],
+            intents: vec![QuoteIntent::new(
+                Venue::Lighter,
+                "XMR_USDT",
+                Side::Ask,
+                100.2,
+                1.0,
+                TimeInForce::PostOnly,
+                new_id.clone(),
+            )],
+            planned_at: now,
+            reference_meta: None,
+            prior_submit_at: Some(previous_submit),
+        };
+
+        strategy.commit_plan(&plan);
+        strategy.rollback_plan(&plan);
+
+        assert_eq!(strategy.last_submit_at, Some(previous_submit));
+        assert!(strategy.scheduled_cancels.contains(&existing_id));
+        assert!(!strategy.pending_cancels.contains(&existing_id));
+        assert!(strategy.active_quotes.contains_key(&existing_id));
+        assert!(!strategy.active_quotes.contains_key(&new_id));
+        assert!(!strategy.active_orders.iter().any(|id| id == &new_id));
+        assert!(strategy.needs_quote);
+    }
+
+    #[test]
+    fn rollback_plan_clears_stale_cancel_state_for_failed_intent() {
+        let mut strategy = MomentumFadeStrategy::new(
+            base_config(EntryPriceSource::Model),
+            Venue::Lighter,
+            "XMR_USDT".to_string(),
+            0.001,
+            1.0,
+        );
+        let now = Instant::now();
+        let new_id = ClientOrderId::new("mf-lighter-b-9");
+
+        let plan = QuotePlan {
+            reference_price: 100.0,
+            reference_best_bid: Some(99.9),
+            reference_best_ask: Some(100.1),
+            cancels: Vec::new(),
+            intents: vec![QuoteIntent::new(
+                Venue::Lighter,
+                "XMR_USDT",
+                Side::Bid,
+                99.95,
+                1.0,
+                TimeInForce::PostOnly,
+                new_id.clone(),
+            )],
+            planned_at: now,
+            reference_meta: None,
+            prior_submit_at: None,
+        };
+
+        strategy.commit_plan(&plan);
+        strategy.scheduled_cancels.insert(new_id.clone());
+        strategy.pending_cancels.insert(new_id.clone());
+
+        strategy.rollback_plan(&plan);
+
+        assert!(!strategy.scheduled_cancels.contains(&new_id));
+        assert!(!strategy.pending_cancels.contains(&new_id));
+        assert!(!strategy.active_quotes.contains_key(&new_id));
+        assert!(!strategy.active_orders.iter().any(|id| id == &new_id));
+    }
+
+    #[test]
+    fn rejected_report_clears_stale_scheduled_cancel_state() {
+        let mut strategy = MomentumFadeStrategy::new(
+            base_config(EntryPriceSource::Model),
+            Venue::Lighter,
+            "XMR_USDT".to_string(),
+            0.001,
+            1.0,
+        );
+        let order_id = ClientOrderId::new("mf-lighter-s-15");
+        let now = Instant::now();
+
+        strategy.active_orders.push(order_id.clone());
+        strategy.active_quotes.insert(
+            order_id.clone(),
+            ActiveOrder {
+                side: Side::Ask,
+                price: 100.0,
+                placed_at: now,
+            },
+        );
+        strategy.scheduled_cancels.insert(order_id.clone());
+        strategy.pending_cancels.insert(order_id.clone());
+
+        strategy.handle_report(&ExecutionReport {
+            client_order_id: order_id.clone(),
+            exchange_order_id: None,
+            status: OrderStatus::Rejected,
+            filled_qty: 0.0,
+            avg_fill_price: None,
+            ts: None,
+        });
+
+        assert!(!strategy.scheduled_cancels.contains(&order_id));
+        assert!(!strategy.pending_cancels.contains(&order_id));
+        assert!(!strategy.active_quotes.contains_key(&order_id));
+        assert!(!strategy.active_orders.iter().any(|id| id == &order_id));
+        assert!(strategy.needs_quote);
     }
 }

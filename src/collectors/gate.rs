@@ -2,7 +2,6 @@ use crate::base_classes::bbo_store::BboStore;
 use crate::base_classes::tickers::{TickerSnapshot, TickerStore};
 use crate::base_classes::trades::{FixedTrades, Trade};
 use crate::base_classes::types::{Price, Qty, Seq};
-use crate::collectors::helpers::{find_first_string_number, find_json_string};
 use crate::exchanges::gate::orderbook::{GateBook, GateMsg};
 use crate::utils::parsing::log_parse_drop;
 use crate::utils::time::ms_to_ns;
@@ -10,9 +9,16 @@ use serde_json::{self, Value};
 
 pub fn events_for<const N: usize>(s: &str, book: &mut GateBook<N>) -> Vec<(&'static str, f64)> {
     let mut out = Vec::with_capacity(1);
-    if let Some(ch) = find_json_string(s, "channel") {
+    let raw: Value = match serde_json::from_str(s) {
+        Ok(val) => val,
+        Err(err) => {
+            log_parse_drop("gate_collector", "json", &err, s);
+            return out;
+        }
+    };
+    if let Some(ch) = raw.get("channel").and_then(|v| v.as_str()) {
         match ch {
-            "futures.book_ticker" => { /* handled by bbo updater in caller */ }
+            "futures.book_ticker" => {}
             "futures.obu" => match serde_json::from_str::<GateMsg>(s) {
                 Ok(msg) => {
                     if book.apply(&msg) {
@@ -21,9 +27,7 @@ pub fn events_for<const N: usize>(s: &str, book: &mut GateBook<N>) -> Vec<(&'sta
                         }
                     }
                 }
-                Err(err) => {
-                    log_parse_drop("gate_collector", "orderbook", &err, s);
-                }
+                Err(err) => log_parse_drop("gate_collector", "orderbook", &err, s),
             },
             "futures.trades" => { /* handled by trades updater in caller */ }
             _ => {}
@@ -45,6 +49,10 @@ fn first_result_object(value: &Value) -> Option<&Value> {
     } else {
         Some(value)
     }
+}
+
+fn event_name(value: &Value) -> Option<&str> {
+    value.get("event").and_then(|v| v.as_str())
 }
 
 fn as_f64(value: &Value) -> Option<f64> {
@@ -135,6 +143,11 @@ pub fn update_tickers(
     if raw.get("channel").and_then(|v| v.as_str()) != Some("futures.tickers") {
         return None;
     }
+    if let Some(event) = event_name(&raw) {
+        if event != "update" {
+            return None;
+        }
+    }
 
     let data_obj = first_result_object(&raw)?;
     if !data_obj.is_object() {
@@ -144,24 +157,19 @@ pub fn update_tickers(
     let symbol = data_obj
         .get("contract")
         .or_else(|| data_obj.get("symbol"))
-        .and_then(|v| v.as_str())
-        .or_else(|| find_json_string(s, "contract"))
-        .or_else(|| find_json_string(s, "symbol"))?
+        .and_then(|v| v.as_str())?
         .to_string();
 
-    let mut snapshot = store.get(&symbol).copied().unwrap_or_default();
+    let prev = store.get(&symbol).copied();
+    let mut snapshot = prev.unwrap_or_default();
 
     if let Some(last_px) = value_to_f64(data_obj, &["last", "last_price"]) {
         snapshot.ticker.last_px = (last_px * PRICE_SCALE).round() as Price;
     }
-    if let Some(bid_px) = value_to_f64(data_obj, &["best_bid", "bid"])
-        .or_else(|| find_first_string_number(s, &["best_bid", "bid"]))
-    {
+    if let Some(bid_px) = value_to_f64(data_obj, &["best_bid", "bid"]) {
         snapshot.ticker.best_bid = (bid_px * PRICE_SCALE).round() as Price;
     }
-    if let Some(ask_px) = value_to_f64(data_obj, &["best_ask", "ask"])
-        .or_else(|| find_first_string_number(s, &["best_ask", "ask"]))
-    {
+    if let Some(ask_px) = value_to_f64(data_obj, &["best_ask", "ask"]) {
         snapshot.ticker.best_ask = (ask_px * PRICE_SCALE).round() as Price;
     }
 
@@ -181,39 +189,27 @@ pub fn update_tickers(
         snapshot.open_interest = Some(oi);
     }
 
-    if let Some(mult) = value_to_f64(data_obj, &["quanto_multiplier"]) {
-        snapshot.quanto_multiplier = Some(mult);
-    }
-
-    if let (Some(oi), Some(mark)) = (snapshot.open_interest, snapshot.mark_px) {
-        let multiplier = match snapshot.quanto_multiplier {
-            Some(mult) => mult,
-            None => {
-                log_parse_drop(
-                    "gate_collector",
-                    "missing_quanto_multiplier",
-                    &"missing quanto_multiplier",
-                    s,
-                );
-                1.0
-            }
-        };
-        snapshot.open_interest_value = Some(oi * mark * multiplier);
-    }
-
     if let Some(last_size) = value_to_f64(data_obj, &["last_size", "last_qty"]) {
         snapshot.ticker.last_qty = (last_size * qty_multiplier * QTY_SCALE).round() as Qty;
     }
 
-    if let Some(ts_ms) = value_to_u64(data_obj, &["time_ms", "ts"]) {
-        snapshot.ticker.ts = ms_to_ns(ts_ms);
-    }
+    let ts_ms = match value_to_u64(data_obj, &["time_ms", "ts"])
+        .or_else(|| raw.get("time_ms").and_then(as_u64))
+    {
+        Some(ts_ms) if ts_ms > 0 => ts_ms,
+        _ => {
+            log_parse_drop("gate_collector", "missing_ts", &"missing ts", s);
+            return None;
+        }
+    };
+    snapshot.ticker.ts = ms_to_ns(ts_ms);
 
-    if let Some(seq) = value_to_u64(data_obj, &["update_id", "seq", "t"]) {
-        snapshot.ticker.seq = seq;
-    } else {
-        log_parse_drop("gate_collector", "missing_seq", &"missing seq", s);
-    }
+    let fallback_seq = prev
+        .map(|snapshot| snapshot.ticker.seq.wrapping_add(1))
+        .unwrap_or(1);
+    snapshot.ticker.seq = value_to_u64(data_obj, &["update_id", "seq", "t"])
+        .filter(|seq| *seq > 0)
+        .unwrap_or(fallback_seq);
 
     let stored = store.update(symbol.clone(), snapshot);
     Some((symbol, stored))
@@ -221,6 +217,8 @@ pub fn update_tickers(
 
 #[cfg(test)]
 mod tests {
+    use crate::base_classes::orderbook_trait::OrderBookOps;
+
     use super::*;
 
     #[test]
@@ -237,7 +235,7 @@ mod tests {
                 "volume_24h_settle":"1234567.89",
                 "total_size":"456.0",
                 "last_size":"2.5",
-                "quanto_multiplier":"0.01",
+                "seq":"123456",
                 "time_ms":1700000000000
             }]
         }"#;
@@ -254,11 +252,11 @@ mod tests {
         assert_eq!(snap.funding_rate, Some(0.0001));
         assert_eq!(snap.turnover_24h, Some(1_234_567.89));
         assert_eq!(snap.open_interest, Some(456.0));
-        assert_eq!(snap.quanto_multiplier, Some(0.01));
-        let expected_oi_value = 456.0 * 43005.0 * 0.01;
-        assert_eq!(snap.open_interest_value, Some(expected_oi_value));
+        assert_eq!(snap.quanto_multiplier, None);
+        assert_eq!(snap.open_interest_value, None);
         assert_eq!(snap.ticker.last_qty, (2.5 * QTY_SCALE).round() as Qty);
         assert_eq!(snap.ticker.ts, 1_700_000_000_000_000_000);
+        assert_eq!(snap.ticker.seq, 123_456);
     }
 
     #[test]
@@ -281,66 +279,253 @@ mod tests {
         let mid = store.mid_price_f64_for("BTC_USDT").unwrap();
         assert!((mid - 110756.85).abs() < 1e-6);
     }
+
+    #[test]
+    fn test_update_tickers_gate_uses_top_level_timestamp_and_synthesizes_sequence() {
+        let json = r#"{
+            "time_ms":1700000000123,
+            "event":"update",
+            "channel":"futures.tickers",
+            "result":[{
+                "contract":"BTC_USDT",
+                "last":"43000"
+            }]
+        }"#;
+        let mut store = TickerStore::default();
+        let (_, snap) = update_tickers(json, &mut store, 1.0).expect("ticker parsed");
+        assert_eq!(snap.ticker.ts, 1_700_000_000_123_000_000);
+        assert_eq!(snap.ticker.seq, 1);
+    }
+
+    #[test]
+    fn test_update_bbo_store_gate_ignores_subscribe_ack() {
+        let json = r#"{
+            "time":1700000000,
+            "time_ms":1700000000100,
+            "channel":"futures.book_ticker",
+            "event":"subscribe",
+            "payload":["BTC_USDT"],
+            "result":{"status":"success"}
+        }"#;
+        let mut store = BboStore::default();
+        assert!(!update_bbo_store(json, &mut store, 1.0));
+        assert!(store.get("BTC_USDT").is_none());
+    }
+
+    #[test]
+    fn test_update_trades_gate_rejects_missing_trade_id() {
+        let json = r#"{
+            "channel":"futures.trades",
+            "time_ms":1700000000100,
+            "result":[{"price":"43000","size":"-0.5","create_time_ms":1700000000000}]
+        }"#;
+        let mut trades = FixedTrades::<4>::default();
+        assert_eq!(update_trades(json, &mut trades, 1.0), 0);
+    }
+
+    #[test]
+    fn test_events_for_ignores_obu_subscribe_ack() {
+        let json = r#"{
+            "time":1772858040,
+            "time_ms":1772858040687,
+            "channel":"futures.obu",
+            "event":"subscribe",
+            "payload":["ob.XRP_USDT.50"],
+            "result":{"status":"success"}
+        }"#;
+        let mut book = GateBook::<16>::new(
+            "XRP_USDT",
+            GateBook::<16>::PRICE_SCALE,
+            GateBook::<16>::QTY_SCALE,
+            1.0,
+        );
+
+        let events = events_for(json, &mut book);
+
+        assert!(events.is_empty());
+        assert!(!book.is_initialized());
+    }
+
+    #[test]
+    fn test_events_for_processes_obu_snapshot_and_delta_without_seq_or_full() {
+        let snapshot = r#"{
+            "channel":"futures.obu",
+            "event":"update",
+            "result":{
+                "t":1772858041160,
+                "s":"ob.XRP_USDT.50",
+                "u":24819532359,
+                "full":true,
+                "b":[["1.3623","477"]],
+                "a":[["1.3624","312"]]
+            },
+            "time_ms":1772858041161
+        }"#;
+        let delta = r#"{
+            "channel":"futures.obu",
+            "event":"update",
+            "result":{
+                "t":1772858041410,
+                "s":"ob.XRP_USDT.50",
+                "U":24819532360,
+                "u":24819532365,
+                "a":[["1.3624","351"]]
+            },
+            "time_ms":1772858041411
+        }"#;
+        let mut book = GateBook::<16>::new(
+            "XRP_USDT",
+            GateBook::<16>::PRICE_SCALE,
+            GateBook::<16>::QTY_SCALE,
+            1.0,
+        );
+
+        let snapshot_events = events_for(snapshot, &mut book);
+        assert_eq!(snapshot_events, vec![("orderbook", 1.36235)]);
+        assert!(book.is_initialized());
+
+        let delta_events = events_for(delta, &mut book);
+        assert_eq!(delta_events, vec![("orderbook", 1.36235)]);
+        assert_eq!(book.best_ask_f64(), Some((1.3624, 351.0)));
+    }
+
+    #[test]
+    fn test_events_for_advances_timestamp_on_empty_obu_delta() {
+        let snapshot = r#"{
+            "channel":"futures.obu",
+            "event":"update",
+            "result":{
+                "t":1772858041160,
+                "s":"ob.XRP_USDT.50",
+                "u":24819532359,
+                "full":true,
+                "b":[["1.3623","477"]],
+                "a":[["1.3624","312"]]
+            },
+            "time_ms":1772858041161
+        }"#;
+        let empty_delta = r#"{
+            "channel":"futures.obu",
+            "event":"update",
+            "result":{
+                "t":1772858041200,
+                "s":"ob.XRP_USDT.50",
+                "U":24819532360,
+                "u":24819532360,
+                "b":[],
+                "a":[]
+            },
+            "time_ms":1772858041201
+        }"#;
+        let mut book = GateBook::<16>::new(
+            "XRP_USDT",
+            GateBook::<16>::PRICE_SCALE,
+            GateBook::<16>::QTY_SCALE,
+            1.0,
+        );
+
+        assert_eq!(
+            events_for(snapshot, &mut book),
+            vec![("orderbook", 1.36235)]
+        );
+        let snapshot_ts = book.last_ts();
+
+        let delta_events = events_for(empty_delta, &mut book);
+        assert_eq!(delta_events, vec![("orderbook", 1.36235)]);
+        assert!(book.last_ts() > snapshot_ts);
+    }
 }
 
 // Update BBO store for Gate from futures.book_ticker
 pub fn update_bbo_store(s: &str, store: &mut BboStore, qty_multiplier: f64) -> bool {
-    if let Ok(raw) = serde_json::from_str::<Value>(s) {
-        if raw.get("channel").and_then(|v| v.as_str()) == Some("futures.book_ticker") {
-            if let Some(obj) = first_result_object(&raw) {
-                let bid = obj
-                    .get("b")
-                    .or_else(|| obj.get("bid"))
-                    .and_then(as_f64)
-                    .or_else(|| find_first_string_number(s, &["b", "bid"]));
-                let ask = obj
-                    .get("a")
-                    .or_else(|| obj.get("ask"))
-                    .and_then(as_f64)
-                    .or_else(|| find_first_string_number(s, &["a", "ask"]));
-                if let (Some(b), Some(a)) = (bid, ask) {
-                    let bid_qty = obj
-                        .get("B")
-                        .or_else(|| obj.get("bid_size"))
-                        .or_else(|| obj.get("bidSize"))
-                        .and_then(as_f64)
-                        .unwrap_or(0.0);
-                    let ask_qty = obj
-                        .get("A")
-                        .or_else(|| obj.get("ask_size"))
-                        .or_else(|| obj.get("askSize"))
-                        .and_then(as_f64)
-                        .unwrap_or(0.0);
-                    let ts_ms = obj
-                        .get("t")
-                        .and_then(as_u64)
-                        .or_else(|| raw.get("time_ms").and_then(as_u64))
-                        .unwrap_or(0);
-                    let ts_ns = ms_to_ns(ts_ms);
-                    let system_ts_ns = raw.get("time_ms").and_then(as_u64).map(ms_to_ns);
-                    let symbol = obj
-                        .get("contract")
-                        .or_else(|| obj.get("symbol"))
-                        .or_else(|| obj.get("s"))
-                        .and_then(|v| v.as_str())
-                        .or_else(|| raw.get("contract").and_then(|v| v.as_str()))
-                        .or_else(|| find_json_string(s, "contract"))
-                        .or_else(|| find_json_string(s, "symbol"))
-                        .or_else(|| find_json_string(s, "s"));
-                    if let Some(symbol) = symbol {
-                        store.update(
-                            symbol,
-                            b,
-                            bid_qty * qty_multiplier,
-                            a,
-                            ask_qty * qty_multiplier,
-                            ts_ns,
-                            system_ts_ns,
-                        );
-                        return true;
-                    }
-                }
+    let raw = match serde_json::from_str::<Value>(s) {
+        Ok(raw) => raw,
+        Err(err) => {
+            log_parse_drop("gate_collector", "json", &err, s);
+            return false;
+        }
+    };
+    if raw.get("channel").and_then(|v| v.as_str()) == Some("futures.book_ticker") {
+        if let Some(event) = event_name(&raw) {
+            if event != "update" {
+                return false;
             }
+        }
+        if let Some(obj) = first_result_object(&raw) {
+            let bid = match obj.get("b").or_else(|| obj.get("bid")).and_then(as_f64) {
+                Some(bid) => bid,
+                None => {
+                    log_parse_drop("gate_collector", "missing_bid", &"missing bid", s);
+                    return false;
+                }
+            };
+            let ask = match obj.get("a").or_else(|| obj.get("ask")).and_then(as_f64) {
+                Some(ask) => ask,
+                None => {
+                    log_parse_drop("gate_collector", "missing_ask", &"missing ask", s);
+                    return false;
+                }
+            };
+            let bid_qty = match obj
+                .get("B")
+                .or_else(|| obj.get("bid_size"))
+                .or_else(|| obj.get("bidSize"))
+                .and_then(as_f64)
+            {
+                Some(qty) => qty,
+                None => {
+                    log_parse_drop("gate_collector", "missing_bid_qty", &"missing bid qty", s);
+                    return false;
+                }
+            };
+            let ask_qty = match obj
+                .get("A")
+                .or_else(|| obj.get("ask_size"))
+                .or_else(|| obj.get("askSize"))
+                .and_then(as_f64)
+            {
+                Some(qty) => qty,
+                None => {
+                    log_parse_drop("gate_collector", "missing_ask_qty", &"missing ask qty", s);
+                    return false;
+                }
+            };
+            let ts_ms = match obj
+                .get("t")
+                .and_then(as_u64)
+                .or_else(|| raw.get("time_ms").and_then(as_u64))
+            {
+                Some(ts_ms) if ts_ms > 0 => ts_ms,
+                _ => {
+                    log_parse_drop("gate_collector", "missing_ts", &"missing ts", s);
+                    return false;
+                }
+            };
+            let ts_ns = ms_to_ns(ts_ms);
+            let system_ts_ns = raw.get("time_ms").and_then(as_u64).map(ms_to_ns);
+            let symbol = match obj
+                .get("contract")
+                .or_else(|| obj.get("symbol"))
+                .or_else(|| obj.get("s"))
+                .and_then(|v| v.as_str())
+                .or_else(|| raw.get("contract").and_then(|v| v.as_str()))
+            {
+                Some(symbol) => symbol,
+                None => {
+                    log_parse_drop("gate_collector", "missing_symbol", &"missing symbol", s);
+                    return false;
+                }
+            };
+            store.update(
+                symbol,
+                bid,
+                bid_qty * qty_multiplier,
+                ask,
+                ask_qty * qty_multiplier,
+                ts_ns,
+                system_ts_ns,
+            );
+            return true;
         }
     }
     false
@@ -352,60 +537,92 @@ pub fn update_trades<const N: usize>(
     trades: &mut FixedTrades<N>,
     qty_multiplier: f64,
 ) -> usize {
-    if let Ok(raw) = serde_json::from_str::<Value>(s) {
-        if raw.get("channel").and_then(|v| v.as_str()) == Some("futures.trades") {
-            let mut inserted = 0usize;
-            if let Some(entries) = raw.get("result").and_then(|res| {
-                if res.is_array() {
-                    Some(res.as_array().unwrap())
-                } else {
-                    None
-                }
-            }) {
-                for entry in entries {
-                    let price = entry
-                        .get("price")
-                        .or_else(|| entry.get("p"))
-                        .and_then(as_f64)
-                        .or_else(|| find_first_string_number(s, &["price", "p"]));
-                    let size = entry
-                        .get("size")
-                        .or_else(|| entry.get("v"))
-                        .or_else(|| entry.get("amount"))
-                        .and_then(as_f64)
-                        .unwrap_or(0.0);
-                    if let Some(px) = price {
-                        let px_i = (px * PRICE_SCALE).round() as Price;
-                        let qty_i = (size * qty_multiplier * QTY_SCALE).round() as Qty;
-                        let ts_ms = entry
-                            .get("create_time_ms")
-                            .or_else(|| entry.get("t"))
-                            .or_else(|| entry.get("ts"))
-                            .and_then(as_u64)
-                            .or_else(|| raw.get("time_ms").and_then(as_u64))
-                            .unwrap_or(0);
-                        let ts_ns = ms_to_ns(ts_ms);
-                        let system_ts_ns = raw.get("time_ms").and_then(as_u64).map(ms_to_ns);
-                        let seq = entry
-                            .get("id")
-                            .or_else(|| entry.get("trade_id"))
-                            .and_then(as_u64)
-                            .unwrap_or(0) as Seq;
-                        let is_buyer_maker = size < 0.0;
-                        trades.push(Trade::new(
-                            px_i,
-                            qty_i,
-                            ts_ns,
-                            seq,
-                            is_buyer_maker,
-                            system_ts_ns,
-                        ));
-                        inserted += 1;
-                    }
-                }
-            }
-            return inserted;
+    let raw = match serde_json::from_str::<Value>(s) {
+        Ok(raw) => raw,
+        Err(err) => {
+            log_parse_drop("gate_collector", "json", &err, s);
+            return 0;
         }
+    };
+    if raw.get("channel").and_then(|v| v.as_str()) == Some("futures.trades") {
+        if let Some(event) = event_name(&raw) {
+            if event != "update" {
+                return 0;
+            }
+        }
+        let mut inserted = 0usize;
+        if let Some(entries) = raw.get("result").and_then(|res| {
+            if res.is_array() {
+                Some(res.as_array().expect("validated array above"))
+            } else {
+                None
+            }
+        }) {
+            for entry in entries {
+                let price = match entry
+                    .get("price")
+                    .or_else(|| entry.get("p"))
+                    .and_then(as_f64)
+                {
+                    Some(price) => price,
+                    None => {
+                        log_parse_drop("gate_collector", "missing_price", &"missing price", s);
+                        continue;
+                    }
+                };
+                let size = match entry
+                    .get("size")
+                    .or_else(|| entry.get("v"))
+                    .or_else(|| entry.get("amount"))
+                    .and_then(as_f64)
+                {
+                    Some(size) => size,
+                    None => {
+                        log_parse_drop("gate_collector", "missing_size", &"missing size", s);
+                        continue;
+                    }
+                };
+                let ts_ms = match entry
+                    .get("create_time_ms")
+                    .or_else(|| entry.get("t"))
+                    .or_else(|| entry.get("ts"))
+                    .and_then(as_u64)
+                    .or_else(|| raw.get("time_ms").and_then(as_u64))
+                {
+                    Some(ts_ms) if ts_ms > 0 => ts_ms,
+                    _ => {
+                        log_parse_drop("gate_collector", "missing_ts", &"missing ts", s);
+                        continue;
+                    }
+                };
+                let seq = match entry
+                    .get("id")
+                    .or_else(|| entry.get("trade_id"))
+                    .and_then(as_u64)
+                {
+                    Some(seq) if seq > 0 => seq as Seq,
+                    _ => {
+                        log_parse_drop("gate_collector", "missing_seq", &"missing seq", s);
+                        continue;
+                    }
+                };
+                let px_i = (price * PRICE_SCALE).round() as Price;
+                let qty_i = (size * qty_multiplier * QTY_SCALE).round() as Qty;
+                let ts_ns = ms_to_ns(ts_ms);
+                let system_ts_ns = raw.get("time_ms").and_then(as_u64).map(ms_to_ns);
+                let is_buyer_maker = size < 0.0;
+                trades.push(Trade::new(
+                    px_i,
+                    qty_i,
+                    ts_ns,
+                    seq,
+                    is_buyer_maker,
+                    system_ts_ns,
+                ));
+                inserted += 1;
+            }
+        }
+        return inserted;
     }
     0
 }

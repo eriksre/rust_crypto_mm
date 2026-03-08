@@ -259,12 +259,12 @@ impl<const N: usize> BitgetEngine<N> {
                         entry.open_interest_value = Some(oi * mark);
                     }
 
-                    let seq = if ticker.ticker.seq != 0 {
-                        ticker.ticker.seq
-                    } else {
-                        entry.seq.wrapping_add(1)
-                    };
-                    entry.seq = seq;
+                    assert!(
+                        ticker.ticker.seq != 0,
+                        "Bitget ticker collector emitted zero seq for symbol {}",
+                        self.symbol
+                    );
+                    entry.seq = ticker.ticker.seq;
 
                     let ticker_ts = if ticker.ticker.ts != 0 {
                         ticker.ticker.ts

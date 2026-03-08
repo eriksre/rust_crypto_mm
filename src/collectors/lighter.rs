@@ -268,10 +268,20 @@ pub fn update_tickers(
         snapshot.open_interest_value = Some(oi * mark);
     }
 
-    if let Some(ts_raw) = msg.market_stats.funding_timestamp {
-        snapshot.ticker.ts = ts_from_exchange(ts_raw);
-        snapshot.ticker.seq = ts_raw;
-    }
+    let ts_raw = match msg.market_stats.funding_timestamp {
+        Some(ts_raw) if ts_raw > 0 => ts_raw,
+        _ => {
+            log_parse_drop(
+                "lighter_collector",
+                "missing_ts",
+                &"missing funding_timestamp",
+                sample.as_str(),
+            );
+            return None;
+        }
+    };
+    snapshot.ticker.ts = ts_from_exchange(ts_raw);
+    snapshot.ticker.seq = ts_raw;
 
     let stored = store.update(symbol.to_string(), snapshot);
     Some((symbol.to_string(), stored))

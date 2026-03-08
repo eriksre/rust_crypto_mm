@@ -174,6 +174,7 @@ pub struct QuotePlan {
     pub intents: Vec<QuoteIntent>,
     pub planned_at: Instant,
     pub reference_meta: Option<ReferenceMeta>,
+    pub prior_submit_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -498,6 +499,7 @@ impl SimpleQuoteStrategy {
             intents,
             planned_at: now,
             reference_meta: self.latest_meta.clone(),
+            prior_submit_at: None,
         })
     }
 
@@ -539,6 +541,7 @@ impl SimpleQuoteStrategy {
         match report.status {
             OrderStatus::Filled | OrderStatus::Canceled | OrderStatus::Rejected => {
                 self.pending_cancels.remove(&report.client_order_id);
+                self.scheduled_cancels.remove(&report.client_order_id);
                 self.active_orders
                     .retain(|id| id != &report.client_order_id);
                 self.active_quotes.remove(&report.client_order_id);
@@ -570,6 +573,21 @@ impl SimpleQuoteStrategy {
                 }
             }
         }
+    }
+
+    pub fn rollback_plan(&mut self, plan: &QuotePlan) {
+        for id in &plan.cancels {
+            self.pending_cancels.remove(id);
+            self.scheduled_cancels.insert(id.clone());
+        }
+        for intent in &plan.intents {
+            self.pending_cancels.remove(&intent.client_order_id);
+            self.scheduled_cancels.remove(&intent.client_order_id);
+            self.active_orders
+                .retain(|id| id != &intent.client_order_id);
+            self.active_quotes.remove(&intent.client_order_id);
+        }
+        self.needs_requote = true;
     }
 
     fn update_volatility(&mut self, mid: f64) {
@@ -695,5 +713,153 @@ impl SimpleQuoteStrategy {
             side_tag.to_lowercase(),
             self.next_id
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::base_classes::types::Side;
+    use crate::execution::Venue;
+
+    fn test_config() -> QuoteConfig {
+        QuoteConfig {
+            venue: Venue::Lighter,
+            symbol: "XMR_USDT".to_string(),
+            size: SizeSpec::Fixed(1.0),
+            quote_interval_ms: 200,
+            min_tick: 0.1,
+            min_half_spread_bps: 10.0,
+            volatility_ewma_alpha: 0.2,
+            volatility_multiplier: 1.5,
+            fee_bps: 1.0,
+            venue_buffer_bps: 1.0,
+            reprice_fraction: 0.25,
+            max_age_ms: 5_000,
+            cross_guard_ticks: 1,
+            cancellation_delay_ms: 200,
+            use_reference_bbo: false,
+            quote_at_reference_bbo: false,
+        }
+    }
+
+    #[test]
+    fn rollback_plan_restores_cancel_and_removes_unsent_quotes() {
+        let mut strategy = SimpleQuoteStrategy::new(test_config(), 1.0);
+        let existing_id = ClientOrderId::new("sq-lighter-b-1");
+        let new_id = ClientOrderId::new("sq-lighter-s-2");
+        let now = Instant::now();
+
+        strategy.active_orders.push(existing_id.clone());
+        strategy.active_quotes.insert(
+            existing_id.clone(),
+            ActiveQuote {
+                side: Side::Bid,
+                price: 100.0,
+                placed_at: now - Duration::from_secs(1),
+                delayed_cancel_since: None,
+            },
+        );
+
+        let plan = QuotePlan {
+            reference_price: 100.0,
+            reference_best_bid: Some(99.9),
+            reference_best_ask: Some(100.1),
+            cancels: vec![existing_id.clone()],
+            intents: vec![QuoteIntent::new(
+                Venue::Lighter,
+                "XMR_USDT",
+                Side::Ask,
+                100.2,
+                1.0,
+                TimeInForce::PostOnly,
+                new_id.clone(),
+            )],
+            planned_at: now,
+            reference_meta: None,
+            prior_submit_at: None,
+        };
+
+        strategy.commit_plan(&plan);
+        strategy.rollback_plan(&plan);
+
+        assert!(strategy.scheduled_cancels.contains(&existing_id));
+        assert!(!strategy.pending_cancels.contains(&existing_id));
+        assert!(strategy.active_quotes.contains_key(&existing_id));
+        assert!(!strategy.active_quotes.contains_key(&new_id));
+        assert!(!strategy.active_orders.iter().any(|id| id == &new_id));
+        assert!(strategy.needs_requote);
+    }
+
+    #[test]
+    fn rollback_plan_clears_stale_cancel_state_for_failed_intent() {
+        let mut strategy = SimpleQuoteStrategy::new(test_config(), 1.0);
+        let new_id = ClientOrderId::new("sq-lighter-b-9");
+        let now = Instant::now();
+
+        let plan = QuotePlan {
+            reference_price: 100.0,
+            reference_best_bid: Some(99.9),
+            reference_best_ask: Some(100.1),
+            cancels: Vec::new(),
+            intents: vec![QuoteIntent::new(
+                Venue::Lighter,
+                "XMR_USDT",
+                Side::Bid,
+                99.95,
+                1.0,
+                TimeInForce::PostOnly,
+                new_id.clone(),
+            )],
+            planned_at: now,
+            reference_meta: None,
+            prior_submit_at: None,
+        };
+
+        strategy.commit_plan(&plan);
+        strategy.scheduled_cancels.insert(new_id.clone());
+        strategy.pending_cancels.insert(new_id.clone());
+
+        strategy.rollback_plan(&plan);
+
+        assert!(!strategy.scheduled_cancels.contains(&new_id));
+        assert!(!strategy.pending_cancels.contains(&new_id));
+        assert!(!strategy.active_quotes.contains_key(&new_id));
+        assert!(!strategy.active_orders.iter().any(|id| id == &new_id));
+    }
+
+    #[test]
+    fn rejected_report_clears_stale_scheduled_cancel_state() {
+        let mut strategy = SimpleQuoteStrategy::new(test_config(), 1.0);
+        let order_id = ClientOrderId::new("sq-lighter-s-15");
+        let now = Instant::now();
+
+        strategy.active_orders.push(order_id.clone());
+        strategy.active_quotes.insert(
+            order_id.clone(),
+            ActiveQuote {
+                side: Side::Ask,
+                price: 100.0,
+                placed_at: now,
+                delayed_cancel_since: None,
+            },
+        );
+        strategy.scheduled_cancels.insert(order_id.clone());
+        strategy.pending_cancels.insert(order_id.clone());
+
+        strategy.handle_report(&ExecutionReport {
+            client_order_id: order_id.clone(),
+            exchange_order_id: None,
+            status: OrderStatus::Rejected,
+            filled_qty: 0.0,
+            avg_fill_price: None,
+            ts: None,
+        });
+
+        assert!(!strategy.scheduled_cancels.contains(&order_id));
+        assert!(!strategy.pending_cancels.contains(&order_id));
+        assert!(!strategy.active_quotes.contains_key(&order_id));
+        assert!(!strategy.active_orders.iter().any(|id| id == &order_id));
+        assert!(strategy.needs_requote);
     }
 }

@@ -85,6 +85,25 @@ impl InventoryTracker {
         added
     }
 
+    pub fn forget_unconfirmed_orders(&mut self, ids: &[ClientOrderId]) -> Vec<ClientOrderId> {
+        let mut removed = Vec::new();
+        for id in ids {
+            let Some(entry) = self.orders.get(id) else {
+                continue;
+            };
+            if entry.filled_qty > f64::EPSILON {
+                eprintln!(
+                    "ERROR: refusing to forget order {} with non-zero filled_qty={}",
+                    id.0, entry.filled_qty
+                );
+                continue;
+            }
+            self.orders.remove(id);
+            removed.push(id.clone());
+        }
+        removed
+    }
+
     pub fn apply_report(&mut self, report: &ExecutionReport) -> InventoryReportOutcome {
         let contract_size = self.contract_size;
         if let Some(entry) = self.orders.get_mut(&report.client_order_id) {
@@ -270,6 +289,26 @@ mod tests {
             }
             other => panic!("unexpected outcome: {:?}", other),
         }
+    }
+
+    #[test]
+    fn forget_unconfirmed_orders_drops_zero_fill_entries_only() {
+        let mut tracker = InventoryTracker::new(10.0, 0.0);
+        let intents = vec![
+            intent("order-b-1", Side::Bid, 10.0),
+            intent("order-s-2", Side::Ask, 10.0),
+        ];
+        tracker.record_orders(&intents);
+
+        let first_id = intents[0].client_order_id.clone();
+        let second_id = intents[1].client_order_id.clone();
+        let _ = tracker.apply_report(&report(&second_id.0, OrderStatus::PartiallyFilled, 5.0));
+
+        let removed = tracker.forget_unconfirmed_orders(&[first_id.clone(), second_id.clone()]);
+
+        assert_eq!(removed, vec![first_id.clone()]);
+        assert!(!tracker.orders.contains_key(&first_id));
+        assert!(tracker.orders.contains_key(&second_id));
     }
 
     #[test]

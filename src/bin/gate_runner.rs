@@ -1,5 +1,6 @@
 #![cfg(feature = "gate_exec")]
 
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -98,6 +99,43 @@ fn now_unix_ns() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos()
+}
+
+fn extract_unknown_order_ids(err_msg: &str) -> Vec<ClientOrderId> {
+    const PREFIX: &str = "unknown order ";
+    let mut ids = Vec::new();
+    let mut seen = HashSet::new();
+    let mut remaining = err_msg;
+
+    while let Some(idx) = remaining.find(PREFIX) {
+        let candidate = &remaining[idx + PREFIX.len()..];
+        let raw_id = candidate
+            .chars()
+            .take_while(|ch| {
+                !ch.is_whitespace() && !matches!(ch, ',' | ')' | '(' | ']' | '[' | '"' | '\'')
+            })
+            .collect::<String>();
+        if !raw_id.is_empty() && seen.insert(raw_id.clone()) {
+            ids.push(ClientOrderId::new(raw_id));
+        }
+        remaining = candidate;
+    }
+
+    ids
+}
+
+fn stale_unknown_order_reports(err_msg: &str) -> Vec<ExecutionReport> {
+    extract_unknown_order_ids(err_msg)
+        .into_iter()
+        .map(|client_order_id| ExecutionReport {
+            client_order_id,
+            exchange_order_id: None,
+            status: OrderStatus::Rejected,
+            filled_qty: 0.0,
+            avg_fill_price: None,
+            ts: None,
+        })
+        .collect()
 }
 
 #[derive(Clone)]
@@ -288,6 +326,37 @@ mod markout_tests {
         assert_eq!(sign_corrected_markout_bps(None, Some(1.0)), None);
         assert_eq!(sign_corrected_markout_bps(Some(Side::Bid), None), None);
     }
+
+    #[test]
+    fn extracts_unknown_order_ids_from_gateway_errors() {
+        let err = "cancel+submit failed: unknown order mf-lighter-s-15, later unknown order mf-lighter-b-16)";
+        let ids = extract_unknown_order_ids(err);
+        assert_eq!(
+            ids,
+            vec![
+                ClientOrderId::new("mf-lighter-s-15"),
+                ClientOrderId::new("mf-lighter-b-16"),
+            ]
+        );
+    }
+
+    #[test]
+    fn stale_unknown_order_reports_are_terminal_rejections() {
+        let reports = stale_unknown_order_reports(
+            "submit failed: unknown order mf-lighter-s-15 and unknown order mf-lighter-s-15",
+        );
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0].client_order_id,
+            ClientOrderId::new("mf-lighter-s-15")
+        );
+        assert_eq!(reports[0].status, OrderStatus::Rejected);
+        assert_eq!(reports[0].filled_qty, 0.0);
+        assert!(reports[0].avg_fill_price.is_none());
+        assert!(reports[0].exchange_order_id.is_none());
+        assert!(reports[0].ts.is_none());
+    }
+
 }
 
 const LIGHTER_POSITION_WS_CHANNEL: &str = "account_all_positions/{ACCOUNT_ID}";
@@ -574,9 +643,8 @@ async fn spawn_lighter_position_ws(
                     let msg_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
                     let channel = value.get("channel").and_then(|v| v.as_str()).unwrap_or("");
                     if msg_type == "ping" {
-                        let _ = sink
-                            .send(Message::Text(r#"{"type":"pong"}"#.to_string()))
-                            .await;
+                        let pong = r#"{"type":"pong"}"#.to_string();
+                        let _ = sink.send(Message::Text(pong)).await;
                         continue;
                     }
 
@@ -1463,6 +1531,7 @@ async fn handle_quote_tick(
 
         let intents = plan.intents.clone();
         let cancels = plan.cancels.clone();
+        let rollback_plan = plan.clone();
         let send_start = Instant::now();
         let sent_ts = SystemTime::now();
         let debounce_budget_ms = match config_ref.strategy_kind {
@@ -1568,6 +1637,9 @@ async fn handle_quote_tick(
         let ref_meta_for_send = ref_meta.clone();
         let config_clone = config.clone();
         let order_manager_clone = order_manager.clone();
+        let strategy_for_rollback = strategy.clone();
+        let inventory_for_rollback = inventory.clone();
+        let rollback_plan_for_send = rollback_plan.clone();
         let quote_internal_for_send = quote_internal;
         let debug_clone = debug.clone();
         tokio::spawn(async move {
@@ -1604,6 +1676,55 @@ async fn handle_quote_tick(
                 }
                 Err(err) => {
                     let err_msg = format!("{:#}", err);
+                    {
+                        let mut strategy_guard = strategy_for_rollback.lock();
+                        strategy_guard.rollback_plan(&rollback_plan_for_send);
+                    }
+                    let rolled_back = {
+                        let intent_ids = intents_for_send
+                            .iter()
+                            .map(|intent| intent.client_order_id.clone())
+                            .collect::<Vec<_>>();
+                        let mut inventory_guard = inventory_for_rollback.lock();
+                        inventory_guard.forget_unconfirmed_orders(&intent_ids)
+                    };
+                    if !rolled_back.is_empty() {
+                        debug_clone.warn(|| {
+                            format!(
+                                "rolled back unconfirmed inventory orders: {}",
+                                rolled_back
+                                    .iter()
+                                    .map(|id| id.0.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )
+                        });
+                    }
+                    let stale_reports = stale_unknown_order_reports(&err_msg);
+                    if !stale_reports.is_empty() {
+                        let stale_ids = stale_reports
+                            .iter()
+                            .map(|report| report.client_order_id.0.as_str())
+                            .collect::<Vec<_>>();
+                        debug_clone.warn(|| {
+                            format!(
+                                "evicting stale local orders after gateway unknown-order failure: {}",
+                                stale_ids.join(", ")
+                            )
+                        });
+                        {
+                            let mut strategy_guard = strategy_for_rollback.lock();
+                            for report in &stale_reports {
+                                strategy_guard.handle_report(report);
+                            }
+                        }
+                        {
+                            let mut inventory_guard = inventory_for_rollback.lock();
+                            for report in &stale_reports {
+                                let _ = inventory_guard.apply_report(report);
+                            }
+                        }
+                    }
                     if cancels_for_send.is_empty() {
                         let intents_copy = intents_for_send.clone();
                         debug_clone.error(move || {

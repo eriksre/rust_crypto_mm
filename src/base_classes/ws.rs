@@ -278,6 +278,24 @@ fn pin_to_core(_core_idx: usize) {
 
 // ---- tungstenite (sync) backend ----
 #[cfg(feature = "ws_tungstenite")]
+fn send_tungstenite_message<S>(
+    socket: &mut tungstenite::WebSocket<S>,
+    message: tungstenite::Message,
+    label: &str,
+    context: &str,
+) -> bool
+where
+    S: std::io::Read + std::io::Write,
+{
+    if let Err(err) = socket.send(message) {
+        eprintln!("WS[{label}] {context} failed: {err}");
+        false
+    } else {
+        true
+    }
+}
+
+#[cfg(feature = "ws_tungstenite")]
 fn run_ws_tungstenite<E, const N: usize>(
     handler: E,
     producer: Producer<E::Out, N>,
@@ -293,7 +311,6 @@ fn run_ws_tungstenite<E, const N: usize>(
     let max_backoff = Duration::from_millis(3_000);
     let mut backoff = initial_backoff;
     loop {
-        // connect
         let (mut socket, _response) = match connect(url::Url::parse(&url).unwrap()) {
             Ok(ok) => ok,
             Err(err) => {
@@ -306,81 +323,150 @@ fn run_ws_tungstenite<E, const N: usize>(
                 continue;
             }
         };
-        backoff = initial_backoff; // reset
+        backoff = initial_backoff;
 
-        // Seq gate per-session
         const SEQ_SLOTS: usize = 256;
         let mut seq_gate: SequenceGate<SEQ_SLOTS> = SequenceGate::new();
 
-        // initial subscriptions
+        let mut reconnect_after_delay = false;
         for sub in handler.initial_subscriptions() {
-            if let Err(e) = socket.send(Message::Text(sub.clone())) {
-                eprintln!("WS[{label}] send error: {e}");
+            if !send_tungstenite_message(
+                &mut socket,
+                Message::Text(sub.clone()),
+                &label,
+                "initial subscription",
+            ) {
+                reconnect_after_delay = true;
+                break;
             }
         }
+        if reconnect_after_delay {
+            std::thread::sleep(backoff);
+            backoff = std::cmp::min(backoff * 2, max_backoff);
+            continue;
+        }
 
-        // Heartbeats
         let hb_interval = Duration::from_secs(20);
         let mut last_hb;
-        let _ = socket.send(Message::Ping(Vec::new()));
+        if !send_tungstenite_message(
+            &mut socket,
+            Message::Ping(Vec::new()),
+            &label,
+            "initial ping",
+        ) {
+            std::thread::sleep(backoff);
+            backoff = std::cmp::min(backoff * 2, max_backoff);
+            continue;
+        }
         last_hb = Instant::now();
 
         let static_app_hb = handler.app_heartbeat();
         let dyn_app_hb_interval = handler.app_heartbeat_interval();
         let mut last_app_hb = Instant::now();
-        if let Some(_) = dyn_app_hb_interval {
+        if dyn_app_hb_interval.is_some() {
             if let Some(payload) = handler.build_app_heartbeat() {
-                match payload {
-                    HeartbeatPayload::Text(s) => {
-                        let _ = socket.send(Message::Text(s));
-                    }
-                    HeartbeatPayload::Binary(b) => {
-                        let _ = socket.send(Message::Binary(b));
-                    }
+                let ok = match payload {
+                    HeartbeatPayload::Text(s) => send_tungstenite_message(
+                        &mut socket,
+                        Message::Text(s),
+                        &label,
+                        "initial app heartbeat",
+                    ),
+                    HeartbeatPayload::Binary(b) => send_tungstenite_message(
+                        &mut socket,
+                        Message::Binary(b),
+                        &label,
+                        "initial app heartbeat",
+                    ),
+                };
+                if !ok {
+                    std::thread::sleep(backoff);
+                    backoff = std::cmp::min(backoff * 2, max_backoff);
+                    continue;
                 }
                 last_app_hb = Instant::now();
             }
         } else if let Some(hb) = &static_app_hb {
-            match &hb.payload {
-                HeartbeatPayload::Text(s) => {
-                    let _ = socket.send(Message::Text(s.clone()));
-                }
-                HeartbeatPayload::Binary(b) => {
-                    let _ = socket.send(Message::Binary(b.clone()));
-                }
+            let ok = match &hb.payload {
+                HeartbeatPayload::Text(s) => send_tungstenite_message(
+                    &mut socket,
+                    Message::Text(s.clone()),
+                    &label,
+                    "initial app heartbeat",
+                ),
+                HeartbeatPayload::Binary(b) => send_tungstenite_message(
+                    &mut socket,
+                    Message::Binary(b.clone()),
+                    &label,
+                    "initial app heartbeat",
+                ),
+            };
+            if !ok {
+                std::thread::sleep(backoff);
+                backoff = std::cmp::min(backoff * 2, max_backoff);
+                continue;
             }
             last_app_hb = Instant::now();
         }
 
-        // Session loop
         loop {
             if last_hb.elapsed() >= hb_interval {
-                let _ = socket.send(Message::Ping(Vec::new()));
+                if !send_tungstenite_message(&mut socket, Message::Ping(Vec::new()), &label, "ping")
+                {
+                    std::thread::sleep(backoff);
+                    backoff = std::cmp::min(backoff * 2, max_backoff);
+                    backoff += Duration::from_millis(25);
+                    break;
+                }
                 last_hb = Instant::now();
             }
             if let Some(interval) = dyn_app_hb_interval {
                 if last_app_hb.elapsed() >= Duration::from_secs(interval) {
                     if let Some(payload) = handler.build_app_heartbeat() {
-                        match payload {
-                            HeartbeatPayload::Text(s) => {
-                                let _ = socket.send(Message::Text(s));
-                            }
-                            HeartbeatPayload::Binary(b) => {
-                                let _ = socket.send(Message::Binary(b));
-                            }
+                        let ok = match payload {
+                            HeartbeatPayload::Text(s) => send_tungstenite_message(
+                                &mut socket,
+                                Message::Text(s),
+                                &label,
+                                "app heartbeat",
+                            ),
+                            HeartbeatPayload::Binary(b) => send_tungstenite_message(
+                                &mut socket,
+                                Message::Binary(b),
+                                &label,
+                                "app heartbeat",
+                            ),
+                        };
+                        if !ok {
+                            std::thread::sleep(backoff);
+                            backoff = std::cmp::min(backoff * 2, max_backoff);
+                            backoff += Duration::from_millis(25);
+                            break;
                         }
                     }
                     last_app_hb = Instant::now();
                 }
             } else if let Some(hb) = &static_app_hb {
                 if last_app_hb.elapsed() >= Duration::from_secs(hb.interval_secs) {
-                    match &hb.payload {
-                        HeartbeatPayload::Text(s) => {
-                            let _ = socket.send(Message::Text(s.clone()));
-                        }
-                        HeartbeatPayload::Binary(b) => {
-                            let _ = socket.send(Message::Binary(b.clone()));
-                        }
+                    let ok = match &hb.payload {
+                        HeartbeatPayload::Text(s) => send_tungstenite_message(
+                            &mut socket,
+                            Message::Text(s.clone()),
+                            &label,
+                            "app heartbeat",
+                        ),
+                        HeartbeatPayload::Binary(b) => send_tungstenite_message(
+                            &mut socket,
+                            Message::Binary(b.clone()),
+                            &label,
+                            "app heartbeat",
+                        ),
+                    };
+                    if !ok {
+                        std::thread::sleep(backoff);
+                        backoff = std::cmp::min(backoff * 2, max_backoff);
+                        backoff += Duration::from_millis(25);
+                        break;
                     }
                     last_app_hb = Instant::now();
                 }
@@ -392,7 +478,17 @@ fn run_ws_tungstenite<E, const N: usize>(
                     match msg {
                         Message::Text(txt) => {
                             if let Some(reply) = gate_ping_reply(&txt) {
-                                let _ = socket.send(Message::Text(reply));
+                                if !send_tungstenite_message(
+                                    &mut socket,
+                                    Message::Text(reply),
+                                    &label,
+                                    "ping reply",
+                                ) {
+                                    std::thread::sleep(backoff);
+                                    backoff = std::cmp::min(backoff * 2, max_backoff);
+                                    backoff += Duration::from_millis(25);
+                                    break;
+                                }
                                 continue;
                             }
                             if let Some((k, s)) = handler.sequence_key_text(&txt) {
@@ -423,7 +519,17 @@ fn run_ws_tungstenite<E, const N: usize>(
                             }
                         }
                         Message::Ping(p) => {
-                            let _ = socket.send(Message::Pong(p));
+                            if !send_tungstenite_message(
+                                &mut socket,
+                                Message::Pong(p),
+                                &label,
+                                "pong reply",
+                            ) {
+                                std::thread::sleep(backoff);
+                                backoff = std::cmp::min(backoff * 2, max_backoff);
+                                backoff += Duration::from_millis(25);
+                                break;
+                            }
                         }
                         Message::Pong(_) => {
                             last_hb = Instant::now();
@@ -440,7 +546,7 @@ fn run_ws_tungstenite<E, const N: usize>(
                     std::thread::sleep(backoff);
                     backoff = std::cmp::min(backoff * 2, max_backoff);
                     backoff += Duration::from_millis(25);
-                    break; // reconnect
+                    break;
                 }
             }
         }
@@ -449,8 +555,11 @@ fn run_ws_tungstenite<E, const N: usize>(
 
 // ---- fastwebsockets (async) backend ----
 #[cfg(all(feature = "ws_fast", not(feature = "ws_tungstenite")))]
-fn run_ws_fast<E, const N: usize>(handler: E, producer: Producer<E::Out, N>)
-where
+fn run_ws_fast<E, const N: usize>(
+    handler: E,
+    producer: Producer<E::Out, N>,
+    signal: Option<FeedSignal>,
+) where
     E: ExchangeHandler,
 {
     use bytes::Bytes;
@@ -461,11 +570,13 @@ where
     use hyper::rt::Executor;
     use hyper_util::client::legacy::Client as HyperClient;
     use hyper_util::rt::TokioExecutor;
+    use std::time::Instant;
     use tokio::net::TcpStream;
     use tokio::runtime::Builder as RtBuilder;
-    use tokio::time::{Duration, Instant, interval};
+    use tokio::time::{Duration, interval};
 
     let url = handler.url().to_string();
+    let label = handler.label();
 
     let rt = RtBuilder::new_multi_thread()
         .enable_all()
@@ -535,8 +646,19 @@ where
             let mut ws = FragmentCollector::new(ws);
 
             // send initial subscriptions
+            let mut initial_send_failed = false;
             for sub in handler.initial_subscriptions() {
-                if let Err(e) = ws.write_text(sub).await { eprintln!("[{label}] send sub: {e}"); }
+                if let Err(err) = ws.write_text(sub).await {
+                    eprintln!("[{label}] initial subscription failed: {err}");
+                    initial_send_failed = true;
+                    break;
+                }
+            }
+            if initial_send_failed {
+                tokio::time::sleep(backoff).await;
+                backoff = std::cmp::min(backoff * 2, max_backoff);
+                backoff += Duration::from_millis(25);
+                continue;
             }
 
             // Heartbeat timers
@@ -549,15 +671,29 @@ where
             // initial app heartbeat
             if dyn_app_hb_interval.is_some() {
                 if let Some(payload) = handler.build_app_heartbeat() {
-                    match payload {
-                        HeartbeatPayload::Text(s) => { let _ = ws.write_text(s).await; }
-                        HeartbeatPayload::Binary(b) => { let _ = ws.write_binary(Bytes::from(b)).await; }
+                    let result = match payload {
+                        HeartbeatPayload::Text(s) => ws.write_text(s).await,
+                        HeartbeatPayload::Binary(b) => ws.write_binary(Bytes::from(b)).await,
+                    };
+                    if let Err(err) = result {
+                        eprintln!("[{label}] initial app heartbeat failed: {err}");
+                        tokio::time::sleep(backoff).await;
+                        backoff = std::cmp::min(backoff * 2, max_backoff);
+                        backoff += Duration::from_millis(25);
+                        continue;
                     }
                 }
             } else if let Some(hb) = &static_app_hb {
-                match &hb.payload {
-                    HeartbeatPayload::Text(s) => { let _ = ws.write_text(s.clone()).await; }
-                    HeartbeatPayload::Binary(b) => { let _ = ws.write_binary(Bytes::from(b.clone())).await; }
+                let result = match &hb.payload {
+                    HeartbeatPayload::Text(s) => ws.write_text(s.clone()).await,
+                    HeartbeatPayload::Binary(b) => ws.write_binary(Bytes::from(b.clone())).await,
+                };
+                if let Err(err) = result {
+                    eprintln!("[{label}] initial app heartbeat failed: {err}");
+                    tokio::time::sleep(backoff).await;
+                    backoff = std::cmp::min(backoff * 2, max_backoff);
+                    backoff += Duration::from_millis(25);
+                    continue;
                 }
             }
 
@@ -572,7 +708,11 @@ where
                                     OpCode::Text => {
                                         if let Ok(s) = std::str::from_utf8(&frame.payload) {
                                             if let Some(reply) = gate_ping_reply(s) {
-                                                if ws.write_text(reply).await.is_err() {
+                                                if let Err(err) = ws.write_text(reply).await {
+                                                    eprintln!("[{label}] ping reply failed: {err}");
+                                                    tokio::time::sleep(backoff).await;
+                                                    backoff = std::cmp::min(backoff * 2, max_backoff);
+                                                    backoff += Duration::from_millis(25);
                                                     break;
                                                 }
                                                 continue;
@@ -598,7 +738,15 @@ where
                                         }
                                     }
                                     OpCode::Close => break,
-                                    OpCode::Ping => { let _ = ws.write_pong(Bytes::new()).await; }
+                                    OpCode::Ping => {
+                                        if let Err(err) = ws.write_pong(Bytes::new()).await {
+                                            eprintln!("[{label}] pong reply failed: {err}");
+                                            tokio::time::sleep(backoff).await;
+                                            backoff = std::cmp::min(backoff * 2, max_backoff);
+                                            backoff += Duration::from_millis(25);
+                                            break;
+                                        }
+                                    }
                                     _ => {}
                                 }
                             }
@@ -614,19 +762,41 @@ where
                             }
                         }
                     }
-                    _ = hb.tick() => { let _ = ws.write_ping(Bytes::new()).await; }
+                    _ = hb.tick() => {
+                        if let Err(err) = ws.write_ping(Bytes::new()).await {
+                            eprintln!("[{label}] ping failed: {err}");
+                            tokio::time::sleep(backoff).await;
+                            backoff = std::cmp::min(backoff * 2, max_backoff);
+                            backoff += Duration::from_millis(25);
+                            break;
+                        }
+                    }
                     _ = async { if let Some(t) = &mut app_hb_timer { t.tick().await; } }, if app_hb_timer.is_some() => {
                         if dyn_app_hb_interval.is_some() {
                             if let Some(payload) = handler.build_app_heartbeat() {
-                                match payload {
-                                    HeartbeatPayload::Text(s) => { let _ = ws.write_text(s).await; }
-                                    HeartbeatPayload::Binary(b) => { let _ = ws.write_binary(Bytes::from(b)).await; }
+                                let result = match payload {
+                                    HeartbeatPayload::Text(s) => ws.write_text(s).await,
+                                    HeartbeatPayload::Binary(b) => ws.write_binary(Bytes::from(b)).await,
+                                };
+                                if let Err(err) = result {
+                                    eprintln!("[{label}] app heartbeat failed: {err}");
+                                    tokio::time::sleep(backoff).await;
+                                    backoff = std::cmp::min(backoff * 2, max_backoff);
+                                    backoff += Duration::from_millis(25);
+                                    break;
                                 }
                             }
                         } else if let Some(hb) = &static_app_hb {
-                            match &hb.payload {
-                                HeartbeatPayload::Text(s) => { let _ = ws.write_text(s.clone()).await; }
-                                HeartbeatPayload::Binary(b) => { let _ = ws.write_binary(Bytes::from(b.clone())).await; }
+                            let result = match &hb.payload {
+                                HeartbeatPayload::Text(s) => ws.write_text(s.clone()).await,
+                                HeartbeatPayload::Binary(b) => ws.write_binary(Bytes::from(b.clone())).await,
+                            };
+                            if let Err(err) = result {
+                                eprintln!("[{label}] app heartbeat failed: {err}");
+                                tokio::time::sleep(backoff).await;
+                                backoff = std::cmp::min(backoff * 2, max_backoff);
+                                backoff += Duration::from_millis(25);
+                                break;
                             }
                         }
                     }

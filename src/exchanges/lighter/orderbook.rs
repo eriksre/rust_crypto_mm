@@ -154,15 +154,20 @@ impl<const N: usize> LighterBook<N> {
             || msg_type.starts_with("snapshot");
 
         let seq = match payload.offset.or(msg.offset).or(payload.nonce) {
-            Some(seq) => seq,
+            Some(seq) if seq > 0 => seq,
             None => {
                 log_parse_drop("lighter_orderbook", "missing_seq", &"missing seq", "");
-                0
+                return false;
+            }
+            Some(seq) => {
+                let detail = format!("invalid seq {seq}");
+                log_parse_drop("lighter_orderbook", "invalid_seq", &detail, "");
+                return false;
             }
         };
         if !is_snapshot {
             if let Some(prev) = self.last_offset {
-                if seq != 0 && seq <= prev {
+                if seq <= prev {
                     return false;
                 }
             }
@@ -174,43 +179,30 @@ impl<const N: usize> LighterBook<N> {
             Some(ts) => Self::ts_from_exchange(ts),
             None => {
                 log_parse_drop("lighter_orderbook", "missing_ts", &"missing ts", "");
-                self.last_ts
+                return false;
             }
-        };
-        let seq_for_book = if seq == 0 {
-            log_parse_drop(
-                "lighter_orderbook",
-                "seq_fallback",
-                &"seq missing; using ts",
-                "",
-            );
-            ts.max(1)
-        } else {
-            seq
         };
 
         let bids = self.parse_levels(&payload.bids);
         let asks = self.parse_levels(&payload.asks);
 
         if is_snapshot {
-            self.book
-                .refresh_from_levels(&asks, &bids, ts, seq_for_book as Seq);
+            self.book.refresh_from_levels(&asks, &bids, ts, seq as Seq);
             self.initialized = true;
         } else {
             if !bids.is_empty() && !asks.is_empty() {
-                self.book
-                    .update_full_batch(&asks, &bids, ts, seq_for_book as Seq);
+                self.book.update_full_batch(&asks, &bids, ts, seq as Seq);
             } else if !bids.is_empty() {
-                self.book.update_bids_batch(&bids, ts, seq_for_book as Seq);
+                self.book.update_bids_batch(&bids, ts, seq as Seq);
             } else if !asks.is_empty() {
-                self.book.update_asks_batch(&asks, ts, seq_for_book as Seq);
+                self.book.update_asks_batch(&asks, ts, seq as Seq);
             } else {
                 return false;
             }
         }
 
         self.last_ts = ts;
-        self.last_offset = Some(seq_for_book);
+        self.last_offset = Some(seq);
         true
     }
 
@@ -314,5 +306,57 @@ impl<const N: usize> OrderBookOps for LighterBook<N> {
         self.initialized = false;
         self.last_ts = 0;
         self.last_offset = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::base_classes::orderbook_trait::OrderBookOps;
+
+    use super::{LighterBook, LighterLevel, LighterOrderBookMsg, LighterOrderBookPayload};
+
+    fn base_msg() -> LighterOrderBookMsg {
+        LighterOrderBookMsg {
+            channel: "order_book:7".to_string(),
+            offset: Some(10),
+            msg_type: Some("snapshot".to_string()),
+            order_book: Some(LighterOrderBookPayload {
+                code: None,
+                asks: vec![LighterLevel {
+                    price: "101.0".to_string(),
+                    size: "1.5".to_string(),
+                }],
+                bids: vec![LighterLevel {
+                    price: "100.0".to_string(),
+                    size: "1.0".to_string(),
+                }],
+                offset: Some(10),
+                nonce: None,
+                timestamp: Some(1_700_000_000_000),
+            }),
+            timestamp: None,
+        }
+    }
+
+    #[test]
+    fn rejects_missing_sequence_instead_of_using_timestamp() {
+        let mut book = LighterBook::<16>::new(7, 100_000.0, 1_000_000.0);
+        let mut msg = base_msg();
+        msg.offset = None;
+        msg.order_book.as_mut().expect("payload").offset = None;
+
+        assert!(!book.apply(&msg));
+        assert!(!book.is_initialized());
+    }
+
+    #[test]
+    fn rejects_missing_timestamp_instead_of_reusing_last_timestamp() {
+        let mut book = LighterBook::<16>::new(7, 100_000.0, 1_000_000.0);
+        let mut msg = base_msg();
+        msg.timestamp = None;
+        msg.order_book.as_mut().expect("payload").timestamp = None;
+
+        assert!(!book.apply(&msg));
+        assert!(!book.is_initialized());
     }
 }

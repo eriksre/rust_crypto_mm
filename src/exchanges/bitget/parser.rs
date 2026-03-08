@@ -63,15 +63,14 @@ impl ExchangeHandler for BitgetHandler {
         })
     }
 
-    // Gate book updates by seq (preferred) or ts per instId and channel
+    // Gate book updates by explicit sequence per instId and channel
     fn sequence_key_text(&self, text: &str) -> Option<(u64, u64)> {
         // Look for arg.channel and only gate books/books1
         let ch = find_json_string(text, "channel")?;
         if ch != BitgetWs::BBO && ch != BitgetWs::ORDERBOOK {
             return None;
         }
-        let inst = find_json_string(text, "instId").unwrap_or(&self.inst_id);
-        // Prefer 'seq' for monotonic ordering; fallback to top-level ts
+        let inst = find_json_string(text, "instId")?;
         if let Some(seq) = find_json_u64(text, "seq") {
             let tag = if ch == BitgetWs::BBO {
                 0x4242_4F31u64
@@ -79,14 +78,6 @@ impl ExchangeHandler for BitgetHandler {
                 0x424F_4F4Bu64
             }; // 'BBO1'/'BOOK'
             return Some((fnv1a64(inst.as_bytes()) ^ tag, seq));
-        }
-        if let Some(ts) = find_json_u64(text, "ts") {
-            let tag = if ch == BitgetWs::BBO {
-                0x4242_4F31u64
-            } else {
-                0x424F_4F4Bu64
-            };
-            return Some((fnv1a64(inst.as_bytes()) ^ tag, ts));
         }
         None
     }
@@ -313,7 +304,8 @@ fn bitget_preparse_flags(text: &str) -> BitgetParseFlags {
 
 #[cfg(test)]
 mod tests {
-    use super::bitget_preparse_flags;
+    use super::{BitgetHandler, bitget_preparse_flags};
+    use crate::base_classes::ws::ExchangeHandler;
 
     #[test]
     fn subscribe_ack_does_not_require_orderbook_parse() {
@@ -329,5 +321,13 @@ mod tests {
         let flags = bitget_preparse_flags(text);
         assert!(flags.needs_orderbook);
         assert!(flags.needs_json);
+    }
+
+    #[test]
+    fn sequence_gate_requires_explicit_seq() {
+        let handler = BitgetHandler::new("XMRUSDT");
+        let text = r#"{"arg":{"channel":"books1","instId":"XMRUSDT"},"data":[{"asks":[["1","1"]],"bids":[["1","1"]],"ts":"1"}]}"#;
+
+        assert!(handler.sequence_key_text(text).is_none());
     }
 }

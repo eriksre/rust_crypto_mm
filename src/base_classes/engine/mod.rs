@@ -85,21 +85,37 @@ async fn bybit_symbol_supported(symbol: &str) -> bool {
     let client = reqwest::Client::new();
     let resp = match client.get(url).send().await {
         Ok(resp) => resp,
-        Err(_) => return true,
+        Err(err) => {
+            eprintln!("Bybit symbol check request failed for {symbol}: {err}");
+            return false;
+        }
     };
     if !resp.status().is_success() {
+        eprintln!(
+            "Bybit symbol check HTTP {} for {}; disabling Bybit feeds",
+            resp.status(),
+            symbol
+        );
         return false;
     }
     let value: serde_json::Value = match resp.json().await {
         Ok(json) => json,
-        Err(_) => return true,
+        Err(err) => {
+            eprintln!("Bybit symbol check JSON decode failed for {symbol}: {err}");
+            return false;
+        }
     };
-    if value
-        .get("retCode")
-        .and_then(|c| c.as_i64())
-        .unwrap_or_default()
-        != 0
-    {
+    let ret_code = match value.get("retCode").and_then(|c| c.as_i64()) {
+        Some(code) => code,
+        None => {
+            eprintln!(
+                "Bybit symbol check missing retCode for {}; disabling Bybit feeds",
+                symbol
+            );
+            return false;
+        }
+    };
+    if ret_code != 0 {
         return false;
     }
     value
@@ -118,23 +134,23 @@ async fn bitget_symbol_supported(symbol: &str) -> bool {
     let resp = match client.get(url).send().await {
         Ok(resp) => resp,
         Err(err) => {
-            eprintln!("Bitget symbol check request failed: {err}; keeping Bitget enabled");
-            return true;
+            eprintln!("Bitget symbol check request failed for {inst_id}: {err}");
+            return false;
         }
     };
     if !resp.status().is_success() {
         eprintln!(
-            "Bitget symbol check HTTP {} for {}; keeping Bitget enabled",
+            "Bitget symbol check HTTP {} for {}; disabling Bitget feeds",
             resp.status(),
             inst_id
         );
-        return true;
+        return false;
     }
     let value: serde_json::Value = match resp.json().await {
         Ok(json) => json,
         Err(err) => {
-            eprintln!("Bitget symbol check JSON decode failed: {err}; keeping Bitget enabled");
-            return true;
+            eprintln!("Bitget symbol check JSON decode failed for {inst_id}: {err}");
+            return false;
         }
     };
     if value
@@ -148,15 +164,15 @@ async fn bitget_symbol_supported(symbol: &str) -> bool {
             .and_then(|v| v.as_str())
             .unwrap_or_default();
         eprintln!(
-            "Bitget symbol check returned code {:?} msg {:?}; keeping Bitget enabled",
+            "Bitget symbol check returned code {:?} msg {:?}; disabling Bitget feeds",
             value.get("code"),
             msg
         );
-        return true;
+        return false;
     }
     let Some(entries) = value.get("data").and_then(|data| data.as_array()) else {
-        eprintln!("Bitget symbol check: missing data array; keeping Bitget enabled");
-        return true;
+        eprintln!("Bitget symbol check: missing data array for {inst_id}; disabling Bitget feeds");
+        return false;
     };
     let found = entries.iter().any(|entry| {
         entry
@@ -320,16 +336,28 @@ pub fn spawn_state_engine(
         } else {
             true
         };
+        let gate_qty_multiplier = gate_contract_meta
+            .as_ref()
+            .and_then(|meta| meta.quanto_multiplier)
+            .filter(|mult| mult.is_finite() && *mult > 0.0);
         let gate_supported = if gate_auto {
-            if gate_contract_meta.is_some() {
+            if gate_qty_multiplier.is_some() {
                 true
             } else {
                 eprintln!(
-                    "Gate contract {} not found; disabling Gate feeds (auto mode)",
+                    "Gate contract {} missing valid quanto_multiplier from REST metadata; disabling Gate feeds (auto mode)",
                     gate_contract
                 );
                 false
             }
+        } else if feeds.gate.initial_enabled() {
+            if gate_qty_multiplier.is_none() {
+                panic!(
+                    "ERROR: Gate contract {} missing valid quanto_multiplier from REST metadata. Gate futures sizing requires contract metadata because futures.tickers does not include it.",
+                    gate_contract
+                );
+            }
+            true
         } else {
             true
         };
@@ -483,10 +511,12 @@ pub fn spawn_state_engine(
                     env::var("gateio_secret_key").or_else(|_| env::var("GATE_API_SECRET"));
                 if let (Ok(api_key), Ok(api_secret)) = (api_key, api_secret) {
                     let settle = env::var("GATE_SETTLE").unwrap_or_else(|_| "usdt".to_string());
-                    let contract_size = gate_contract_meta
-                        .as_ref()
-                        .and_then(|meta| meta.quanto_multiplier)
-                        .unwrap_or(1.0);
+                    let contract_size = gate_qty_multiplier.unwrap_or_else(|| {
+                        panic!(
+                            "ERROR: Gate contract {} missing valid quanto_multiplier from REST metadata for user trade listener",
+                            gate_contract
+                        )
+                    });
                     spawn_gate_user_trades_listener(
                         api_key,
                         api_secret,
@@ -508,7 +538,16 @@ pub fn spawn_state_engine(
             binance::BinanceEngine::try_new(binance_symbol.clone(), consumer, binance_auto)
         });
         let mut gate_engine = gate_c.take().map(|consumer| {
-            gate::GateEngine::new(gate_symbol.clone(), consumer, gate_contract_meta.clone())
+            gate::GateEngine::new(
+                gate_symbol.clone(),
+                consumer,
+                gate_contract_meta.clone().unwrap_or_else(|| {
+                    panic!(
+                        "ERROR: Gate engine started without contract metadata for {}",
+                        gate_contract
+                    )
+                }),
+            )
         });
         let mut bitget_engine = bitget_c
             .take()

@@ -42,6 +42,7 @@ Implement `ExchangeHandler` in `parser.rs` (`src/base_classes/ws.rs:1`):
 - `parse_text/parse_binary()` push minimal frames: `{ ts, recv_instant, raw }`
 - Sequence gating: override `sequence_key_*()` when the venue provides per-stream sequence
 - Heartbeats: implement `app_heartbeat()` or dynamic `app_heartbeat_interval()` + `build_app_heartbeat()` if required by the venue
+- Control/ack frames: classify subscribe acks, pings/pongs, and success/error envelopes explicitly so downstream collectors do not log them as malformed market data
 
 Keep the handler minimal. It should not decode into rich types on the hot path; downstream collectors will parse and update shared stores.
 
@@ -56,6 +57,7 @@ Add `src/collectors/<exchange>.rs:1`:
 - `update_tickers(...)` to update `TickerStore`
 
 Use shared JSON helpers in `src/collectors/helpers.rs:1`. Ensure consistent integer scaling for price/qty (see existing constants per venue).
+Do not require fields the venue does not guarantee. In particular, ticker channels often provide a timestamp but no explicit sequence; in that case, validate `ts`, reject stale updates, and let `TickerStore` synthesize the internal sequence.
 
 Register the module in `src/collectors/mod.rs:1`.
 
@@ -106,6 +108,7 @@ Create a small bin (see `src/bin/okx_orderbook_debug.rs:1` for reference):
 
 ### Monitoring
 - Add metrics or logs for sequence drops, checksum mismatches, reconnection/backoff.
+- Count parse drops per `(source, event)` so repeated warnings stay attributable to one feed and one failure mode.
 
 ---
 

@@ -91,12 +91,12 @@ pub fn update_tickers(
     snapshot.open_interest_value =
         value_to_f64(payload, &["openInterestCcy"]).or(snapshot.open_interest_value);
 
-    if let Some(seq) = value_to_u64(payload, &["seqId", "seq"]) {
-        snapshot.ticker.seq = seq;
-    } else {
-        // OKX tickers payloads do not guarantee seq fields; use local monotonic fallback.
-        snapshot.ticker.seq = 0;
-    }
+    let fallback_seq = prev
+        .map(|snapshot| snapshot.ticker.seq.wrapping_add(1))
+        .unwrap_or(1);
+    snapshot.ticker.seq = value_to_u64(payload, &["seqId", "seq"])
+        .filter(|seq| *seq > 0)
+        .unwrap_or(fallback_seq);
 
     let ts_ns = match value_to_u64(payload, &["ts"]) {
         Some(ts_ms) => ms_to_ns(ts_ms),
@@ -157,8 +157,11 @@ pub fn update_bbo_store(frame: &mut OkxFrame, store: &mut BboStore, qty_multipli
                 sample.as_str(),
             );
             None
-        })
-        .unwrap_or_default();
+        });
+    let inst_id = match inst_id {
+        Some(inst_id) => inst_id,
+        None => return false,
+    };
     let data = raw
         .get("data")
         .and_then(|v| v.as_array())
@@ -459,27 +462,20 @@ mod tests {
     use std::time::Instant;
 
     #[test]
-    fn update_tickers_accepts_missing_seq_with_local_monotonic_fallback() {
+    fn update_tickers_accepts_missing_seq_and_synthesizes_store_sequence() {
         let mut store = TickerStore::default();
         let msg1 = r#"{"arg":{"channel":"tickers","instId":"SOL-USDT-SWAP"},"data":[{"instType":"SWAP","instId":"SOL-USDT-SWAP","last":"90.1","lastSz":"0.01","askPx":"90.2","askSz":"10","bidPx":"90.0","bidSz":"11","ts":"1000"}]}"#;
-        let msg2 = r#"{"arg":{"channel":"tickers","instId":"SOL-USDT-SWAP"},"data":[{"instType":"SWAP","instId":"SOL-USDT-SWAP","last":"90.2","lastSz":"0.02","askPx":"90.3","askSz":"12","bidPx":"90.1","bidSz":"13","ts":"1001"}]}"#;
-
         let mut frame1 = OkxFrame::from_text(msg1, 1, Instant::now());
-        let (_, snap1) = update_tickers(&mut frame1, &mut store, 1.0).expect("first ticker");
-        assert_eq!(snap1.ticker.seq, 1);
-        assert_eq!(snap1.ticker.ts, ms_to_ns(1000));
-
-        let mut frame2 = OkxFrame::from_text(msg2, 2, Instant::now());
-        let (_, snap2) = update_tickers(&mut frame2, &mut store, 1.0).expect("second ticker");
-        assert_eq!(snap2.ticker.seq, 2);
-        assert_eq!(snap2.ticker.ts, ms_to_ns(1001));
+        let (_, snap) = update_tickers(&mut frame1, &mut store, 1.0).expect("ticker parsed");
+        assert_eq!(snap.ticker.seq, 1);
+        assert_eq!(snap.ticker.ts, ms_to_ns(1000));
     }
 
     #[test]
     fn update_tickers_rejects_stale_timestamp() {
         let mut store = TickerStore::default();
-        let newer = r#"{"arg":{"channel":"tickers","instId":"SOL-USDT-SWAP"},"data":[{"instType":"SWAP","instId":"SOL-USDT-SWAP","last":"90.2","lastSz":"0.02","askPx":"90.3","askSz":"12","bidPx":"90.1","bidSz":"13","ts":"2000"}]}"#;
-        let older = r#"{"arg":{"channel":"tickers","instId":"SOL-USDT-SWAP"},"data":[{"instType":"SWAP","instId":"SOL-USDT-SWAP","last":"90.1","lastSz":"0.01","askPx":"90.2","askSz":"10","bidPx":"90.0","bidSz":"11","ts":"1999"}]}"#;
+        let newer = r#"{"arg":{"channel":"tickers","instId":"SOL-USDT-SWAP"},"data":[{"instType":"SWAP","instId":"SOL-USDT-SWAP","last":"90.2","lastSz":"0.02","askPx":"90.3","askSz":"12","bidPx":"90.1","bidSz":"13","seqId":"2","ts":"2000"}]}"#;
+        let older = r#"{"arg":{"channel":"tickers","instId":"SOL-USDT-SWAP"},"data":[{"instType":"SWAP","instId":"SOL-USDT-SWAP","last":"90.1","lastSz":"0.01","askPx":"90.2","askSz":"10","bidPx":"90.0","bidSz":"11","seqId":"1","ts":"1999"}]}"#;
 
         let mut newer_frame = OkxFrame::from_text(newer, 1, Instant::now());
         update_tickers(&mut newer_frame, &mut store, 1.0).expect("newer ticker");

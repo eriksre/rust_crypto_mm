@@ -36,6 +36,10 @@ A successful response echoes the `id` plus `{ "event": "subscribe", "arg": { ...
   - `open24h`, `high24h`, `low24h`
   - `vol24h` (base contracts) and `volCcy24h` / `volCcyQuote` (quote volume)
   - `ts` (ms)
+- Freshness handling:
+  - Treat `ts` as the authoritative ordering field for ticker pushes.
+  - Do not require `seqId` on `tickers`; current public ticker pushes in this repo's captures do not include it consistently.
+  - If downstream code needs a monotonically increasing ticker sequence, synthesize it locally after the timestamp check passes.
 - Update cadence: best-effort 100 ms, only when a trade or top-of-book change occurs.
 
 Example push:
@@ -146,6 +150,7 @@ Example:
 
 ## Integration Notes & Quirks
 - **Sequence handling:** `prevSeqId` is `-1` on snapshots and can arrive as a signed string. Deserialize using a signed type, treat negative values as “no previous sequence,” and maintain separate counters for `books` and `bbo-tbt` since each channel has its own monotonic stream.
+- **Ticker sequencing:** `tickers` is timestamp-ordered in the hot path. Missing `seqId` on ticker frames is not, by itself, a schema failure.
 - **BBO + depth reconciliation:** We subscribe to both `books` (snapshot + deltas) and `bbo-tbt`. `books` drives the main depth state, while `bbo-tbt` lets us tighten top-of-book between depth pushes. Both feeds update the same `OkxBook`, so the mid and top levels stay aligned regardless of which channel fired last.
 - **Signed checksums:** The CRC32 checksum is published as a signed 32-bit integer. Negative values are expected—they’re simply the raw CRC interpreted as `i32`. We log the value but do not yet hard-fail on mismatch.
 - **Heartbeat keep-alives:** Expect keep-alive updates with empty `asks`/`bids` but unchanged `seqId`. Treat them as connection health signals and leave the book untouched.

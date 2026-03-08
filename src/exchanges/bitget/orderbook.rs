@@ -148,10 +148,7 @@ impl<const N: usize> BitgetBook<N> {
 
     #[inline(always)]
     fn extract_seq(d: &BitgetDatum) -> Option<u64> {
-        d.seq
-            .or(d.seq_id)
-            .or_else(|| d.prev_seq.map(|prev| prev.saturating_add(1)))
-            .or_else(|| d.prev_seq_id.map(|prev| prev.saturating_add(1)))
+        d.seq.or(d.seq_id)
     }
 
     #[inline(always)]
@@ -454,5 +451,41 @@ impl<const N: usize> OrderBookOps for BitgetBook<N> {
         self.last_seq = 0;
         self.last_system_ts_ns = None;
         self.last_bbo_system_ts_ns = None;
+    }
+}
+
+#[cfg(all(test, feature = "bitget_book"))]
+mod tests {
+    use super::{BitgetArg, BitgetBook, BitgetDatum, BitgetMsg};
+    use crate::base_classes::orderbook_trait::OrderBookOps;
+
+    #[test]
+    fn rejects_synthesized_sequence_from_prev_seq() {
+        let mut book = BitgetBook::<16>::new(
+            "BTCUSDT",
+            BitgetBook::<16>::PRICE_SCALE,
+            BitgetBook::<16>::QTY_SCALE,
+        );
+        let msg = BitgetMsg {
+            action: "snapshot".to_string(),
+            arg: BitgetArg {
+                inst_type: "USDT-FUTURES".to_string(),
+                channel: "books".to_string(),
+                inst_id: "BTCUSDT".to_string(),
+            },
+            data: vec![BitgetDatum {
+                asks: vec![vec!["101".to_string(), "1".to_string()]],
+                bids: vec![vec!["100".to_string(), "1".to_string()]],
+                seq: None,
+                seq_id: None,
+                prev_seq: Some(9),
+                prev_seq_id: None,
+                ts: Some(1_700_000_000_000),
+            }],
+            ts: Some(1_700_000_000_001),
+        };
+
+        assert!(!book.apply(&msg));
+        assert!(!book.is_initialized());
     }
 }

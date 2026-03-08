@@ -277,21 +277,24 @@ pub fn update_tickers(
         snapshot.open_interest_value = Some(oi * mark);
     }
 
-    if let Some(ts_ms) = data
+    let ts_ms = match data
         .get("timestamp")
         .and_then(as_u64)
         .or_else(|| raw.get("ts").and_then(as_u64))
     {
-        snapshot.ticker.ts = ms_to_ns(ts_ms);
-        snapshot.ticker.seq = ts_ms;
-    } else {
-        log_parse_drop(
-            "mexc_collector",
-            "missing_ts",
-            &"missing ts",
-            sample.as_str(),
-        );
-    }
+        Some(ts_ms) if ts_ms > 0 => ts_ms,
+        _ => {
+            log_parse_drop(
+                "mexc_collector",
+                "missing_ts",
+                &"missing ts",
+                sample.as_str(),
+            );
+            return None;
+        }
+    };
+    snapshot.ticker.ts = ms_to_ns(ts_ms);
+    snapshot.ticker.seq = ts_ms;
 
     let stored = store.update(symbol.clone(), snapshot);
     Some((symbol, stored))

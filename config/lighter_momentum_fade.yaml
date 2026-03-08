@@ -5,7 +5,7 @@ strategy:
   size: min
 momentum_fade:
   entry_price_source: model
-  lookback_ms: 142
+  lookback_ms: 135
   entry_threshold_bps: 1
   entry_threshold_bps_bid: 1
   entry_threshold_bps_ask: 1
@@ -15,10 +15,10 @@ momentum_fade:
   adverse_threshold_bps: 0
   adverse_threshold_bps_bid: 0
   adverse_threshold_bps_ask: 0
-  max_age_ms: 700
-  max_age_ms_bid: 700
-  max_age_ms_ask: 700
-  min_interval_ms: 50
+  max_age_ms: 2000
+  max_age_ms_bid: 2000
+  max_age_ms_ask: 2000
+  min_interval_ms: 100
 pricing_model:
   enabled: true
   time_basis: wire
