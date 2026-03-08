@@ -40,6 +40,10 @@ pub struct ModeConfig {
     pub markout_prints: bool,
     #[serde(default = "default_true")]
     pub demean_prices: bool,
+    #[serde(default)]
+    pub suppress_quote_loop_idle_logs: bool,
+    #[serde(default)]
+    pub suppress_lighter_sendtx_quota_logs: bool,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -675,7 +679,7 @@ where
 
 pub fn log_runner_config(config: &RunnerConfig) {
     eprintln!(
-        "Runner config: strategy_kind={}, venue={}, symbol={}, dry_run={}, log_fills={}, debug_prints={}, markout_prints={}, demean_prices={}",
+        "Runner config: strategy_kind={}, venue={}, symbol={}, dry_run={}, log_fills={}, debug_prints={}, markout_prints={}, demean_prices={}, suppress_quote_loop_idle_logs={}, suppress_lighter_sendtx_quota_logs={}",
         config.strategy_kind.as_str(),
         config.strategy.venue.as_str(),
         config.strategy.symbol,
@@ -683,7 +687,9 @@ pub fn log_runner_config(config: &RunnerConfig) {
         config.mode.log_fills,
         config.mode.debug_prints,
         config.mode.markout_prints,
-        config.mode.demean_prices
+        config.mode.demean_prices,
+        config.mode.suppress_quote_loop_idle_logs,
+        config.mode.suppress_lighter_sendtx_quota_logs
     );
     if config.logging.enabled {
         eprintln!(
@@ -835,5 +841,25 @@ pricing_model:
             err.to_string().contains("pricing_model.kalman.stats_alpha"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn mode_config_parses_lighter_sendtx_quota_log_suppression_flag() {
+        let yaml = r#"
+strategy:
+  venue: lighter
+  symbol: SOL_USDT
+  size: 1
+risk:
+  max_order_notional: 10
+  max_position_notional: 20
+mode:
+  dry_run: true
+  suppress_quote_loop_idle_logs: true
+  suppress_lighter_sendtx_quota_logs: true
+"#;
+        let cfg = serde_yaml::from_str::<RunnerConfig>(yaml).expect("yaml parse");
+        assert!(cfg.mode.suppress_quote_loop_idle_logs);
+        assert!(cfg.mode.suppress_lighter_sendtx_quota_logs);
     }
 }

@@ -1,7 +1,7 @@
 strategy_kind: momentum_fade
 strategy:
   venue: lighter
-  symbol: XRP_USDT
+  symbol: SOL_USDT
   size: min
 momentum_fade:
   entry_price_source: model
@@ -105,6 +105,8 @@ mode:
   debug_prints: false
   markout_prints: true
   demean_prices: false
+  suppress_quote_loop_idle_logs: true
+  suppress_lighter_sendtx_quota_logs: true
 logging:
   enabled: true
   path: logs/lighter_activity.csv

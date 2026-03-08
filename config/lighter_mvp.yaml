@@ -100,6 +100,8 @@ mode:
   debug_prints: true
   markout_prints: true
   demean_prices: false
+  suppress_quote_loop_idle_logs: false
+  suppress_lighter_sendtx_quota_logs: false
 logging:
   enabled: true
   path: logs/lighter_activity.csv

@@ -249,6 +249,7 @@ impl SimpleQuoteStrategy {
             client_order_id: order_id.clone(),
             fair_mid: self.latest_price,
             lighter_mid: Self::lighter_mid_from_state(),
+            entry_reference_price: None,
             order_age_ms,
         }
     }

@@ -42,6 +42,7 @@ pub struct FillContext {
     pub client_order_id: ClientOrderId,
     pub fair_mid: Option<f64>,
     pub lighter_mid: Option<f64>,
+    pub entry_reference_price: Option<f64>,
     pub order_age_ms: Option<u64>,
 }
 

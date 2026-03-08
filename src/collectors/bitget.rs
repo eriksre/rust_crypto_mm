@@ -239,7 +239,10 @@ pub fn update_tickers(s: &str, store: &mut TickerStore) -> Option<(String, Ticke
     snapshot.ticker.ts = ts_ns;
     snapshot.ticker.seq = first_u64(data, &["seq", "seqId", "u"])
         .filter(|seq| *seq > 0)
-        .unwrap_or_else(|| prev.map(|snapshot| snapshot.ticker.seq.wrapping_add(1)).unwrap_or(1));
+        .unwrap_or_else(|| {
+            prev.map(|snapshot| snapshot.ticker.seq.wrapping_add(1))
+                .unwrap_or(1)
+        });
 
     let stored = store.update(symbol.clone(), snapshot);
     Some((symbol, stored))

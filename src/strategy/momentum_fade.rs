@@ -149,6 +149,7 @@ impl PriceHistory {
 struct ActiveOrder {
     side: Side,
     price: f64,
+    entry_reference_price: f64,
     placed_at: Instant,
 }
 
@@ -341,6 +342,7 @@ impl MomentumFadeStrategy {
                 ActiveOrder {
                     side: intent.side,
                     price: intent.price,
+                    entry_reference_price: plan.reference_price,
                     placed_at: plan.planned_at,
                 },
             );
@@ -423,6 +425,10 @@ impl MomentumFadeStrategy {
             client_order_id: order_id.clone(),
             fair_mid: self.latest_fair_mid,
             lighter_mid,
+            entry_reference_price: self
+                .active_quotes
+                .get(order_id)
+                .map(|order| order.entry_reference_price),
             order_age_ms,
         }
     }
@@ -837,6 +843,7 @@ mod tests {
             ActiveOrder {
                 side: Side::Bid,
                 price: 100.0,
+                entry_reference_price: 100.0,
                 placed_at: now - Duration::from_millis(150),
             },
         );
@@ -845,6 +852,7 @@ mod tests {
             ActiveOrder {
                 side: Side::Ask,
                 price: 100.0,
+                entry_reference_price: 100.0,
                 placed_at: now - Duration::from_millis(150),
             },
         );
@@ -875,6 +883,7 @@ mod tests {
             ActiveOrder {
                 side: Side::Bid,
                 price: 100.0,
+                entry_reference_price: 100.0,
                 placed_at: now - Duration::from_secs(1),
             },
         );
@@ -908,6 +917,46 @@ mod tests {
         assert!(!strategy.active_quotes.contains_key(&new_id));
         assert!(!strategy.active_orders.iter().any(|id| id == &new_id));
         assert!(strategy.needs_quote);
+    }
+
+    #[test]
+    fn fill_context_carries_entry_reference_price() {
+        let mut strategy = MomentumFadeStrategy::new(
+            base_config(EntryPriceSource::Model),
+            Venue::Lighter,
+            "XMR_USDT".to_string(),
+            0.001,
+            1.0,
+        );
+        let now = Instant::now();
+        let order_id = ClientOrderId::new("mf-lighter-b-3");
+        let reference_price = 100.25;
+
+        let plan = QuotePlan {
+            reference_price,
+            reference_best_bid: Some(100.0),
+            reference_best_ask: Some(100.1),
+            cancels: Vec::new(),
+            intents: vec![QuoteIntent::new(
+                Venue::Lighter,
+                "XMR_USDT",
+                Side::Bid,
+                100.0,
+                1.0,
+                TimeInForce::PostOnly,
+                order_id.clone(),
+            )],
+            planned_at: now,
+            reference_meta: None,
+            prior_submit_at: None,
+        };
+
+        strategy.latest_fair_mid = Some(reference_price);
+        strategy.commit_plan(&plan);
+
+        let context = strategy.fill_context(&order_id, now + Duration::from_millis(25));
+        assert_eq!(context.entry_reference_price, Some(reference_price));
+        assert_eq!(context.order_age_ms, Some(25));
     }
 
     #[test]
@@ -971,6 +1020,7 @@ mod tests {
             ActiveOrder {
                 side: Side::Ask,
                 price: 100.0,
+                entry_reference_price: 100.0,
                 placed_at: now,
             },
         );

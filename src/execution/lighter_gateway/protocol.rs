@@ -1,15 +1,5 @@
 use super::*;
 
-#[derive(Debug, Clone)]
-pub struct LighterCredentials {
-    pub api_key_hex: String,
-    pub account_index: i64,
-    pub api_key_index: i32,
-    pub base_url: String,
-    pub signer_lib: String,
-    pub chain_id: Option<u32>,
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct SendTxBatchResponse {
     pub(super) code: i32,
@@ -131,6 +121,12 @@ pub(super) fn is_lighter_rate_limited(msg: &str) -> bool {
         || msg.contains("\"code\":23000")
         || msg.contains("HTTP 429")
         || msg.contains("status=429")
+}
+
+pub fn is_lighter_sendtx_quota_error(msg: &str) -> bool {
+    (msg.contains("sendTxBatch") || msg.contains("sendtx"))
+        && msg.contains("23000")
+        && msg.contains("Not enough volume quota")
 }
 
 fn encode_form_field(value: &str) -> String {

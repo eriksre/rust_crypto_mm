@@ -17,8 +17,8 @@ pub use inventory::{
     InventoryReportOutcome, InventoryTracker, InventoryUpdate, InventoryUpdateSource,
 };
 pub use lighter_gateway::{
-    LighterAuthClient, LighterCredentials, LighterGateway, lighter_auth_token,
-    resolve_lighter_signer_path,
+    LighterAuthClient, LighterCredentials, LighterGateway, LighterGatewayConfig, LighterInstrument,
+    is_lighter_sendtx_quota_error, lighter_auth_token, resolve_lighter_signer_path,
 };
 pub use order_manager::OrderManager;
 pub use types::{
