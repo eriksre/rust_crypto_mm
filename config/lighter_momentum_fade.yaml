@@ -2,7 +2,7 @@ strategy_kind: momentum_fade
 strategy:
   venue: lighter
   symbol: SOL_USDT
-  size: min
+  size: 1
 momentum_fade:
   entry_price_source: model
   lookback_ms: 135
@@ -97,8 +97,8 @@ feeds:
   mexc: false
   lighter: true
 risk:
-  max_order_notional: 50.0
-  max_position_notional: 100.0
+  max_order_notional: 100.0
+  max_position_notional: 200.0
 mode:
   dry_run: false
   log_fills: false
