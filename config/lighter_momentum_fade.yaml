@@ -106,6 +106,7 @@ mode:
   markout_prints: true
   demean_prices: false
   suppress_quote_loop_idle_logs: true
+  suppress_inventory_rollback_warnings: true
   suppress_lighter_sendtx_quota_logs: true
 logging:
   enabled: true

@@ -340,14 +340,14 @@ impl MomentumFadeStrategy {
         if !plan.intents.is_empty() {
             self.last_submit_at = Some(plan.planned_at);
         }
-        let entry_move_bps = if plan.intents.is_empty() {
-            None
-        } else {
-            Some(
-                plan.entry_move_bps
-                    .expect("momentum fade commit_plan missing entry_move_bps for submitted intent"),
-            )
-        };
+        let entry_move_bps =
+            if plan.intents.is_empty() {
+                None
+            } else {
+                Some(plan.entry_move_bps.expect(
+                    "momentum fade commit_plan missing entry_move_bps for submitted intent",
+                ))
+            };
         for intent in &plan.intents {
             if !self
                 .active_orders
@@ -451,7 +451,10 @@ impl MomentumFadeStrategy {
                 .active_quotes
                 .get(order_id)
                 .map(|order| order.entry_reference_price),
-            entry_move_bps: self.active_quotes.get(order_id).map(|order| order.entry_move_bps),
+            entry_move_bps: self
+                .active_quotes
+                .get(order_id)
+                .map(|order| order.entry_move_bps),
             order_age_ms,
         }
     }

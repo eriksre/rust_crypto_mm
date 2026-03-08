@@ -1753,16 +1753,18 @@ async fn handle_quote_tick(
                         inventory_guard.forget_unconfirmed_orders(&intent_ids)
                     };
                     if !rolled_back.is_empty() {
-                        debug_clone.warn(|| {
-                            format!(
-                                "rolled back unconfirmed inventory orders: {}",
-                                rolled_back
-                                    .iter()
-                                    .map(|id| id.0.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            )
-                        });
+                        if !config_clone.mode.suppress_inventory_rollback_warnings {
+                            debug_clone.warn(|| {
+                                format!(
+                                    "rolled back unconfirmed inventory orders: {}",
+                                    rolled_back
+                                        .iter()
+                                        .map(|id| id.0.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                )
+                            });
+                        }
                     }
                     let stale_reports = stale_unknown_order_reports(&err_msg);
                     if !stale_reports.is_empty() {

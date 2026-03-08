@@ -43,6 +43,8 @@ pub struct ModeConfig {
     #[serde(default)]
     pub suppress_quote_loop_idle_logs: bool,
     #[serde(default)]
+    pub suppress_inventory_rollback_warnings: bool,
+    #[serde(default)]
     pub suppress_lighter_sendtx_quota_logs: bool,
 }
 
@@ -679,7 +681,7 @@ where
 
 pub fn log_runner_config(config: &RunnerConfig) {
     eprintln!(
-        "Runner config: strategy_kind={}, venue={}, symbol={}, dry_run={}, log_fills={}, debug_prints={}, markout_prints={}, demean_prices={}, suppress_quote_loop_idle_logs={}, suppress_lighter_sendtx_quota_logs={}",
+        "Runner config: strategy_kind={}, venue={}, symbol={}, dry_run={}, log_fills={}, debug_prints={}, markout_prints={}, demean_prices={}, suppress_quote_loop_idle_logs={}, suppress_inventory_rollback_warnings={}, suppress_lighter_sendtx_quota_logs={}",
         config.strategy_kind.as_str(),
         config.strategy.venue.as_str(),
         config.strategy.symbol,
@@ -689,6 +691,7 @@ pub fn log_runner_config(config: &RunnerConfig) {
         config.mode.markout_prints,
         config.mode.demean_prices,
         config.mode.suppress_quote_loop_idle_logs,
+        config.mode.suppress_inventory_rollback_warnings,
         config.mode.suppress_lighter_sendtx_quota_logs
     );
     if config.logging.enabled {
@@ -856,10 +859,12 @@ risk:
 mode:
   dry_run: true
   suppress_quote_loop_idle_logs: true
+  suppress_inventory_rollback_warnings: true
   suppress_lighter_sendtx_quota_logs: true
 "#;
         let cfg = serde_yaml::from_str::<RunnerConfig>(yaml).expect("yaml parse");
         assert!(cfg.mode.suppress_quote_loop_idle_logs);
+        assert!(cfg.mode.suppress_inventory_rollback_warnings);
         assert!(cfg.mode.suppress_lighter_sendtx_quota_logs);
     }
 }
