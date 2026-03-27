@@ -15,3 +15,7 @@ env/
 logs/*.csv
 logs/*copy*.csv
 
+
+
+#Ignore cursor AI rules
+.cursor/rules/codacy.mdc

@@ -5,7 +5,7 @@ strategy:
   size: 1
 momentum_fade:
   entry_price_source: model
-  lookback_ms: 135
+  lookback_ms: 195
   entry_threshold_bps: 1
   entry_threshold_bps_bid: 1
   entry_threshold_bps_ask: 1
@@ -100,7 +100,7 @@ risk:
   max_order_notional: 100.0
   max_position_notional: 200.0
 mode:
-  dry_run: false
+  dry_run: true
   log_fills: false
   debug_prints: false
   markout_prints: true

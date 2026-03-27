@@ -135,6 +135,32 @@ impl GateResult {
     }
 }
 
+fn format_top_level(level: Option<(f64, f64)>) -> String {
+    match level {
+        Some((px, qty)) => format!("{px:.6}@{qty:.6}"),
+        None => "none".to_string(),
+    }
+}
+
+fn format_level_sample(levels: &[(Price, Qty)], price_scale: f64, qty_scale: f64) -> String {
+    const SAMPLE_LIMIT: usize = 3;
+    if levels.is_empty() {
+        return "[]".to_string();
+    }
+    let mut rendered = Vec::with_capacity(levels.len().min(SAMPLE_LIMIT));
+    for (px, qty) in levels.iter().take(SAMPLE_LIMIT) {
+        rendered.push(format!(
+            "{:.6}@{:.6}",
+            (*px as f64) / price_scale,
+            (*qty as f64) / qty_scale
+        ));
+    }
+    if levels.len() > SAMPLE_LIMIT {
+        rendered.push(format!("...(+{} more)", levels.len() - SAMPLE_LIMIT));
+    }
+    format!("[{}]", rendered.join(", "))
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct GateMsg {
     pub channel: String,
@@ -183,6 +209,14 @@ impl<const N: usize> GateBook<N> {
         (
             (px * self.price_scale).round() as Price,
             (qty * self.qty_multiplier * self.qty_scale).round() as Qty,
+        )
+    }
+
+    #[inline(always)]
+    fn top_of_book_summary(&self) -> (String, String) {
+        (
+            format_top_level(self.best_bid_f64()),
+            format_top_level(self.best_ask_f64()),
         )
     }
 
@@ -254,9 +288,39 @@ impl<const N: usize> GateBook<N> {
             self.initialized = true;
             self.last_ts = ts;
             self.last_depth_id = Some(seq);
+            let (best_bid, best_ask) = self.top_of_book_summary();
+            eprintln!(
+                "gate depth snapshot applied: contract={}, ts_ms={}, depth_end={}, msg_time_ms={:?}, result_t={:?}, result_time_ms={:?}, result_seq={:?}, full={:?}, bids={}, asks={}, best_bid={}, best_ask={}",
+                self.contract,
+                ts_ms,
+                seq,
+                msg.time_ms,
+                res.t,
+                res.time_ms,
+                res.seq,
+                res.full,
+                bids.len(),
+                asks.len(),
+                best_bid,
+                best_ask
+            );
             return true;
         } else if !self.initialized {
             // We are not synchronized; ignore deltas until a proper snapshot arrives.
+            eprintln!(
+                "WARN: Gate orderbook delta ignored while waiting for snapshot: contract={}, ts_ms={}, delta_start={:?}, delta_end={}, msg_time_ms={:?}, result_t={:?}, result_time_ms={:?}, result_seq={:?}, full={:?}, bids={}, asks={}",
+                self.contract,
+                ts_ms,
+                res.depth_start_id(),
+                seq,
+                msg.time_ms,
+                res.t,
+                res.time_ms,
+                res.seq,
+                res.full,
+                bids.len(),
+                asks.len()
+            );
             return false;
         }
 
@@ -286,9 +350,27 @@ impl<const N: usize> GateBook<N> {
         };
         let expected_next = prev_depth_end.saturating_add(1);
         if depth_start > expected_next || (seq as u64) < expected_next {
+            let (best_bid, best_ask) = self.top_of_book_summary();
             eprintln!(
-                "ERROR: Gate orderbook depth gap for contract {}: prev_end={}, delta_start={}, delta_end={}; clearing local book and waiting for a fresh snapshot",
-                self.contract, prev_depth_end, depth_start, seq
+                "ERROR: Gate orderbook depth gap for contract {}: prev_end={}, expected_next={}, delta_start={}, delta_end={}, ts_ms={}, msg_time_ms={:?}, result_t={:?}, result_time_ms={:?}, result_seq={:?}, full={:?}, last_ts_ns={}, best_bid={}, best_ask={}, incoming_bids={}, incoming_asks={}, incoming_bid_sample={}, incoming_ask_sample={}; clearing local book and waiting for a fresh snapshot",
+                self.contract,
+                prev_depth_end,
+                expected_next,
+                depth_start,
+                seq,
+                ts_ms,
+                msg.time_ms,
+                res.t,
+                res.time_ms,
+                res.seq,
+                res.full,
+                self.last_ts,
+                best_bid,
+                best_ask,
+                bids.len(),
+                asks.len(),
+                format_level_sample(&bids, self.price_scale, self.qty_scale),
+                format_level_sample(&asks, self.price_scale, self.qty_scale)
             );
             self.book.clear();
             self.initialized = false;

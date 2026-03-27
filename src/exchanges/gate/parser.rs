@@ -129,16 +129,15 @@ impl ExchangeHandler for GateHandler {
         Some(HeartbeatPayload::Text(msg))
     }
 
-    // Gate OB (v1/v2) monotonic gating by time_ms (or t/u)
+    // Gate OB updates must be gated by depth sequence `u`; using timestamps drops
+    // distinct updates that share the same millisecond and creates false gaps.
     fn sequence_key_text(&self, text: &str) -> Option<(u64, u64)> {
-        if !text.contains("\"channel\":\"futures.obu\"") {
+        if !text.contains("\"channel\":\"futures.obu\"") || !text.contains("\"event\":\"update\"") {
             return None;
         }
-        let t = find_json_u64(text, "time_ms")
-            .or_else(|| find_json_u64(text, "t"))
-            .or_else(|| find_json_u64(text, "u"))?;
+        let seq = find_json_u64(text, "u")?;
         let key = fnv1a64(self.contract.as_bytes()) ^ 0x0B00u64;
-        Some((key, t))
+        Some((key, seq))
     }
 
     fn label(&self) -> String {
@@ -339,4 +338,65 @@ fn gate_preparse_flags(text: &str) -> (bool, bool) {
         || text.contains("\"channel\":\"futures.tickers\"")
         || text.contains("\"channel\":\"futures.trades\"");
     (needs_json, is_obu)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GateHandler;
+    use crate::base_classes::ws::ExchangeHandler;
+
+    #[test]
+    fn gate_obu_sequence_key_uses_depth_end_id_instead_of_timestamp() {
+        let handler = GateHandler::new("SOL_USDT");
+        let first = r#"{
+            "channel":"futures.obu",
+            "event":"update",
+            "result":{
+                "t":1772858041410,
+                "s":"ob.SOL_USDT.50",
+                "U":24819532360,
+                "u":24819532365,
+                "a":[["82.4980","2"]]
+            },
+            "time_ms":1772858041411
+        }"#;
+        let second = r#"{
+            "channel":"futures.obu",
+            "event":"update",
+            "result":{
+                "t":1772858041410,
+                "s":"ob.SOL_USDT.50",
+                "U":24819532366,
+                "u":24819532372,
+                "a":[["82.4990","3"]]
+            },
+            "time_ms":1772858041411
+        }"#;
+
+        let (_, first_seq) = handler
+            .sequence_key_text(first)
+            .expect("first update should produce a sequence key");
+        let (_, second_seq) = handler
+            .sequence_key_text(second)
+            .expect("second update should produce a sequence key");
+
+        assert_eq!(first_seq, 24_819_532_365);
+        assert_eq!(second_seq, 24_819_532_372);
+        assert!(second_seq > first_seq);
+    }
+
+    #[test]
+    fn gate_obu_sequence_key_ignores_subscribe_ack() {
+        let handler = GateHandler::new("SOL_USDT");
+        let subscribe_ack = r#"{
+            "time":1772858040,
+            "time_ms":1772858040687,
+            "channel":"futures.obu",
+            "event":"subscribe",
+            "payload":["ob.SOL_USDT.50"],
+            "result":{"status":"success"}
+        }"#;
+
+        assert!(handler.sequence_key_text(subscribe_ack).is_none());
+    }
 }
